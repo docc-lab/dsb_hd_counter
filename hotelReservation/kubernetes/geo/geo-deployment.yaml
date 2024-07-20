@@ -27,8 +27,8 @@ spec:
     spec:
       containers:
         - command:
-            - ./geo
-          image: docclab/hotel_reserv_geo_single_node:latest
+            - geo
+          image: deathstarbench/hotel-reservation:latest
           name: hotel-reserv-geo
           ports:
             - containerPort: 8083

@@ -27,8 +27,8 @@ spec:
     spec:
       containers:
         - command:
-            - ./recommendation
-          image: docclab/hotel_reserv_recommendation_single_node:latest
+            - recommendation
+          image: deathstarbench/hotel-reservation:latest
           name: hotel-reserv-recommendation
           ports:
             - containerPort: 8085

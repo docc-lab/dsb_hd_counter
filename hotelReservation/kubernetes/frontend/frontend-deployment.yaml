@@ -27,8 +27,8 @@ spec:
     spec:
       containers:
         - command:
-            - ./frontend
-          image: docclab/hotel_reserv_frontend_single_node:latest
+            - frontend
+          image: deathstarbench/hotel-reservation:latest
           name: hotel-reserv-frontend
           ports:
             - containerPort: 5000

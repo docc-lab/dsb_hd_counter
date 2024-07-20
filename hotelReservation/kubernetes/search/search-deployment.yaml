@@ -27,8 +27,8 @@ spec:
     spec:
       containers:
         - command:
-            - ./search
-          image: docclab/hotel_reserv_search_single_node:latest
+            - search
+          image: deathstarbench/hotel-reservation:latest
           name: hotel-reserv-search
           ports:
             - containerPort: 8082
