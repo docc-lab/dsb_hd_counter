@@ -9,3 +9,6 @@ build
 wrk2/wrk
 wrk2/*.[oa]
 wrk2/obj/
+
+daprApps_v1/test/socialnet/tmp/tester-0*1645152149690-img-0
+daprApps_v1/test/socialnet/tmp/tester-0*1645152265090-img-0
