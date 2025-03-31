@@ -2,8 +2,9 @@ disabled: false
 reporter:
   logSpans: false
   localAgentHostPort: "jaeger-agent:6831"
+#  CollectorEndpoint: "http://jaeger-collector:14268/api/traces"
   queueSize: 1000000
   bufferFlushInterval: 10
 sampler:
-  type: "probabilistic"
-  param: 0.1
+  type: "probabilisitc"
+  param: 0.01

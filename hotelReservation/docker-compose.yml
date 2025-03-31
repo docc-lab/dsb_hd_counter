@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   consul:
     image: hashicorp/consul:latest
@@ -219,8 +218,8 @@ services:
         condition: any
 
   jaeger:
-#    image: jaegertracing/all-in-one:lates
-t    image: jaegertracing/all-in-one:1.53  #Older version for OpenTracing compatibility
+    image: jaegertracing/all-in-one:1.53
+     #    image: jaegertracing/all-in-one:latest
     ports:
       - "14269"
       - "5778:5778"

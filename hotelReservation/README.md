@@ -16,6 +16,8 @@ Supported actions:
 - Docker-compose
 - luarocks (apt-get install luarocks)
 - luasocket (luarocks install luasocket)
+- libz-dev (apt-get install libz-dev)
+- luasocket (sudo-apt get install luasocket)
 
 ## Running the hotel reservation application
 ### Before you start
@@ -55,6 +57,29 @@ Read the Readme file in Openshift directory.
 Read the Readme file in Kubernetes directory.
 
 #### workload generation
+
+##### Make
+
+It is necessary to build the workload generator tool. Thus, please assert that:
+1. Your repository was cloned using `--recurse-submodules` or you pulled the submodules after the clone using `git submodule update --init --recursive`
+2. You have the "luajit", "luasocket", "libssl-dev" and "make" packages installed.
+3. You are not running inside arm 
+
+With the dependencies fulfilled, you can run: 
+
+```bash
+# There are two wrk2 folders: one in the root of the repository and one inside the HotelReservation folder. This is the first one.
+cd ../wrk2
+# Compile
+make
+```
+
+And then go back to the HotelReservation folder to run the wrk2 properly for the system.
+```bash
+# Back to HotelReservation, in the root folder.
+cd ../hotelresrvation
+```
+
 ```bash
 ../wrk2/wrk -D exp -t <num-threads> -c <num-conns> -d <duration> -L -s ./wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua http://x.x.x.x:5000 -R <reqs-per-sec>
 ```
@@ -62,3 +87,12 @@ Read the Readme file in Kubernetes directory.
 ### Questions and contact
 
 You are welcome to submit a pull request if you find a bug or have extended the application in an interesting way. For any questions please contact us at: <microservices-bench-L@list.cornell.edu>
+
+
+### DOCCLAB-specific modifications:
+
+Raja (03/30/25) - Modified Docker Compose to use Jaeger 1.53 image.  HotelReservations services apart from the Jaeger container are not able to send spans with the latest version of Jaeger.  I'm unsure of versions newer than 1.53.
+
+Raja (03/30/25) - Added lines so that Lua Hotel Reservation script looks for lua socker in the right directories on Ubuntu machines.
+
+Raja (03/30/25) - Added more info about compiling wrk2 and running Lua scripts.  It is copied from the SocialNetwork folde.r
