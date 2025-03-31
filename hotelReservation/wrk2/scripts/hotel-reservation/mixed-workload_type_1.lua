@@ -1,3 +1,7 @@
+-- The following two lines are needed for this script to access lua 5.1 (Raja - 03/30/25)
+package.cpath ="/usr/lib/x86_64-linux-gnu/lua/5.1/?.so;" .. package.cpath
+package.path = "/usr/share/lua/5.1/?.lua;" .. package.path
+
 local socket = require("socket")
 math.randomseed(socket.gettime()*1000)
 math.random(); math.random(); math.random()

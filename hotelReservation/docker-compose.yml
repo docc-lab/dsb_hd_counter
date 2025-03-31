@@ -219,7 +219,8 @@ services:
         condition: any
 
   jaeger:
-    image: jaegertracing/all-in-one:latest
+#    image: jaegertracing/all-in-one:lates
+t    image: jaegertracing/all-in-one:1.53  #Older version for OpenTracing compatibility
     ports:
       - "14269"
       - "5778:5778"
