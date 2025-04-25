@@ -18,8 +18,15 @@ COPY tune/ tune/
 
 COPY config.json config.json
 
-RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs perf_api.a services/perf/perf_api.o
+WORKDIR /workspace/services/perf
+RUN gcc -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o
 
-RUN CGO_ENABLED=0 GOOS=linux GO111MODULE=on go install -ldflags="-s -w" -mod=vendor ./cmd/...
+WORKDIR /workspace
+
+ENV CGO_ENABLED=1 \
+    CGO_LDFLAGS="-L/workspace/services/perf -lperf_api" \
+    CGO_CFLAGS="-I/workspace/services/perf"
+
+RUN GOOS=linux GO111MODULE=on go install -mod=vendor ./cmd/...
 
 
