@@ -100,6 +100,7 @@ func (s *Server) Shutdown() {
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
 	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile_counters")
 
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
@@ -171,7 +172,8 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	log.Trace().Msgf("In GetProfiles after getting resp")
 		
 	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return res, nil
 }
