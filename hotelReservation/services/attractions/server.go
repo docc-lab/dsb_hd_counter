@@ -249,7 +249,7 @@ func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []g
 
 	counterResults := C.perf_stop()
 	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
-	
+
 	return s.indexH.KNearest(
 		center,
 		maxSearchResults,
