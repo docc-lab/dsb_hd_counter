@@ -22,6 +22,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-profile"
 
 // Server implements the profile service
@@ -92,6 +99,7 @@ func (s *Server) Shutdown() {
 // GetProfiles returns hotel profiles for requested IDs
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
+	C.perf_start()
 
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
@@ -161,5 +169,9 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 
 	res.Hotels = hotels
 	log.Trace().Msgf("In GetProfiles after getting resp")
+		
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }

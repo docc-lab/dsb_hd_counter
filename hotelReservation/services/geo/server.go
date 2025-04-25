@@ -20,6 +20,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const (
 	name             = "srv-geo"
 	maxSearchRadius  = 10
@@ -95,6 +102,7 @@ func (s *Server) Shutdown() {
 // Nearby returns all hotels within a given distance.
 func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In geo Nearby")
+	C.perf_start()
 
 	var (
 		points = s.getNearbyPoints(ctx, float64(req.Lat), float64(req.Lon))
@@ -108,18 +116,25 @@ func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error
 		res.HotelIds = append(res.HotelIds, p.Id())
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
 func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
+	C.perf_start()
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
 		Plat: lat,
 		Plon: lon,
 	}
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return s.index.KNearest(
 		center,
 		maxSearchResults,

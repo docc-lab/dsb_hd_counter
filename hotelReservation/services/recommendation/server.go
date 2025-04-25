@@ -21,6 +21,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-recommendation"
 
 // Server implements the recommendation service
@@ -90,6 +97,8 @@ func (s *Server) Shutdown() {
 
 // GiveRecommendation returns recommendations within a given requirement.
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
+
 	res := new(pb.Result)
 	log.Trace().Msgf("GetRecommendations")
 	require := req.Require
@@ -147,7 +156,10 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 	} else {
 		log.Warn().Msgf("Wrong require parameter: %v", require)
 	}
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 

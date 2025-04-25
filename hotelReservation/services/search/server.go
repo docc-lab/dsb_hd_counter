@@ -21,6 +21,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-search"
 
 // Server implments the search service
@@ -129,6 +136,7 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
+	C.perf_start()
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
 	log.Trace().Msgf("nearby lon = %f", req.Lon)
@@ -166,5 +174,9 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		log.Trace().Msgf("get RatePlan HotelId = %s, Code = %s", ratePlan.HotelId, ratePlan.Code)
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
+		
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }

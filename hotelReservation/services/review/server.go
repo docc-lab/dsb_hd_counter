@@ -31,6 +31,13 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-review"
 
 // Server implements the rate service
@@ -110,6 +117,7 @@ type ImageHelper struct {
 }
 
 func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
 
 	res := new(pb.Result)
 	reviews := make([]*pb.ReviewComm, 0)
@@ -173,5 +181,9 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 	//reviewsEmpty := make([]*pb.ReviewComm, 0)
 
 	res.Reviews = reviews
+		
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }

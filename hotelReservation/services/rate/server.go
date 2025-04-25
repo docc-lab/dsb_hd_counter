@@ -24,6 +24,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-rate"
 
 // Server implements the rate service
@@ -91,6 +98,8 @@ func (s *Server) Shutdown() {
 
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
+
 	res := new(pb.Result)
 
 	ratePlans := make(RatePlans, 0)
@@ -177,7 +186,10 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 
 	sort.Sort(ratePlans)
 	res.RatePlans = ratePlans
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 

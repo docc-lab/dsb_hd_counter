@@ -20,6 +20,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-user"
 
 // Server implements the user service
@@ -89,6 +96,8 @@ func (s *Server) Shutdown() {
 
 // CheckUser returns whether the username and password are correct.
 func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
+
 	res := new(pb.Result)
 
 	log.Trace().Msg("CheckUser")
@@ -102,7 +111,10 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 	}
 
 	log.Trace().Msgf("CheckUser %d", res.Correct)
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 

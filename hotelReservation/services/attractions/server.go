@@ -20,6 +20,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const (
 	name             = "srv-attractions"
 	maxSearchRadius  = 10
@@ -110,6 +117,7 @@ func (s *Server) Shutdown() {
 // NearbyRest returns all restaurants close to the hotel.
 func (s *Server) NearbyRest(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyRest")
+	C.perf_start()
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_restaurant")
 	mongoSpan.SetTag("span.kind", "client")
@@ -141,12 +149,16 @@ func (s *Server) NearbyRest(ctx context.Context, req *pb.Request) (*pb.Result, e
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
 // NearbyMus returns all museums close to the hotel.
 func (s *Server) NearbyMus(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyMus")
+	C.perf_start()
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_museum")
 	mongoSpan.SetTag("span.kind", "client")
@@ -178,12 +190,16 @@ func (s *Server) NearbyMus(ctx context.Context, req *pb.Request) (*pb.Result, er
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
 // NearbyCinema returns all cinemas close to the hotel.
 func (s *Server) NearbyCinema(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyCinema")
+	C.perf_start()
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_cinema")
 	mongoSpan.SetTag("span.kind", "client")
@@ -215,11 +231,15 @@ func (s *Server) NearbyCinema(ctx context.Context, req *pb.Request) (*pb.Result,
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
 func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
+	C.perf_start()
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
@@ -227,6 +247,9 @@ func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []g
 		Plon: lon,
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	
 	return s.indexH.KNearest(
 		center,
 		maxSearchResults,
@@ -238,6 +261,7 @@ func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []g
 
 func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsRest, lat = %f, lon = %f", lat, lon)
+	C.perf_start()
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
@@ -245,6 +269,9 @@ func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []ge
 		Plon: lon,
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return s.indexR.KNearest(
 		center,
 		maxSearchResults,
@@ -256,6 +283,7 @@ func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []ge
 
 func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsMus, lat = %f, lon = %f", lat, lon)
+	C.perf_start()
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
@@ -263,6 +291,9 @@ func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geo
 		Plon: lon,
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return s.indexM.KNearest(
 		center,
 		maxSearchResults,
@@ -274,6 +305,7 @@ func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geo
 
 func (s *Server) getNearbyPointsCinema(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsCinema, lat = %f, lon = %f", lat, lon)
+	C.perf_start()
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
@@ -281,6 +313,9 @@ func (s *Server) getNearbyPointsCinema(ctx context.Context, lat, lon float64) []
 		Plon: lon,
 	}
 
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return s.indexC.KNearest(
 		center,
 		maxSearchResults,

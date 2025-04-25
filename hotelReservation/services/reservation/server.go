@@ -23,6 +23,13 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lmyfunc
+#include "../perf/perf_api.h"
+*/
+import "C"
+
 const name = "srv-reservation"
 
 // Server implements the user service
@@ -92,6 +99,8 @@ func (s *Server) Shutdown() {
 
 // MakeReservation makes a reservation based on given information
 func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
+
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
 
@@ -213,12 +222,17 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	}
 
 	res.HotelId = append(res.HotelId, hotelId)
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
 // CheckAvailability checks if given information is available
 func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	C.perf_start()
+
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
 
@@ -406,7 +420,10 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 			res.HotelId = append(res.HotelId, k)
 		}
 	}
-
+	
+	counterResults := C.perf_stop()
+	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+ 
 	return res, nil
 }
 
