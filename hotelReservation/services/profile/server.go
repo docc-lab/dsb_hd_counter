@@ -27,7 +27,7 @@ import (
 #cgo LDFLAGS: -L. -lmyfunc
 #include "../perf/perf_api.h"
 */
-import "C"
+// import "C"
 
 const name = "srv-profile"
 
