@@ -99,8 +99,8 @@ func (s *Server) Shutdown() {
 // GetProfiles returns hotel profiles for requested IDs
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
-	C.perf_start()
 	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	// C.perf_start()
 
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
@@ -113,8 +113,8 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		profileMap[hotelId] = struct{}{}
 	}
 
-	counterResults := C.perf_stop()
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	// counterResults := C.perf_stop()
+	counterSpan.SetTag("Machine Counter Readings", "test")
 	counterSpan.Finish()
 
 	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile")
