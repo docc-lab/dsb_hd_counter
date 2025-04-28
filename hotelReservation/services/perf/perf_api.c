@@ -89,6 +89,8 @@ const char* perf_stop() {
     if (!initialized) return "not_initialized";
 
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
+
+    ioctl(leader_fd, PERF_EVENT_IOC_REFRESH, 0);
     
     //long long cycles = -1, instructions = -1, l1_misses = -1;
     //int bytes_read = read(leader_fd, &cycles, sizeof(long long));
@@ -107,9 +109,14 @@ const char* perf_stop() {
       snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
       return error_buffer;
     }
-    if (bytes_read < sizeof(rf)) {
-      snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
-      return error_buffer;
+    //if (bytes_read < sizeof(rf)) {
+    //  snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
+    //  return error_buffer;
+    //}
+
+    if (rf.nr < 3) {
+        snprintf(error_buffer, sizeof(error_buffer), "not all events read: %d events", rf.nr);
+        return error_buffer;
     }
 
     long long cycles = rf.values[0].value;
