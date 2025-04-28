@@ -133,7 +133,7 @@ const char* perf_stop() {
 
     leader_fd = instructions_fd = l1_misses_fd = -1;
 
-    initialized = -1;
+    initialized = 0;
 
     return result_buffer;
 }
