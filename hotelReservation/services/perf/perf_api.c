@@ -109,10 +109,10 @@ const char* perf_stop() {
       snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
       return error_buffer;
     }
-    //if (bytes_read < sizeof(rf)) {
-    //  snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
-    //  return error_buffer;
-    //}
+    if (bytes_read < sizeof(rf)) {
+      snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
+      return error_buffer;
+    }
 
     if (rf.nr < 3) {
         snprintf(error_buffer, sizeof(error_buffer), "not all events read: %d events", rf.nr);
