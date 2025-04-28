@@ -90,7 +90,7 @@ const char* perf_stop() {
 
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
 
-    ioctl(leader_fd, PERF_EVENT_IOC_REFRESH, 0);
+    //ioctl(leader_fd, PERF_EVENT_IOC_REFRESH, 0);
     
     //long long cycles = -1, instructions = -1, l1_misses = -1;
     //int bytes_read = read(leader_fd, &cycles, sizeof(long long));
