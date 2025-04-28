@@ -113,10 +113,6 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		profileMap[hotelId] = struct{}{}
 	}
 
-	counterResults := C.perf_stop()
-	counterString := C.GoString(counterResults)  // <-- correctly interpret it
-	counterSpan.SetTag("Machine Counter Readings", counterString)
-	counterSpan.Finish()
 
 	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile")
 	memSpan.SetTag("span.kind", "client")
@@ -173,6 +169,11 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		}
 	}
 	wg.Wait()
+
+	counterResults := C.perf_stop()
+	counterString := C.GoString(counterResults)  // <-- correctly interpret it
+	counterSpan.SetTag("Machine Counter Readings", counterString)
+	counterSpan.Finish()
 
 	res.Hotels = hotels
 	log.Trace().Msgf("In GetProfiles after getting resp")
