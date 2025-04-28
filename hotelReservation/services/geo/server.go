@@ -102,7 +102,10 @@ func (s *Server) Shutdown() {
 // Nearby returns all hotels within a given distance.
 func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In geo Nearby")
-	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
+	}
 
 	var (
 		points = s.getNearbyPoints(ctx, float64(req.Lat), float64(req.Lon))
@@ -116,15 +119,19 @@ func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error
 		res.HotelIds = append(res.HotelIds, p.Id())
 	}
 
-	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return res, nil
 }
 
 func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
-	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
+	}
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
@@ -132,8 +139,9 @@ func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoind
 		Plon: lon,
 	}
 	
-	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return s.index.KNearest(
 		center,

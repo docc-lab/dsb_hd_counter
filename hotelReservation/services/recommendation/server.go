@@ -97,7 +97,10 @@ func (s *Server) Shutdown() {
 
 // GiveRecommendation returns recommendations within a given requirement.
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
+	}
 
 	res := new(pb.Result)
 	log.Trace().Msgf("GetRecommendations")
@@ -157,8 +160,9 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 		log.Warn().Msgf("Wrong require parameter: %v", require)
 	}
 	
-	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return res, nil
 }

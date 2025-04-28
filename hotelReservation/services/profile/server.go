@@ -100,8 +100,8 @@ func (s *Server) Shutdown() {
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
 	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start()== -1 {
-		log.Error().Msgf("PERF COULD NOT STARTED!")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
 	}
 
 	var wg sync.WaitGroup
@@ -118,7 +118,6 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 
 	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile")
 	memSpan.SetTag("span.kind", "client")
-	memSpan.SetTag("test", "test")
 	resMap, err := s.MemcClient.GetMulti(hotelIds)
 	memSpan.Finish()
 
@@ -172,9 +171,8 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	}
 	wg.Wait()
 
-	counterResults := C.perf_stop()
-	counterString := C.GoString(counterResults)  // <-- correctly interpret it
-	counterSpan.SetTag("Machine Counter Readings", counterString)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
 	counterSpan.Finish()
 
 	res.Hotels = hotels

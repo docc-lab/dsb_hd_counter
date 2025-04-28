@@ -98,7 +98,10 @@ func (s *Server) Shutdown() {
 
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
+	}
 
 	res := new(pb.Result)
 
@@ -187,8 +190,9 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	sort.Sort(ratePlans)
 	res.RatePlans = ratePlans
 	
-	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return res, nil
 }

@@ -136,7 +136,10 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
-	C.perf_start()
+	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+	if C.perf_start() == -1 {
+		counterSpan.SetTag("Error", "Failed to start perf counters")
+	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
 	log.Trace().Msgf("nearby lon = %f", req.Lon)
@@ -175,8 +178,9 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
 		
-	counterResults := C.perf_stop()
-	ctx = context.WithValue(ctx, "Machine Counter Readings", counterResults)
+	counterResults := C.GoString(C.perf_stop())
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
+	counterSpan.Finish()
  
 	return res, nil
 }
