@@ -16,6 +16,7 @@ static int leader_fd = -1;
 static int instructions_fd = -1;
 static int l1_misses_fd = -1;
 static char result_buffer[256];
+static char error_buffer[256];
 
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
@@ -84,9 +85,14 @@ const char* perf_stop() {
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
 
     long long cycles = -1, instructions = -1, l1_misses = -1;
-    read(leader_fd, &cycles, sizeof(long long));
+    int bytes_read = read(leader_fd, &cycles, sizeof(long long));
     read(instructions_fd, &instructions, sizeof(long long));
     read(l1_misses_fd, &l1_misses, sizeof(long long));
+
+    if (bytes_read == -1) {
+        snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
+        return error_buffer;
+    }
 
     snprintf(result_buffer, sizeof(result_buffer),
              "cycles=%lld, instructions=%lld, l1_misses=%lld",
