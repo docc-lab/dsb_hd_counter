@@ -24,6 +24,15 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
+struct read_format {
+    uint64_t nr;            // number of events
+    struct {
+        uint64_t value;     // counter value
+        uint64_t id;        // event ID
+    } values[3];
+};
+
+
 int perf_start() {
     if (!initialized) {
         struct perf_event_attr pe = {0};
@@ -80,16 +89,32 @@ const char* perf_stop() {
     if (!initialized) return "not_initialized";
 
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
+    
+    //long long cycles = -1, instructions = -1, l1_misses = -1;
+    //int bytes_read = read(leader_fd, &cycles, sizeof(long long));
+    //read(instructions_fd, &instructions, sizeof(long long));
+    //read(l1_misses_fd, &l1_misses, sizeof(long long));
 
-    long long cycles = -1, instructions = -1, l1_misses = -1;
-    int bytes_read = read(leader_fd, &cycles, sizeof(long long));
-    read(instructions_fd, &instructions, sizeof(long long));
-    read(l1_misses_fd, &l1_misses, sizeof(long long));
+    //if (bytes_read == -1) {
+    //    snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
+    //    return error_buffer;
+    //}
+    
+    struct read_format rf;
+    int bytes_read = read(leader_fd, &rf, sizeof(rf));
 
     if (bytes_read == -1) {
-        snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
-        return error_buffer;
+      snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
+      return error_buffer;
     }
+    if (bytes_read < sizeof(rf)) {
+      snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
+      return error_buffer;
+    }
+
+    long long cycles = rf.values[0].value;
+    long long instructions = rf.values[1].value;
+    long long l1_misses = rf.values[2].value;
 
     snprintf(result_buffer, sizeof(result_buffer),
              "cycles=%lld, instructions=%lld, l1_misses=%lld",
