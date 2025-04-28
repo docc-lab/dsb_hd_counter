@@ -28,11 +28,7 @@ int perf_start() {
     if (!initialized) {
         struct perf_event_attr pe = {0};
 
-        // // Pin to core 0
-        // cpu_set_t set;
-        // CPU_ZERO(&set);
-        // CPU_SET(0, &set);
-        // sched_setaffinity(0, sizeof(set), &set);
+        int cpu = sched_getcpu();
 
         // Leader: cycles
         pe.type = PERF_TYPE_HARDWARE;
@@ -42,7 +38,7 @@ int perf_start() {
         pe.exclude_kernel = 1;
         pe.exclude_hv = 1;
 
-        leader_fd = perf_event_open(&pe, 0, -1, -1, 0);
+        leader_fd = perf_event_open(&pe, 0, cpu, -1, 0);
         if (leader_fd == -1) {
             perror("perf_event_open (cycles)");
             return -1;
@@ -51,7 +47,7 @@ int perf_start() {
         // Instructions
         pe.disabled = 0;
         pe.config = PERF_COUNT_HW_INSTRUCTIONS;
-        instructions_fd = perf_event_open(&pe, 0, -1, leader_fd, 0);
+        instructions_fd = perf_event_open(&pe, 0, cpu, leader_fd, 0);
         if (instructions_fd == -1) {
             perror("perf_event_open (instructions)");
             close(leader_fd);
@@ -63,7 +59,7 @@ int perf_start() {
         pe.config = PERF_COUNT_HW_CACHE_L1D |
                     (PERF_COUNT_HW_CACHE_OP_READ << 8) |
                     (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
-        l1_misses_fd = perf_event_open(&pe, 0, -1, leader_fd, 0);
+        l1_misses_fd = perf_event_open(&pe, 0, cpu, leader_fd, 0);
         if (l1_misses_fd == -1) {
             perror("perf_event_open (l1_misses)");
             close(leader_fd);
