@@ -56,6 +56,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   search:
     configs:
@@ -76,6 +80,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   geo:
     configs:
@@ -97,6 +105,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   rate:
     configs:
@@ -119,6 +131,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   review:
     environment:
@@ -136,6 +152,10 @@ services:
       - memcached-review
       - consul
     restart: always
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
   
   attractions:
     environment:
@@ -152,6 +172,10 @@ services:
       - mongodb-attractions
       - consul
     restart: always
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   recommendation:
     configs:
@@ -173,6 +197,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   user:
     configs:
@@ -194,6 +222,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   reservation:
     configs:
@@ -216,6 +248,10 @@ services:
       replicas: 1
       restart_policy:
         condition: any
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
 
   jaeger:
     image: jaegertracing/all-in-one:1.53
