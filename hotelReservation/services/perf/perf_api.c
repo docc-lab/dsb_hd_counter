@@ -100,7 +100,7 @@ const char* perf_stop() {
     //    return error_buffer;
     //}
     
-    struct read_format rf;
+    struct read_format rf={0};
     int bytes_read = read(leader_fd, &rf, sizeof(rf));
 
     if (bytes_read == -1) {
