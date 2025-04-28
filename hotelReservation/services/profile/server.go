@@ -100,7 +100,9 @@ func (s *Server) Shutdown() {
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
 	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	C.perf_start()
+	if C.perf_start()== -1 {
+		log.Error().Msgf("PERF COULD NOT STARTED!")
+	}
 
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
