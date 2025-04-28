@@ -114,7 +114,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	}
 
 	counterResults := C.perf_stop()
-	counterSpan.SetTag("Machine Counter Readings", "test")
+	counterSpan.SetTag("Machine Counter Readings", counterResults)
 	counterSpan.Finish()
 
 	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile")
