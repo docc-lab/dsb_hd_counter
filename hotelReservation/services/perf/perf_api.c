@@ -83,7 +83,7 @@ const char* perf_stop() {
 
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
 
-    long long cycles = 0, instructions = 0, l1_misses = 0;
+    long long cycles = -1, instructions = -1, l1_misses = -1;
     read(leader_fd, &cycles, sizeof(long long));
     read(instructions_fd, &instructions, sizeof(long long));
     read(l1_misses_fd, &l1_misses, sizeof(long long));
