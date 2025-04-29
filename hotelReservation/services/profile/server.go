@@ -99,10 +99,14 @@ func (s *Server) Shutdown() {
 // GetProfiles returns hotel profiles for requested IDs
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In GetProfiles")
-	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start() == -1 {
-		counterSpan.SetTag("Error", "Failed to start perf counters")
-	}
+	//counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
+
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		if C.perf_start() == -1 {
+			counterSpan.SetTag("Error", "Failed to start perf counters")
+		}
+    	}
+
 
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
@@ -171,9 +175,14 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	}
 	wg.Wait()
 
-	counterResults := C.GoString(C.perf_stop())
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
-	counterSpan.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		counterResults := C.GoString(C.perf_stop())
+		counterSpan.SetTag("Machine Counter Readings", counterResults)
+    	}
+	
+	//counterResults := C.GoString(C.perf_stop())
+	//counterSpan.SetTag("Machine Counter Readings", counterResults)
+	//counterSpan.Finish()
 
 	res.Hotels = hotels
 	log.Trace().Msgf("In GetProfiles after getting resp")
