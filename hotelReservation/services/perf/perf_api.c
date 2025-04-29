@@ -92,36 +92,36 @@ const char* perf_stop() {
 
     //ioctl(leader_fd, PERF_EVENT_IOC_REFRESH, 0);
     
-    //long long cycles = -1, instructions = -1, l1_misses = -1;
-    //int bytes_read = read(leader_fd, &cycles, sizeof(long long));
-    //read(instructions_fd, &instructions, sizeof(long long));
-    //read(l1_misses_fd, &l1_misses, sizeof(long long));
-
-    //if (bytes_read == -1) {
-    //    snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
-    //    return error_buffer;
-    //}
-    
-    struct read_format rf={0};
-    int bytes_read = read(leader_fd, &rf, sizeof(rf));
+    long long cycles = -1, instructions = -1, l1_misses = -1;
+    int bytes_read = read(leader_fd, &cycles, sizeof(long long));
+    read(instructions_fd, &instructions, sizeof(long long));
+    read(l1_misses_fd, &l1_misses, sizeof(long long));
 
     if (bytes_read == -1) {
-      snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
-      return error_buffer;
-    }
-    if (bytes_read < sizeof(rf)) {
-      snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
-      return error_buffer;
-    }
-
-    if (rf.nr < 3) {
-        snprintf(error_buffer, sizeof(error_buffer), "not all events read: %d events", rf.nr);
+        snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
         return error_buffer;
     }
+    
+    //struct read_format rf={0};
+    //int bytes_read = read(leader_fd, &rf, sizeof(rf));
 
-    long long cycles = rf.values[0].value;
-    long long instructions = rf.values[1].value;
-    long long l1_misses = rf.values[2].value;
+    //if (bytes_read == -1) {
+    //  snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
+    //  return error_buffer;
+    //}
+    //if (bytes_read < sizeof(rf)) {
+    //  snprintf(error_buffer, sizeof(error_buffer), "read too small: %d bytes", bytes_read);
+    //  return error_buffer;
+    //}
+
+    //if (rf.nr < 3) {
+    //    snprintf(error_buffer, sizeof(error_buffer), "not all events read: %d events", rf.nr);
+    //    return error_buffer;
+    //}
+
+    //long long cycles = rf.values[0].value;
+    //long long instructions = rf.values[1].value;
+    //long long l1_misses = rf.values[2].value;
 
     snprintf(result_buffer, sizeof(result_buffer),
              "cycles=%lld, instructions=%lld, l1_misses=%lld",
