@@ -103,7 +103,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		if C.perf_start() == -1 {
-			counterSpan.SetTag("Error", "Failed to start perf counters")
+			span.SetTag("Error", "Failed to start perf counters")
 		}
     	}
 
@@ -177,7 +177,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		counterResults := C.GoString(C.perf_stop())
-		counterSpan.SetTag("Machine Counter Readings", counterResults)
+		span.SetTag("Machine Counter Readings", counterResults)
     	}
 	
 	//counterResults := C.GoString(C.perf_stop())
