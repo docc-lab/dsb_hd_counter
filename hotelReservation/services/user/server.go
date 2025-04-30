@@ -96,10 +96,11 @@ func (s *Server) Shutdown() {
 
 // CheckUser returns whether the username and password are correct.
 func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start() == -1 {
-		counterSpan.SetTag("Error", "Failed to start perf counters")
-	}
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		if C.perf_start() == -1 {
+			span.SetTag("Error", "Failed to start perf counters")
+		}
+    	}
 
 	res := new(pb.Result)
 
@@ -115,9 +116,10 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 
 	log.Trace().Msgf("CheckUser %d", res.Correct)
 	
-	counterResults := C.GoString(C.perf_stop())
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
-	counterSpan.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		counterResults := C.GoString(C.perf_stop())
+		span.SetTag("Machine Counter Readings", counterResults)
+    	}
  
 	return res, nil
 }
