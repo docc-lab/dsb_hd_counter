@@ -117,11 +117,12 @@ type ImageHelper struct {
 }
 
 func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start() == -1 {
-		counterSpan.SetTag("Error", "Failed to start perf counters")
-	}
-
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		if C.perf_start() == -1 {
+			span.SetTag("Error", "Failed to start perf counters")
+		}
+    	}
+	
 	res := new(pb.Result)
 	reviews := make([]*pb.ReviewComm, 0)
 
@@ -185,9 +186,10 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 
 	res.Reviews = reviews
 		
-	counterResults := C.GoString(C.perf_stop())
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
-	counterSpan.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		counterResults := C.GoString(C.perf_stop())
+		span.SetTag("Machine Counter Readings", counterResults)
+    	}
  
 	return res, nil
 }
