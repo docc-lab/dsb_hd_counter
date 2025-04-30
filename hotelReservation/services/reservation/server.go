@@ -99,11 +99,12 @@ func (s *Server) Shutdown() {
 
 // MakeReservation makes a reservation based on given information
 func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start() == -1 {
-		counterSpan.SetTag("Error", "Failed to start perf counters")
-	}
-
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		if C.perf_start() == -1 {
+			span.SetTag("Error", "Failed to start perf counters")
+		}
+    	}
+	
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
 
@@ -226,20 +227,22 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 
 	res.HotelId = append(res.HotelId, hotelId)
 	
-	counterResults := C.GoString(C.perf_stop())
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
-	counterSpan.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		counterResults := C.GoString(C.perf_stop())
+		span.SetTag("Machine Counter Readings", counterResults)
+    	}
  
 	return res, nil
 }
 
 // CheckAvailability checks if given information is available
 func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
-	if C.perf_start() == -1 {
-		counterSpan.SetTag("Error", "Failed to start perf counters")
-	}
-
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		if C.perf_start() == -1 {
+			span.SetTag("Error", "Failed to start perf counters")
+		}
+    	}
+	
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
 
@@ -428,9 +431,10 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		}
 	}
 	
-	counterResults := C.GoString(C.perf_stop())
-	counterSpan.SetTag("Machine Counter Readings", counterResults)
-	counterSpan.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		counterResults := C.GoString(C.perf_stop())
+		span.SetTag("Machine Counter Readings", counterResults)
+    	}
  
 	return res, nil
 }
