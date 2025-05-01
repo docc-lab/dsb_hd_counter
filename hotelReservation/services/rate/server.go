@@ -104,8 +104,9 @@ func (s *Server) Shutdown() {
 
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 
 	

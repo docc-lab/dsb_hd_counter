@@ -105,8 +105,9 @@ func (s *Server) Shutdown() {
 
 // MakeReservation makes a reservation based on given information
 func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 	
 	res := new(pb.Result)
@@ -241,8 +242,9 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 
 // CheckAvailability checks if given information is available
 func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 	
 	res := new(pb.Result)

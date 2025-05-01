@@ -142,8 +142,9 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)

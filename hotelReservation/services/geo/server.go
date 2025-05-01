@@ -109,8 +109,9 @@ func (s *Server) Shutdown() {
 func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In geo Nearby")
 
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 
 	var (

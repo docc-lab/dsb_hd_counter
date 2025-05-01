@@ -102,8 +102,9 @@ func (s *Server) Shutdown() {
 
 // CheckUser returns whether the username and password are correct.
 func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 
 	res := new(pb.Result)

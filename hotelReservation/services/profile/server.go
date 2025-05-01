@@ -107,8 +107,9 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	log.Trace().Msgf("In GetProfiles")
 	//counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
 
+	var cHandles C.struct_perf_handles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
+		cHandles = C.perf_start()
 	}
 
 
