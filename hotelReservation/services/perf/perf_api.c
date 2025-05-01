@@ -58,7 +58,7 @@ struct perf_handles perf_start() {
         // Instructions
         pe.disabled = 0;
         pe.config = PERF_COUNT_HW_INSTRUCTIONS;
-        handles.instructions_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
+        handles.instructions_fd = perf_event_open(&pe, 0, cpu, handles.leader_fd, PERF_FLAG_FD_CLOEXEC);
         if (handles.instructions_fd == -1) {
             perror("perf_event_open (instructions)");
             close(handles.leader_fd);
@@ -70,7 +70,7 @@ struct perf_handles perf_start() {
         pe.config = PERF_COUNT_HW_CACHE_L1D |
                     (PERF_COUNT_HW_CACHE_OP_READ << 8) |
                     (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
-        handles.l1_misses_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
+        handles.l1_misses_fd = perf_event_open(&pe, 0, cpu, handles.leader_fd, PERF_FLAG_FD_CLOEXEC);
         if (handles.l1_misses_fd == -1) {
             perror("perf_event_open (l1_misses)");
             close(handles.leader_fd);
