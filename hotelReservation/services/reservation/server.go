@@ -30,6 +30,12 @@ import (
 */
 import "C"
 
+type PerfHandles struct {
+    LeaderFD       int
+    InstructionsFD int
+    L1MissesFD     int
+}
+
 const name = "srv-reservation"
 
 // Server implements the user service
@@ -99,9 +105,10 @@ func (s *Server) Shutdown() {
 
 // MakeReservation makes a reservation based on given information
 func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
-    	}
+		cHandles = C.perf_start()
+	}
 	
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
@@ -228,16 +235,17 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
-    	}
+	}
  
 	return res, nil
 }
 
 // CheckAvailability checks if given information is available
 func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
-    	}
+		cHandles = C.perf_start()
+	}
 	
 	res := new(pb.Result)
 	res.HotelId = make([]string, 0)
@@ -430,7 +438,7 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
-    	}
+	}
  
 	return res, nil
 }

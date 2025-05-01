@@ -28,6 +28,12 @@ import (
 */
 import "C"
 
+type PerfHandles struct {
+    LeaderFD       int
+    InstructionsFD int
+    L1MissesFD     int
+}
+
 const name = "srv-recommendation"
 
 // Server implements the recommendation service
@@ -98,9 +104,10 @@ func (s *Server) Shutdown() {
 // GiveRecommendation returns recommendations within a given requirement.
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 
+	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
-    	}
+		cHandles = C.perf_start()
+	}
 	
 	res := new(pb.Result)
 	log.Trace().Msgf("GetRecommendations")
@@ -163,7 +170,7 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
-    	}
+	}
  
 	return res, nil
 }

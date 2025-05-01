@@ -27,6 +27,12 @@ import (
 */
 import "C"
 
+type PerfHandles struct {
+    LeaderFD       int
+    InstructionsFD int
+    L1MissesFD     int
+}
+
 const name = "srv-user"
 
 // Server implements the user service
@@ -96,11 +102,10 @@ func (s *Server) Shutdown() {
 
 // CheckUser returns whether the username and password are correct.
 func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
-    	}
+		cHandles = C.perf_start()
+	}
 
 	res := new(pb.Result)
 
@@ -117,9 +122,9 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 	log.Trace().Msgf("CheckUser %d", res.Correct)
 	
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
-    	}
+	}
  
 	return res, nil
 }

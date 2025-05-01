@@ -29,6 +29,12 @@ import (
 */
 import "C"
 
+type PerfHandles struct {
+    LeaderFD       int
+    InstructionsFD int
+    L1MissesFD     int
+}
+
 const name = "srv-profile"
 
 // Server implements the profile service
@@ -101,9 +107,10 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	log.Trace().Msgf("In GetProfiles")
 	//counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
 
+	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles := C.perf_start()
-    	}
+		cHandles = C.perf_start()
+	}
 
 
 	var wg sync.WaitGroup
@@ -176,7 +183,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
 		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
-    	}
+	}
 	
 	//counterResults := C.GoString(C.perf_stop())
 	//counterSpan.SetTag("Machine Counter Readings", counterResults)
