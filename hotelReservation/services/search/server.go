@@ -34,12 +34,6 @@ type PerfHandles struct {
     L1MissesFD     int
 }
 
-type PerfHandles struct {
-    LeaderFD       int
-    InstructionsFD int
-    L1MissesFD     int
-}
-
 const name = "srv-search"
 
 // Server implments the search service
