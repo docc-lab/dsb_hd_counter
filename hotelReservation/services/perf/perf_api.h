@@ -8,7 +8,7 @@ struct perf_handles {
 };
 
 // Start performance counters
-perf_handles perf_start();
+struct perf_handles perf_start();
 
 // Stop counters and return a result string like: "cycles=..., instructions=..., l1_misses=..."
 const char* perf_stop(int leader_fd, int instructions_fd, int l1_misses_fd);
