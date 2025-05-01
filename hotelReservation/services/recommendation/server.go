@@ -99,9 +99,7 @@ func (s *Server) Shutdown() {
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
+		cHandles := C.perf_start()
     	}
 	
 	res := new(pb.Result)
@@ -163,7 +161,7 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 	}
 	
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
     	}
  
