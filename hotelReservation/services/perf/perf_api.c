@@ -24,12 +24,6 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
-struct perf_handles {
-    int leader_fd;
-    int instructions_fd;
-    int l1_misses_fd;
-};
-
 struct read_format {
     uint64_t nr;            // number of events
     struct {
