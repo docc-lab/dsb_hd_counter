@@ -12,12 +12,12 @@
 #include <errno.h>
 #include <sched.h>
 
-static int initialized = 0;
-static int leader_fd = -1;
-static int instructions_fd = -1;
-static int l1_misses_fd = -1;
-static char result_buffer[256];
-static char error_buffer[256];
+__thread int initialized = 0;
+__thread int leader_fd = -1;
+__thread int instructions_fd = -1;
+__thread int l1_misses_fd = -1;
+__thread char result_buffer[256];
+__thread char error_buffer[256];
 
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
