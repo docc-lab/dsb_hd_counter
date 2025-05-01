@@ -27,6 +27,12 @@ import (
 */
 import "C"
 
+type PerfHandles struct {
+    LeaderFD       int
+    InstructionsFD int
+    L1MissesFD     int
+}
+
 const (
 	name             = "srv-geo"
 	maxSearchRadius  = 10
@@ -103,9 +109,7 @@ func (s *Server) Shutdown() {
 func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In geo Nearby")
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
+		cHandles := C.perf_start()
     	}
 
 	var (
@@ -121,7 +125,7 @@ func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error
 	}
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
     	}
  
