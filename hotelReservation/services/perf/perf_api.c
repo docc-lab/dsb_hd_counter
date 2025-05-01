@@ -33,7 +33,7 @@ struct read_format {
 };
 
 
-perf_handles perf_start() {
+struct perf_handles perf_start() {
     struct perf_handles handles = { .leader_fd = -1, .instructions_fd = -1, .l1_misses_fd = -1 };
     int initialized = 0;
     if (!initialized) {
