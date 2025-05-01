@@ -104,9 +104,8 @@ func (s *Server) Shutdown() {
 
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+		cHandles := C.perf_start()
 	}
 
 	
@@ -198,7 +197,7 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	res.RatePlans = ratePlans
 	
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
 		span.SetTag("Machine Counter Readings", counterResults)
 	}
  

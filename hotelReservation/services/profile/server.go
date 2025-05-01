@@ -107,9 +107,8 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	log.Trace().Msgf("In GetProfiles")
 	//counterSpan, _ := opentracing.StartSpanFromContext(ctx, "get_profile_counters")
 
-	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+		cHandles := C.perf_start()
 	}
 
 
@@ -181,7 +180,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	wg.Wait()
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
 		span.SetTag("Machine Counter Readings", counterResults)
 	}
 	

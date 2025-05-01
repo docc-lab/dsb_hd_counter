@@ -123,9 +123,8 @@ type ImageHelper struct {
 }
 
 func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+		cHandles := C.perf_start()
 	}
 	
 	res := new(pb.Result)
@@ -192,7 +191,7 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 	res.Reviews = reviews
 		
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
 		span.SetTag("Machine Counter Readings", counterResults)
 	}
  

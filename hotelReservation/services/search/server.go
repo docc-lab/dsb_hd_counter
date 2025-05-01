@@ -142,9 +142,8 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
-	var cHandles PerfHandles
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+		cHandles := C.perf_start()
 	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
@@ -185,7 +184,7 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 	}
 		
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
 		span.SetTag("Machine Counter Readings", counterResults)
 	}
  
