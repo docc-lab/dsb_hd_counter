@@ -130,22 +130,12 @@ func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error
 
 func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
-    	}
 
 	center := &geoindex.GeoPoint{
 		Pid:  "",
 		Plat: lat,
 		Plon: lon,
 	}
-	
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
-		span.SetTag("Machine Counter Readings", counterResults)
-    	}
  
 	return s.index.KNearest(
 		center,
