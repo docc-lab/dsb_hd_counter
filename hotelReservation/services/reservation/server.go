@@ -100,9 +100,7 @@ func (s *Server) Shutdown() {
 // MakeReservation makes a reservation based on given information
 func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
+		cHandles := C.perf_start()
     	}
 	
 	res := new(pb.Result)
@@ -228,7 +226,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	res.HotelId = append(res.HotelId, hotelId)
 	
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
     	}
  
@@ -238,9 +236,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 // CheckAvailability checks if given information is available
 func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		if C.perf_start() == -1 {
-			span.SetTag("Error", "Failed to start perf counters")
-		}
+		cHandles := C.perf_start()
     	}
 	
 	res := new(pb.Result)
@@ -432,7 +428,7 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 	}
 	
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop())
+		counterResults := C.GoString(C.perf_stop(C.int(cHandles.LeaderFD),C.int(cHandles.InstructionsFD),C.int(cHandles.L1MissesFD)))
 		span.SetTag("Machine Counter Readings", counterResults)
     	}
  
