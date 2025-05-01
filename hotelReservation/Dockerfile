@@ -19,7 +19,7 @@ COPY tune/ tune/
 COPY config.json config.json
 
 WORKDIR /workspace/services/perf
-RUN gcc -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o
+RUN gcc -std=c11 -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o
 
 WORKDIR /workspace
 
