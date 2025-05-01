@@ -12,10 +12,10 @@
 #include <errno.h>
 #include <sched.h>
 
-_Thread_local static int initialized = 0;
-_Thread_local static int leader_fd = -1;
-_Thread_local static int instructions_fd = -1;
-_Thread_local static int l1_misses_fd = -1;
+//_Thread_local static int initialized = 0;
+//_Thread_local static int leader_fd = -1;
+//_Thread_local static int instructions_fd = -1;
+//_Thread_local static int l1_misses_fd = -1;
 _Thread_local static char result_buffer[256];
 _Thread_local static char error_buffer[256];
 
@@ -23,6 +23,12 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
+
+struct perf_handles {
+    int leader_fd;
+    int instructions_fd;
+    int l1_misses_fd;
+};
 
 struct read_format {
     uint64_t nr;            // number of events
@@ -33,7 +39,9 @@ struct read_format {
 };
 
 
-int perf_start() {
+perf_handles perf_start() {
+    struct perf_handles handles = { .leader_fd = -1, .instructions_fd = -1, .l1_misses_fd = -1 };
+    int initialized = 0;
     if (!initialized) {
         struct perf_event_attr pe = {0};
 
@@ -47,20 +55,20 @@ int perf_start() {
         pe.exclude_kernel = 1;
         pe.exclude_hv = 1;
 
-        leader_fd = perf_event_open(&pe, 0, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-        if (leader_fd == -1) {
+        handles.leader_fd = perf_event_open(&pe, 0, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+        if (handles.leader_fd == -1) {
             perror("perf_event_open (cycles)");
-            return -1;
+            return handles;
         }
 
         // Instructions
         pe.disabled = 0;
         pe.config = PERF_COUNT_HW_INSTRUCTIONS;
-        instructions_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
-        if (instructions_fd == -1) {
+        handles.instructions_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
+        if (handles.instructions_fd == -1) {
             perror("perf_event_open (instructions)");
-            close(leader_fd);
-            return -1;
+            close(handles.leader_fd);
+            return handles;
         }
 
         // L1 cache misses
@@ -68,24 +76,25 @@ int perf_start() {
         pe.config = PERF_COUNT_HW_CACHE_L1D |
                     (PERF_COUNT_HW_CACHE_OP_READ << 8) |
                     (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
-        l1_misses_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
-        if (l1_misses_fd == -1) {
+        handles.l1_misses_fd = perf_event_open(&pe, 0, cpu, leader_fd, PERF_FLAG_FD_CLOEXEC);
+        if (handles.l1_misses_fd == -1) {
             perror("perf_event_open (l1_misses)");
-            close(leader_fd);
-            close(instructions_fd);
-            return -1;
+            close(handles.leader_fd);
+            close(handles.instructions_fd);
+            return handles;
         }
 
         initialized = 1;
     }
 
     // Reset and enable only if already initialized
-    ioctl(leader_fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(leader_fd, PERF_EVENT_IOC_ENABLE, 0);
-    return 0;
+    ioctl(handles.leader_fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(handles.leader_fd, PERF_EVENT_IOC_ENABLE, 0);
+    return handles;
 }
 
-const char* perf_stop() {
+const char* perf_stop(int leader_fd, int instructions_fd, int l1_misses_fd) {
+    int initialized = 1;
     if (!initialized) return "not_initialized";
 
     ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, 0);
