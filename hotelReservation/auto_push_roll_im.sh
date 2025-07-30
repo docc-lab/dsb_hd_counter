@@ -1,0 +1,10 @@
+./ims-build-push-rollout.sh attractions srv-attractions
+#./ims-build-push-rollout.sh frontend <tag>
+./ims-build-push-rollout.sh geo srv-geo
+./ims-build-push-rollout.sh profile srv-profile
+./ims-build-push-rollout.sh rate srv-rate
+./ims-build-push-rollout.sh recommendation srv-recommendation
+./ims-build-push-rollout.sh reservation srv-reservation
+./ims-build-push-rollout.sh review srv-review
+./ims-build-push-rollout.sh search srv-search
+./ims-build-push-rollout.sh user srv-user
