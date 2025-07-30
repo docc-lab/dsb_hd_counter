@@ -29,4 +29,24 @@ ENV CGO_ENABLED=1 \
 
 RUN GOOS=linux GO111MODULE=on go install -mod=vendor ./cmd/...
 
+# Final runtime stage
+FROM ubuntu:22.04
 
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy all built binaries from builder stage
+COPY --from=builder /go/bin/* ./
+
+# Copy configuration file
+COPY --from=builder /workspace/config.json ./
+
+# Copy static files for frontend service
+COPY --from=builder /workspace/services/frontend/static/ ./static/
+
+# Default command (can be overridden by entrypoint)
+CMD ["./frontend"]

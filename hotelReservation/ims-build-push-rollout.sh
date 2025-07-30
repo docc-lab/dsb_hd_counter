@@ -23,17 +23,26 @@ failed_services=()
 build_and_push_docker() {
     local service=$1
     local tag=$2
+    local base_image="hotelreservation-base:${tag}"
 
     log_info "Building and pushing Docker image for $service"
 
-    # Navigate to the service directory
-    cd "services/${service}" || { log_error "Failed to navigate to services/${service} directory"; return 1; }
+    # Check if base image already exists locally
+    if ! sudo docker image inspect "${base_image}" >/dev/null 2>&1; then
+        log_info "Building base Docker image: ${base_image}"
+        if ! sudo docker build -t "${base_image}" .; then
+            log_error "Docker build failed for base image"
+            return 1
+        fi
+        log_success "Base image built successfully"
+    else
+        log_info "Base image ${base_image} already exists, reusing it"
+    fi
 
-    # Build Docker image
-    log_info "Building Docker image for $service:$tag"
-    if ! sudo docker build -t "${REGISTRY}/${service}:${tag}" .; then
-        log_error "Docker build failed for $service"
-        cd ../..
+    # Tag the base image for the specific service
+    log_info "Tagging image for service $service:$tag"
+    if ! sudo docker tag "${base_image}" "${REGISTRY}/${service}:${tag}"; then
+        log_error "Docker tag failed for $service"
         return 1
     fi
 
@@ -41,11 +50,9 @@ build_and_push_docker() {
     log_info "Pushing Docker image for $service:$tag"
     if ! sudo docker push "${REGISTRY}/${service}:${tag}"; then
         log_error "Docker push failed for $service"
-        cd ../..
         return 1
     fi
 
-    cd ../.. || { log_error "Failed to navigate back from services/${service} directory"; return 1; }
     log_success "Successfully built and pushed Docker image for $service"
 }
 
