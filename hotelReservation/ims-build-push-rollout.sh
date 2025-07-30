@@ -8,20 +8,22 @@ VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation"
 
 # Function to show usage
 show_usage() {
-    echo "Usage: $0 <service|all> [tag]"
+    echo "Usage: $0 <service1 [service2 ...]|all> [tag]"
     echo ""
     echo "Arguments:"
-    echo "  service    Deploy a specific service (${VALID_SERVICES[*]})"
+    echo "  service    Deploy specific service(s) (${VALID_SERVICES[*]})"
     echo "  all        Deploy all valid services"
     echo "  tag        Docker image tag (default: debug0.1)"
     echo ""
     echo "Examples:"
-    echo "  $0 frontend debug0.2           # Deploy only frontend service"
-    echo "  $0 all debug0.1                # Deploy all valid services"
-    echo "  $0 all                         # Deploy all valid services with default tag"
+    echo "  $0 frontend debug0.2                    # Deploy only frontend"
+    echo "  $0 frontend geo profile debug0.1        # Deploy multiple specific services"
+    echo "  $0 all debug0.1                         # Deploy all valid services"
+    echo "  $0 all                                  # Deploy all (default tag)"
     echo ""
     echo "Valid services: ${VALID_SERVICES[*]}"
     echo "Note: 'review' and 'attractions' do not have kubernetes deployment files"
+    echo "Rollout timeout: 60 seconds per service"
 }
 
 # Function for consistent log formatting
@@ -97,7 +99,7 @@ check_rollout() {
     log_info "Checking rollout status for updated service"
 
     log_info "Checking rollout status for $service"
-    if ! kubectl rollout status "deployment/${service}" --timeout=300s; then
+    if ! kubectl rollout status "deployment/${service}" --timeout=30s; then
         log_error "Rollout failed for $service"
         failed_rollouts+=("$service")
         success=false
@@ -114,24 +116,33 @@ check_rollout() {
     return 0
 }
 
-# Function to deploy all valid services
-deploy_all_services() {
-    local tag=$1
+# Function to deploy multiple services
+deploy_multiple_services() {
+    local services=("$@")
+    local tag="${services[-1]}"  # Last argument is the tag
+    unset 'services[-1]'        # Remove tag from services array
     local failed_services=()
     
+    # Check if tag looks like a service name instead of a tag
+    for valid_service in "${VALID_SERVICES[@]}"; do
+        if [[ "$tag" == "$valid_service" ]]; then
+            # Last argument is actually a service, not a tag
+            services+=("$tag")
+            tag="debug0.1"  # Use default tag
+            break
+        fi
+    done
+    
     echo "=========================================="
-    echo "Deploying All Hotel Reservation Services"
+    echo "Deploying Hotel Reservation Services"
+    echo "Services: ${services[*]}"
     echo "Tag: $tag"
-    echo "Valid services: ${VALID_SERVICES[*]}"
     echo "=========================================="
     
-    for service in "${VALID_SERVICES[@]}"; do
+    for service in "${services[@]}"; do
         echo ""
         echo "Building and Deploying $service"
         echo "----------------------------------------"
-        
-        # Reset failed_services array for individual service
-        failed_services_single=()
         
         # Build and push
         if ! build_and_push_docker "$service" "$tag"; then
@@ -193,11 +204,46 @@ fi
 if [[ "$1" == "all" ]]; then
     TAG="${2:-debug0.1}"  # Default to debug0.1 if no tag provided
     log_info "Deploying all valid services with tag: $TAG"
-    deploy_all_services "$TAG"
+    deploy_multiple_services "${VALID_SERVICES[@]}" "$TAG"
     exit $?
 fi
 
-# Validate single service
+# Check if multiple services provided
+if [[ $# -gt 1 ]]; then
+    # Validate all provided services
+    services_to_deploy=()
+    tag="debug0.1"  # Default tag
+    
+    for arg in "$@"; do
+        # Check if this argument is a valid service
+        if validate_service "$arg"; then
+            services_to_deploy+=("$arg")
+        else
+            # Check if this looks like a tag (contains dots, numbers, or common tag patterns)
+            if [[ "$arg" =~ ^[a-zA-Z0-9._-]+$ && ! "$arg" =~ ^(review|attractions)$ ]]; then
+                tag="$arg"
+            else
+                log_error "Invalid service: '$arg'"
+                echo ""
+                show_usage
+                exit 1
+            fi
+        fi
+    done
+    
+    if [[ ${#services_to_deploy[@]} -eq 0 ]]; then
+        log_error "No valid services specified"
+        echo ""
+        show_usage
+        exit 1
+    fi
+    
+    log_info "Deploying multiple services: ${services_to_deploy[*]} with tag: $tag"
+    deploy_multiple_services "${services_to_deploy[@]}" "$tag"
+    exit $?
+fi
+
+# Single service deployment
 if ! validate_service "$1"; then
     log_error "Service '$1' is not a valid deployable service."
     echo ""
