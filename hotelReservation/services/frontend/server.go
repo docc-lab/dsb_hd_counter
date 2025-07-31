@@ -50,6 +50,8 @@ type Server struct {
 
 // Run the server
 func (s *Server) Run() error {
+	opentracing.SetGlobalTracer(s.Tracer)
+
 	if s.Port == 0 {
 		return fmt.Errorf("Server port must be set")
 	}

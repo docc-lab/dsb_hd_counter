@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	defaultSampleRatio float64 = 0.01
+	defaultSampleRatio float64 = 0.99
 )
 
 // Init returns a newly configured tracer
