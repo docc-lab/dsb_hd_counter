@@ -2,6 +2,7 @@
 
 # Configuration
 REGISTRY="docclabgroup"
+IMAGE_NAME="hotelreservation"
 
 # List of services that have kubernetes deployment files
 VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -9,6 +10,11 @@ VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation"
 # Function to show usage
 show_usage() {
     echo "Usage: $0 <service1 [service2 ...]|all> [tag]"
+    echo ""
+    echo "This script follows the working approach from kubernetes/scripts/:"
+    echo "  • Builds a single 'hotelreservation' image (not per-service images)"
+    echo "  • Updates deployment YAML files with new image"
+    echo "  • Applies updated deployments to Kubernetes"
     echo ""
     echo "Arguments:"
     echo "  service    Deploy specific service(s) (${VALID_SERVICES[*]})"
@@ -22,6 +28,7 @@ show_usage() {
     echo "  $0 all                                  # Deploy all (default tag)"
     echo ""
     echo "Valid services: ${VALID_SERVICES[*]}"
+    echo "Registry: ${REGISTRY}/${IMAGE_NAME}"
     echo "Note: 'review' and 'attractions' do not have kubernetes deployment files"
     echo "Rollout timeout: 60 seconds per service"
 }
@@ -53,41 +60,53 @@ validate_service() {
     return 1
 }
 
-# Function to build and push Docker image
+# Function to build and push Docker image (single image for all services)
 build_and_push_docker() {
-    local service=$1
-    local tag=$2
-    local base_image="hotelreservation-base:${tag}"
+    local tag=$1
+    local image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
 
-    log_info "Building and pushing Docker image for $service"
+    log_info "Building and pushing single Docker image for all services"
 
-    # Check if base image already exists locally
-    if ! sudo docker image inspect "${base_image}" >/dev/null 2>&1; then
-        log_info "Building base Docker image: ${base_image}"
-        if ! sudo docker build -t "${base_image}" .; then
-            log_error "Docker build failed for base image"
+    # Get architecture and decide platform
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64)
+            PLATFORM="linux/amd64"
+            ;;
+        aarch64|arm64)
+            PLATFORM="linux/arm64"
+            ;;
+        armv7l)
+            PLATFORM="linux/arm/v7"
+            ;;
+        *)
+            log_error "Unsupported architecture: $ARCH"
+            return 1
+            ;;
+    esac
+
+    # Check if image already exists locally
+    if ! sudo docker image inspect "${image_full_name}" >/dev/null 2>&1; then
+        log_info "Building Docker image: ${image_full_name}"
+        log_info "Platform: ${PLATFORM}"
+        
+        # Use docker buildx for better platform support
+        if ! sudo docker buildx build --no-cache -t "${image_full_name}" \
+            -f Dockerfile . --platform "${PLATFORM}" --push; then
+            log_error "Docker build/push failed"
             return 1
         fi
-        log_success "Base image built successfully"
+        log_success "Image built and pushed successfully"
     else
-        log_info "Base image ${base_image} already exists, reusing it"
+        log_info "Image ${image_full_name} already exists locally"
+        # Still push in case remote is outdated
+        log_info "Pushing existing image to registry"
+        if ! sudo docker push "${image_full_name}"; then
+            log_error "Docker push failed"
+            return 1
+        fi
+        log_success "Image pushed successfully"
     fi
-
-    # Tag the base image for the specific service
-    log_info "Tagging image for service $service:$tag"
-    if ! sudo docker tag "${base_image}" "${REGISTRY}/${service}:${tag}"; then
-        log_error "Docker tag failed for $service"
-        return 1
-    fi
-
-    # Push Docker image
-    log_info "Pushing Docker image for $service:$tag"
-    if ! sudo docker push "${REGISTRY}/${service}:${tag}"; then
-        log_error "Docker push failed for $service"
-        return 1
-    fi
-
-    log_success "Successfully built and pushed Docker image for $service"
 }
 
 # Function to check rollout status
@@ -116,7 +135,78 @@ check_rollout() {
     return 0
 }
 
-# Function to deploy multiple services
+# Function to update YAML files with new image
+update_yaml_files() {
+    local services=("$@")
+    local tag="${services[-1]}"  # Last argument is the tag
+    unset 'services[-1]'        # Remove tag from services array
+    local image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
+    local yaml_dir="kubernetes"
+    local updated_files=()
+    
+    # Check if tag looks like a service name instead of a tag
+    for valid_service in "${VALID_SERVICES[@]}"; do
+        if [[ "$tag" == "$valid_service" ]]; then
+            # Last argument is actually a service, not a tag
+            services+=("$tag")
+            tag="debug0.1"  # Use default tag
+            image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
+            break
+        fi
+    done
+    
+    log_info "Updating YAML files to use image: ${image_full_name}"
+    
+    # Update deployment YAML files for specified services
+    for service in "${services[@]}"; do
+        local deployment_file="${yaml_dir}/${service}/${service}-deployment.yaml"
+        
+        # Handle special cases where directory names differ
+        case $service in
+            "recommendation")
+                deployment_file="${yaml_dir}/reccomend/recommendation-deployment.yaml"
+                ;;
+            "reservation")
+                deployment_file="${yaml_dir}/reserve/reservation-deployment.yaml"
+                ;;
+        esac
+        
+        if [[ -f "$deployment_file" ]]; then
+            log_info "Updating $deployment_file"
+            
+            # Create backup
+            cp "$deployment_file" "${deployment_file}.backup"
+            
+            # Update the image line
+            if sed -i 's|image: deathstarbench/hotel-reservation:latest|image: '"${image_full_name}"'|g' "$deployment_file"; then
+                if sed -i 's|image: '"${REGISTRY}/${IMAGE_NAME}"':.*|image: '"${image_full_name}"'|g' "$deployment_file"; then
+                    log_success "Updated $deployment_file"
+                    updated_files+=("$deployment_file")
+                else
+                    log_error "Failed to update $deployment_file"
+                    # Restore backup
+                    mv "${deployment_file}.backup" "$deployment_file"
+                fi
+            else
+                log_error "Failed to update $deployment_file"
+                # Restore backup
+                mv "${deployment_file}.backup" "$deployment_file"
+            fi
+        else
+            log_error "Deployment file not found: $deployment_file"
+        fi
+    done
+    
+    if [[ ${#updated_files[@]} -gt 0 ]]; then
+        log_success "Updated ${#updated_files[@]} YAML files"
+        return 0
+    else
+        log_error "No YAML files were updated"
+        return 1
+    fi
+}
+
+# Function to deploy services (build + update YAML + apply)
 deploy_multiple_services() {
     local services=("$@")
     local tag="${services[-1]}"  # Last argument is the tag
@@ -137,31 +227,52 @@ deploy_multiple_services() {
     echo "Deploying Hotel Reservation Services"
     echo "Services: ${services[*]}"
     echo "Tag: $tag"
+    echo "Image: ${REGISTRY}/${IMAGE_NAME}:${tag}"
     echo "=========================================="
     
+    # Phase 1: Build and push single image (only once)
+    log_info "Phase 1: Building and pushing Docker image"
+    if ! build_and_push_docker "$tag"; then
+        log_error "Failed to build/push image"
+        return 1
+    fi
+    
+    # Phase 2: Update YAML files
+    log_info "Phase 2: Updating deployment YAML files"
+    if ! update_yaml_files "${services[@]}" "$tag"; then
+        log_error "Failed to update YAML files"
+        return 1
+    fi
+    
+    # Phase 3: Apply updated deployments and check rollouts
+    log_info "Phase 3: Applying deployments and checking rollouts"
     for service in "${services[@]}"; do
         echo ""
-        echo "Building and Deploying $service"
+        echo "Deploying $service"
         echo "----------------------------------------"
         
-        # Build and push
-        if ! build_and_push_docker "$service" "$tag"; then
-            failed_services+=("$service")
-            echo "❌ $service build/push failed"
-            continue
-        fi
+        local deployment_file="kubernetes/${service}/${service}-deployment.yaml"
         
-        # Update deployment
-        log_info "Phase 3: Updating Kubernetes deployment for $service"
-        log_info "Setting new image for $service"
-        if ! kubectl set image "deployment/$service" "hotel-reserv-$service=${REGISTRY}/$service:$tag"; then
-            log_error "Failed to update image for $service"
+        # Handle special cases
+        case $service in
+            "recommendation")
+                deployment_file="kubernetes/reccomend/recommendation-deployment.yaml"
+                ;;
+            "reservation")
+                deployment_file="kubernetes/reserve/reservation-deployment.yaml"
+                ;;
+        esac
+        
+        # Apply the deployment
+        log_info "Applying deployment for $service"
+        if ! kubectl apply -f "$deployment_file"; then
+            log_error "Failed to apply deployment for $service"
             failed_services+=("$service")
             continue
         fi
         
         # Check rollout
-        log_info "Phase 4: Checking rollout status for $service"
+        log_info "Checking rollout status for $service"
         if ! check_rollout "$service"; then
             log_error "Rollout failed for $service"
             failed_services+=("$service")
@@ -253,34 +364,5 @@ fi
 
 log_info "Service '$1' validated successfully"
 
-# Second Phase: Build and Push Docker Images
-log_info "Phase 2: Building and pushing Docker images"
-echo -e "\n----------------------------------------"
-if ! build_and_push_docker "$1" "$2"; then
-    failed_services+=("$1")
-fi
-echo "----------------------------------------"
-
-if [ ${#failed_services[@]} -ne 0 ]; then
-    log_error "Failed to build/push the following services: ${failed_services[*]}"
-    exit 1
-fi
-
-# Third Phase: Update Kubernetes Deployments
-log_info "Phase 3: Updating Kubernetes deployments"
-echo "Updating all service images simultaneously..."
-
-log_info "Setting new image for $1"
-kubectl set image "deployment/$1" "hotel-reserv-$1=${REGISTRY}/$1:$2" &
-
-# Wait for all kubectl set image commands to complete
-log_info "Waiting for all image updates to complete"
-wait
-log_success "All deployment image updates initiated"
-
-# Fourth Phase: Check Rollout Status
-log_info "Phase 4: Checking rollout status for updated service"
-if ! check_rollout "$1"; then
-    log_error "Deployment failed to roll out properly"
-    exit 1
-fi
+# Deploy single service using the new approach
+deploy_multiple_services "$1" "${2:-debug0.1}"
