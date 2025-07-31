@@ -41,7 +41,5 @@ spec:
             capabilities:
               add:
               - SYS_ADMIN
-            appArmorProfile:
-              type: Unconfined
       restartPolicy: Always
 status: {}
