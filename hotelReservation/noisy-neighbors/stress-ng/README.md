@@ -1,0 +1,265 @@
+# Stress-ng for Kubernetes
+
+A simple toolkit for creating "noisy neighbor" pods in Kubernetes using stress-ng. Perfect for testing how your services handle resource contention.
+
+## 🚀 Quick Start
+
+1. **Build and push the Docker image:**
+   ```bash
+   ./build-stress-ng.sh yourusername
+   ```
+
+2. **Update the username in helpers:**
+   ```bash
+   # Edit stress-ng-helpers.sh and change:
+   USERNAME="yourusername"  # <- Change this to your Docker Hub username
+   ```
+
+3. **Start stress testing:**
+   ```bash
+   # Option 1: Use helper commands
+   alias my-stressng='./stress-ng-helpers.sh'
+   my-stressng cpu 4 60s
+
+   # Option 2: Use kubectl directly
+   kubectl run cpu-stress --image=yourusername/stress-ng --restart=Never -- --cpu 4 --timeout 60s
+   ```
+
+## 📁 Files
+
+- `Dockerfile` - Builds stress-ng container
+- `build-stress-ng.sh` - Builds and pushes Docker image
+- `stress-ng-helpers.sh` - Convenient wrapper commands
+- `README.md` - This file
+
+## 🛠️ Helper Commands
+
+After setting up the alias `alias my-stressng='./stress-ng-helpers.sh'`:
+
+### Core Stress Tests
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `my-stressng cpu [workers] [duration]` | CPU stress | `my-stressng cpu 4 120s` |
+| `my-stressng memory [workers] [duration]` | Memory pressure | `my-stressng memory 2 60s` |
+| `my-stressng vm [workers] [size] [duration]` | Virtual memory stress | `my-stressng vm 2 1G 60s` |
+| `my-stressng pagefault [workers] [duration]` | Page fault stress | `my-stressng pagefault 1 30s` |
+| `my-stressng io [workers] [duration]` | I/O stress | `my-stressng io 2 60s` |
+| `my-stressng network [workers] [duration]` | Network stress | `my-stressng network 1 45s` |
+
+### Special Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `my-stressng noisy [duration]` | Combined noisy neighbor | `my-stressng noisy 300s` |
+| `my-stressng status` | Show running stress pods | `my-stressng status` |
+| `my-stressng cleanup` | Remove all stress pods | `my-stressng cleanup` |
+| `my-stressng help` | Show help | `my-stressng help` |
+
+## 📋 kubectl Examples
+
+### Basic Stress Tests
+
+**CPU stress - 4 workers for 2 minutes**
+```bash
+# Helper shorthand:
+my-stressng cpu 4 120s
+
+# Equivalent kubectl command:
+kubectl run cpu-stress --image=yourusername/stress-ng --restart=Never -- --cpu 4 --timeout 120s
+```
+
+**Memory pressure - heap expansion**
+```bash
+# Helper shorthand:
+my-stressng memory 2 60s
+
+# Equivalent kubectl command:
+kubectl run mem-stress --image=yourusername/stress-ng --restart=Never -- --brk 2 --timeout 60s
+```
+
+**VM stress - 2 workers with 1GB each**
+```bash
+# Helper shorthand:
+my-stressng vm 2 1G 60s
+
+# Equivalent kubectl command:
+kubectl run vm-stress --image=yourusername/stress-ng --restart=Never -- --vm 2 --vm-bytes 1G --timeout 60s
+```
+
+**Page fault stress**
+```bash
+# Helper shorthand:
+my-stressng pagefault 1 60s
+
+# Equivalent kubectl command:
+kubectl run page-fault --image=yourusername/stress-ng --restart=Never -- --fault 1 --timeout 60s
+```
+
+**I/O stress**
+```bash
+# Helper shorthand:
+my-stressng io 2 60s
+
+# Equivalent kubectl command:
+kubectl run io-stress --image=yourusername/stress-ng --restart=Never -- --io 2 --timeout 60s
+```
+
+**Network stress**
+```bash
+# Helper shorthand:
+my-stressng network 2 60s
+
+# Equivalent kubectl command:
+kubectl run network-stress --image=yourusername/stress-ng --restart=Never -- --sock 2 --timeout 60s
+```
+
+### Advanced Examples
+
+**Combined noisy neighbor - combines multiple stressors**
+```bash
+# Helper shorthand:
+my-stressng noisy 0  # 0 = infinite duration
+
+# Equivalent kubectl command:
+kubectl run noisy-neighbor --image=yourusername/stress-ng --restart=Never -- \
+  --cpu 2 --vm 1 --vm-bytes 1G --brk 1 --io 2 --sock 1 --timeout 0
+```
+
+
+**With resource limits**
+```bash
+# Helper shorthand:
+# Cannot use helper shorthand, must directly use kubectl with --limits flag
+
+# kubectl command:
+kubectl run limited-stress --image=yourusername/stress-ng --restart=Never \
+  --limits="cpu=2,memory=1Gi" -- --cpu 4 --vm 1 --vm-bytes 512M --timeout 0
+```
+
+### Target Specific Nodes
+```bash
+# Helper shorthand:
+# Cannot use helper shorthand, must directly use kubectl with --overrides flag
+
+# kubectl command:
+kubectl run node-stress --image=yourusername/stress-ng --restart=Never \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-node-1"}}}' \
+  -- --cpu 4 --timeout 300s
+```
+
+## 🧹 Cleanup
+```bash
+# Helper shorthand:
+my-stressng cleanup
+
+# Equivalent kubectl commands:
+kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress network-stress noisy-neighbor heavy-load limited-stress node-stress
+```
+
+## 📊 Monitoring Impact
+
+Watch the impact on your services:
+```bash
+# Monitor resource usage
+kubectl top pods
+kubectl top nodes
+
+# Watch victim service's logs
+kubectl logs -f victim-pod
+
+# Monitor node metrics
+kubectl describe node victim-node
+
+# Watch in real-time
+watch kubectl get pods -o wide
+```
+
+## ⚙️ Stress-ng Parameters
+
+### Common Options
+- `--cpu N` - Number of CPU workers (0 = all CPUs)
+- `--vm N` - Number of VM workers
+- `--vm-bytes SIZE` - Memory per VM worker (256M, 512M, 1G, 2G)
+- `--brk N` - Memory pressure via heap expansion
+- `--fault N` - Page fault workers
+- `--io N` - I/O workers
+- `--sock N` - Socket workers
+- `--timeout TIME` - Duration (60s, 5m, 1h, 0 = infinite)
+
+### Memory Sizes
+- `256M` = 256 megabytes
+- `512M` = 512 megabytes  
+- `1G` = 1 gigabyte
+- `2G` = 2 gigabytes
+- `50%` = 50% of available memory
+
+## 🎯 Use Cases
+
+### Test Scenarios
+1. **CPU Starvation** - High CPU load to test CPU contention
+2. **Memory Pressure** - Force memory allocation to test OOM conditions
+3. **I/O Bottlenecks** - Heavy disk I/O to simulate storage issues
+4. **Mixed Workloads** - Combined stress to simulate realistic noisy neighbors
+
+### Example Test Session
+```bash
+# Set up alias
+alias my-stressng='./stress-ng-helpers.sh'
+
+# Start background noisy neighbor
+my-stressng noisy &
+
+# Test hotelreservation application performance
+# in a loop for manual curl
+curl -v "http://192.168.161.9:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194"
+# or use load generator wrk2
+
+# Add more specific stress
+my-stressng cpu 4 120s    # CPU pressure for 2 minutes
+my-stressng vm 2 1G 60s   # Memory pressure for 1 minute
+
+# Check what's running
+my-stressng status
+
+# Clean up when done
+my-stressng cleanup
+```
+
+## 🔧 Troubleshooting
+
+### Image Build Issues
+```bash
+# Clean up failed builds
+docker system prune -f
+
+# Test locally first
+docker build -t stress-ng-local .
+docker run --rm stress-ng-local --version
+```
+
+### Permission Issues
+```bash
+# If pods fail to start, check:
+kubectl describe pod stress-test-pod
+kubectl logs stress-test-pod
+```
+
+### Resource Limits
+```bash
+# If stress test seems limited, check node resources:
+kubectl describe node
+kubectl top node
+```
+
+## 🚨 Notes
+
+- **Set timeouts** - Avoid infinite tests time
+- **Use resource limits** - Prevent complete resource exhaustion
+- **Test incrementally** - Start with light loads and increase gradually
+
+## 📚 References
+
+- [Official stress-ng documentation](https://colinianking.github.io/stress-ng/)
+- [stress-ng man page](https://manpages.ubuntu.com/manpages/focal/man1/stress-ng.1.html)
+- [Kubernetes resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
