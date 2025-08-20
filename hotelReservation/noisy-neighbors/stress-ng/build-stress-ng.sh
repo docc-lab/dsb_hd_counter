@@ -3,12 +3,18 @@
 # Build and push stress-ng Docker image
 # Usage: ./build-stress-ng.sh [your-dockerhub-username]
 
-USERNAME=${1:-"yourusername"}
+if [ -z "$1" ]; then
+    echo "Usage: $0 <dockerhub-username>"
+    echo "Example: $0 myusername"
+    exit 1
+fi
+
+USERNAME="$1"
 IMAGE_NAME="stress-ng"
 VERSION="0.17.08"
 LATEST_TAG="latest"
 
-echo "Building stress-ng Docker image..."
+echo "Building stress-ng Docker image for user: $USERNAME"
 
 # Build the image
 docker build -t ${USERNAME}/${IMAGE_NAME}:${VERSION} .
