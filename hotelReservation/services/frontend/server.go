@@ -215,6 +215,12 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	ctx := r.Context()
 
+	span := opentracing.StartSpan("manual-test-span")
+        span.SetTag("handler", "searchHandler")
+        span.SetTag("test", "debugging")
+        defer span.Finish()
+        log.Info().Msg("Created manual test span")
+
 	log.Trace().Msg("starts searchHandler")
 
 	// in/out dates from query params

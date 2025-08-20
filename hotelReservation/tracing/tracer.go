@@ -34,7 +34,8 @@ func Init(serviceName, host string) (opentracing.Tracer, error) {
 		Reporter: &config.ReporterConfig{
 			LogSpans:            false,
 			BufferFlushInterval: 1 * time.Second,
-			LocalAgentHostPort:  host,
+			CollectorEndpoint: "http://jaeger:14268/api/traces",
+			//LocalAgentHostPort:  host,
 		},
 	}
 

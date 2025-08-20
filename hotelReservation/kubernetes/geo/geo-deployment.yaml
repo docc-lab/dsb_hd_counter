@@ -37,5 +37,9 @@ spec:
               cpu: 100m
             limits:
               cpu: 1000m
+          securityContext:
+            capabilities:
+              add:
+              - SYS_ADMIN
       restartPolicy: Always
 status: {}
