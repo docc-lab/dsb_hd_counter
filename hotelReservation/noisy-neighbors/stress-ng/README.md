@@ -6,7 +6,7 @@ A simple toolkit for creating "noisy neighbor" pods in Kubernetes using stress-n
 
 1. **Build and push the Docker image:**
    ```bash
-   ./build-stress-ng.sh yourusername
+   ./build-stress-ng.sh yourusername 
    ```
 
 2. **Update the username in helpers:**
