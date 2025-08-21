@@ -1,5 +1,15 @@
 #!/bin/bash
-# service-monitor.sh - Fixed version
+# service-monitor.sh - Enhanced with perf counter sets
+
+# Define counter sets for different experiments
+declare -A COUNTER_SETS=(
+    ["basic"]="cycles,instructions,cache-references,cache-misses"
+    ["cpu"]="cycles,instructions,branch-instructions,branch-misses,cpu-clock,task-clock"
+    ["memory"]="cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses"
+    ["scheduling"]="context-switches,cpu-migrations,page-faults,minor-faults,major-faults"
+    ["bandwidth"]="cycles,instructions,cache-references,cache-misses,bus-cycles"
+    ["interference"]="cycles,instructions,cache-misses,context-switches,page-faults,L1-dcache-load-misses"
+)
 
 resolve_service_to_pod() {
     local service_name=$1
@@ -25,6 +35,7 @@ monitor_service_remote() {
     local service_name=$1
     local namespace=${2:-default}
     local duration=${3:-30}
+    local counter_set=${4:-basic}
     
     echo "=== Monitoring Service: $service_name ==="
     
@@ -35,15 +46,27 @@ monitor_service_remote() {
     fi
     
     # Now use the existing monitoring logic
-    monitor_pod_remote $pod_name $namespace $duration
+    monitor_pod_remote $pod_name $namespace $duration $counter_set
 }
 
 monitor_pod_remote() {
     local pod_name=$1
     local namespace=${2:-default}
     local duration=${3:-30}
+    local counter_set=${4:-basic}
+    
+    # Get counter list
+    local counters="${COUNTER_SETS[$counter_set]}"
+    if [[ -z "$counters" ]]; then
+        echo "Error: Unknown counter set '$counter_set'"
+        echo "Available counter sets: ${!COUNTER_SETS[@]}"
+        return 1
+    fi
     
     echo "=== Monitoring Pod: $pod_name ==="
+    echo "Counter set: $counter_set"
+    echo "Counters: $counters"
+    echo "Duration: ${duration}s"
     
     # Validate pod exists and get info
     if ! kubectl get pod $pod_name -n $namespace &>/dev/null; then
@@ -70,7 +93,7 @@ monitor_pod_remote() {
         return 1
     fi
     
-    # Execute monitoring
+    # Execute monitoring with specified counters
     ssh $node_name "
         set -e
         
@@ -94,8 +117,8 @@ monitor_pod_remote() {
             exit 1
         fi
         
-        echo 'Starting perf monitoring for $duration seconds...'
-        sudo perf stat -p \$PID sleep $duration
+        echo 'Starting perf monitoring with counters: $counters'
+        sudo perf stat -e $counters -p \$PID sleep $duration
     "
     
     local ssh_exit_code=$?
@@ -110,27 +133,43 @@ monitor_pod_remote() {
 
 # Main execution
 if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <service_name|pod_name> [namespace] [duration]"
+    echo "Usage: $0 <service_name|pod_name> [namespace] [duration] [counter_set]"
+    echo ""
+    echo "Parameters:"
+    echo "  service_name     Service name (e.g., frontend, search) or full pod name"
+    echo "  namespace        Kubernetes namespace (default: default)"
+    echo "  duration         Monitoring duration in seconds (default: 30)"
+    echo "  counter_set      Performance counter set (default: basic)"
+    echo ""
+    echo "Available counter sets:"
+    for set in "${!COUNTER_SETS[@]}"; do
+        echo "  $set: ${COUNTER_SETS[$set]}"
+    done
     echo ""
     echo "Examples:"
-    echo "  $0 frontend              # Monitor frontend service"
-    echo "  $0 mongodb-user         # Monitor mongodb-user service"  
-    echo "  $0 memcached-profile    # Monitor memcached-profile service"
-    echo "  $0 frontend default 60  # Monitor for 60 seconds"
+    echo "  $0 frontend                           # Basic monitoring"
+    echo "  $0 search default 60 cpu             # CPU interference study"
+    echo "  $0 mongodb-user default 120 memory   # Memory interference study"
+    echo "  $0 memcached-profile default 90 bandwidth  # Bandwidth study"
     echo ""
     echo "Available services in default namespace:"
     kubectl get pods --no-headers 2>/dev/null | awk '{print $1}' | sed 's/-[^-]*-[^-]*$//' | sort -u | sed 's/^/  /' || echo "  (kubectl not available)"
     exit 1
 fi
 
-# Determine if input is a service name or full pod name
+# Parse arguments
 input_name=$1
+namespace=${2:-default}
+duration=${3:-30}
+counter_set=${4:-basic}
+
+# Determine if input is a service name or full pod name
 if [[ "$input_name" =~ -[a-z0-9]+-[a-z0-9]+$ ]]; then
     # Input looks like a full pod name (ends with -hash-hash)
     echo "Input appears to be a full pod name"
-    monitor_pod_remote "$@"
+    monitor_pod_remote "$input_name" "$namespace" "$duration" "$counter_set"
 else
     # Input looks like a service name
     echo "Input appears to be a service name"
-    monitor_service_remote "$@"
+    monitor_service_remote "$input_name" "$namespace" "$duration" "$counter_set"
 fi
