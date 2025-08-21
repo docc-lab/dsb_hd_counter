@@ -14,7 +14,7 @@ extract_node_param() {
     
     for ((i=0; i<${#@}; i++)); do
         if [[ "${@:$((i+1)):1}" == "--node" ]] || [[ "${@:$((i+1)):1}" == "-n" ]]; then
-            if [[ $((i+2)) -lt ${#@} ]]; then
+            if [[ $((i+2)) -le ${#@} ]]; then
                 node="${@:$((i+2)):1}"
                 i=$((i+1))  # Skip the next argument since we consumed it
             fi
@@ -32,7 +32,7 @@ extract_image_tag_param() {
     
     for ((i=0; i<${#@}; i++)); do
         if [[ "${@:$((i+1)):1}" == "--image-tag" ]] || [[ "${@:$((i+1)):1}" == "-t" ]]; then
-            if [[ $((i+2)) -lt ${#@} ]]; then
+            if [[ $((i+2)) -le ${#@} ]]; then
                 image_tag="${@:$((i+2)):1}"
                 break
             fi
