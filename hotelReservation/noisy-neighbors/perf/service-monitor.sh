@@ -89,13 +89,13 @@ monitor_pod_remote() {
             exit 1
         fi
         
-        if ! kill -0 \$PID 2>/dev/null; then
+        if ! sudo kill -0 \$PID 2>/dev/null; then
             echo 'Error: Cannot access process \$PID'
             exit 1
         fi
         
         echo 'Starting perf monitoring for $duration seconds...'
-        perf stat -p \$PID sleep $duration
+        sudo perf stat -p \$PID sleep $duration
     "
     
     local ssh_exit_code=$?
