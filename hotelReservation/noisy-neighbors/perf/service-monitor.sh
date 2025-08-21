@@ -1,24 +1,24 @@
 #!/bin/bash
-# service-monitor.sh - Monitor pods by service name
+# service-monitor.sh - Fixed version
 
 resolve_service_to_pod() {
     local service_name=$1
     local namespace=${2:-default}
     
-    echo "Resolving service '$service_name' to pod name..."
+    # Send informational messages to stderr so they don't get captured
+    echo "Resolving service '$service_name' to pod name..." >&2
     
-    # Get all pods and filter by service name pattern
     local pod_name=$(kubectl get pods -n $namespace --no-headers | grep "^${service_name}-" | head -1 | awk '{print $1}')
     
     if [[ -z "$pod_name" ]]; then
-        echo "Error: No pod found for service '$service_name'"
-        echo "Available services:"
-        kubectl get pods -n $namespace --no-headers | awk '{print $1}' | sed 's/-[^-]*-[^-]*$//' | sort -u | sed 's/^/  /'
+        echo "Error: No pod found for service '$service_name'" >&2
+        echo "Available services:" >&2
+        kubectl get pods -n $namespace --no-headers | awk '{print $1}' | sed 's/-[^-]*-[^-]*$//' | sort -u | sed 's/^/  /' >&2
         return 1
     fi
     
-    echo "Found pod: $pod_name"
-    echo "$pod_name"
+    echo "Found pod: $pod_name" >&2
+    echo "$pod_name"  # Only this goes to stdout
 }
 
 monitor_service_remote() {
