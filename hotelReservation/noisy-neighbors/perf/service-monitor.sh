@@ -4,7 +4,7 @@
 # Define counter sets for different experiments
 declare -A COUNTER_SETS=(
     ["basic"]="cycles,instructions,cache-references,cache-misses"
-    ["cpu"]="cycles,instructions,branch-instructions,branch-misses,cpu-clock,task-clock"
+    ["cpu"]="cycles,instructions,branch-instructions,branch-misses,cpu-clock,task-clock,context-switches"
     ["memory"]="cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses"
     ["scheduling"]="context-switches,cpu-migrations,page-faults,minor-faults,major-faults"
     ["bandwidth"]="cycles,instructions,cache-references,cache-misses,bus-cycles"
