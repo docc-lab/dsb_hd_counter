@@ -1,49 +1,105 @@
 #!/bin/bash
 # Stress-ng Helper Script for Kubernetes
-# Usage: ./stress-ng-helpers.sh <command> [args...]
+# Usage: ./stress-ng-helpers.sh <command> [args...] [--node <node-name>]
 # Or create alias: alias my-stressng='./stress-ng-helpers.sh'
 
 # Change this to your Docker Hub username
 USERNAME="royno7"
 IMAGE="${USERNAME}/stress-ng:latest"
 
+# Function to extract node parameter from arguments
+extract_node_param() {
+    local node=""
+    local args=()
+    
+    for ((i=0; i<${#@}; i++)); do
+        if [[ "${@:$((i+1)):1}" == "--node" ]] || [[ "${@:$((i+1)):1}" == "-n" ]]; then
+            if [[ $((i+2)) -lt ${#@} ]]; then
+                node="${@:$((i+2)):1}"
+                i=$((i+1))  # Skip the next argument since we consumed it
+            fi
+        elif [[ "${@:$((i+1)):1}" != "--node" ]] && [[ "${@:$((i+1)):1}" != "-n" ]]; then
+            args+=("${@:$((i+1)):1}")
+        fi
+    done
+    
+    echo "$node"
+}
+
+# Function to create kubectl command with optional node selection
+create_kubectl_cmd() {
+    local pod_name="$1"
+    local image="$2"
+    local args="$3"
+    local node="$4"
+    
+    local cmd="kubectl run $pod_name --image=$image --restart=Never"
+    
+    if [[ -n "$node" ]]; then
+        cmd="$cmd --overrides='{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"}}}'"
+    fi
+    
+    cmd="$cmd -- $args"
+    echo "$cmd"
+}
+
 # Main command function
 my_stressng() {
-    case "$1" in
+    # Extract node parameter if present
+    local node=$(extract_node_param "$@")
+    local args=()
+    
+    # Rebuild arguments without node parameters
+    for ((i=0; i<${#@}; i++)); do
+        if [[ "${@:$((i+1)):1}" == "--node" ]] || [[ "${@:$((i+1)):1}" == "-n" ]]; then
+            i=$((i+1))  # Skip the node parameter
+        elif [[ "${@:$((i+1)):1}" != "--node" ]] && [[ "${@:$((i+1)):1}" != "-n" ]]; then
+            args+=("${@:$((i+1)):1}")
+        fi
+    done
+    
+    case "${args[0]}" in
         cpu)
-            local workers=${2:-2}
-            local duration=${3:-60s}
-            kubectl run cpu-stress --image=$IMAGE --restart=Never -- --cpu $workers --timeout $duration
+            local workers=${args[1]:-2}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "cpu-stress" "$IMAGE" "--cpu $workers --timeout $duration" "$node")
+            eval $cmd
             ;;
         memory)
-            local workers=${2:-1}
-            local duration=${3:-60s}
-            kubectl run mem-stress --image=$IMAGE --restart=Never -- --brk $workers --timeout $duration
+            local workers=${args[1]:-1}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "mem-stress" "$IMAGE" "--brk $workers --timeout $duration" "$node")
+            eval $cmd
             ;;
         vm)
-            local workers=${2:-2}
-            local size=${3:-512M}
-            local duration=${4:-60s}
-            kubectl run vm-stress --image=$IMAGE --restart=Never -- --vm $workers --vm-bytes $size --timeout $duration
+            local workers=${args[1]:-2}
+            local size=${args[2]:-512M}
+            local duration=${args[3]:-60s}
+            local cmd=$(create_kubectl_cmd "vm-stress" "$IMAGE" "--vm $workers --vm-bytes $size --timeout $duration" "$node")
+            eval $cmd
             ;;
         pagefault)
-            local workers=${2:-1}
-            local duration=${3:-60s}
-            kubectl run page-fault --image=$IMAGE --restart=Never -- --fault $workers --timeout $duration
+            local workers=${args[1]:-1}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "page-fault" "$IMAGE" "--fault $workers --timeout $duration" "$node")
+            eval $cmd
             ;;
         io)
-            local workers=${2:-2}
-            local duration=${3:-60s}
-            kubectl run io-stress --image=$IMAGE --restart=Never -- --io $workers --timeout $duration
+            local workers=${args[1]:-2}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "io-stress" "$IMAGE" "--io $workers --timeout $duration" "$node")
+            eval $cmd
             ;;
         network)
-            local workers=${2:-2}
-            local duration=${3:-60s}
-            kubectl run sock-stress --image=$IMAGE --restart=Never -- --sock $workers --timeout $duration
+            local workers=${args[1]:-2}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "sock-stress" "$IMAGE" "--sock $workers --timeout $duration" "$node")
+            eval $cmd
             ;;
         noisy)
-            local duration=${2:-0}  # 0 = infinite
-            kubectl run noisy-neighbor --image=$IMAGE --restart=Never -- --cpu 2 --vm 1 --vm-bytes 1G --brk 1 --io 2 --sock 1 --timeout $duration
+            local duration=${args[1]:-0}  # 0 = infinite
+            local cmd=$(create_kubectl_cmd "noisy-neighbor" "$IMAGE" "--cpu 2 --vm 1 --vm-bytes 1G --brk 1 --io 2 --sock 1 --timeout $duration" "$node")
+            eval $cmd
             ;;
         cleanup)
             kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress sock-stress noisy-neighbor heavy-load 2>/dev/null || true
@@ -51,47 +107,57 @@ my_stressng() {
             ;;
         status)
             echo "Current stress test pods:"
-            kubectl get pods | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|sock-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
+            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|sock-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
+            ;;
+        nodes)
+            echo "Available nodes:"
+            kubectl get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[?(@.type=='Ready')].status,ROLES:.metadata.labels.kubernetes\.io/role"
             ;;
         help|--help|-h)
             echo "Stress-ng Helper Commands"
             echo "========================="
             echo ""
-            echo "Usage: my-stressng <command> [args...]"
+            echo "Usage: my-stressng <command> [args...] [--node <node-name>]"
             echo ""
             echo "Commands:"
-            echo "  cpu [workers] [duration]           # Default: 2 workers, 60s"
-            echo "  memory [workers] [duration]        # Default: 1 worker, 60s"
-            echo "  vm [workers] [size] [duration]     # Default: 2 workers, 512M, 60s"
-            echo "  pagefault [workers] [duration]     # Default: 1 worker, 60s"
-            echo "  io [workers] [duration]            # Default: 2 workers, 60s"
-            echo "  network [workers] [duration]       # Default: 2 workers, 60s"
-            echo "  noisy [duration]                   # Combined load (default: infinite)"
+            echo "  cpu [workers] [duration] [--node <node>]           # Default: 2 workers, 60s"
+            echo "  memory [workers] [duration] [--node <node>]        # Default: 1 worker, 60s"
+            echo "  vm [workers] [size] [duration] [--node <node>]     # Default: 2 workers, 512M, 60s"
+            echo "  pagefault [workers] [duration] [--node <node>]     # Default: 1 worker, 60s"
+            echo "  io [workers] [duration] [--node <node>]            # Default: 2 workers, 60s"
+            echo "  network [workers] [duration] [--node <node>]       # Default: 2 workers, 60s"
+            echo "  noisy [duration] [--node <node>]                   # Combined load (default: infinite)"
             echo ""
             echo "Utilities:"
             echo "  cleanup                            # Remove all stress test pods"
             echo "  status                             # Show running stress test pods"
+            echo "  nodes                              # List available nodes"
             echo "  help                               # Show this help"
             echo ""
+            echo "Node Selection:"
+            echo "  --node <node-name>                 # Deploy pod to specific node"
+            echo "  -n <node-name>                     # Short form for node selection"
+            echo ""
             echo "Examples:"
-            echo "  my-stressng cpu 4 120s             # 4 CPU workers for 2 minutes"
-            echo "  my-stressng vm 2 1G 60s            # 2 VM workers with 1GB each"
-            echo "  my-stressng noisy 300s             # Mixed load for 5 minutes"
-            echo "  my-stressng noisy                  # Infinite noisy neighbor"
-            echo "  my-stressng status                 # Check running pods"
-            echo "  my-stressng cleanup                # Clean up all stress pods"
+            echo "  my-stressng cpu 4 120s --node node-0               # 4 CPU workers for 2 minutes on node-0"
+            echo "  my-stressng vm 2 1G 60s -n node-1                 # 2 VM workers with 1GB each on node-1"
+            echo "  my-stressng noisy 300s --node node-2               # Mixed load for 5 minutes on node-2"
+            echo "  my-stressng noisy --node node-3                    # Infinite noisy neighbor on node-3"
+            echo "  my-stressng status                                 # Check running pods"
+            echo "  my-stressng nodes                                  # List available nodes"
+            echo "  my-stressng cleanup                                # Clean up all stress pods"
             echo ""
             echo "Setup:"
             echo "  # Option 1: Use directly"
-            echo "  ./stress-ng-helpers.sh cpu 4 60s"
+            echo "  ./stress-ng-helpers.sh cpu 4 60s --node node-0"
             echo ""
             echo "  # Option 2: Create alias (recommended)"
             echo "  alias my-stressng='$(pwd)/stress-ng-helpers.sh'"
-            echo "  my-stressng cpu 4 60s"
+            echo "  my-stressng cpu 4 60s --node node-0"
             echo ""
             echo "  # Option 3: Add to PATH"
             echo "  sudo cp stress-ng-helpers.sh /usr/local/bin/my-stressng"
-            echo "  my-stressng cpu 4 60s"
+            echo "  my-stressng cpu 4 60s --node node-0"
             ;;
         *)
             echo "Unknown command: $1"

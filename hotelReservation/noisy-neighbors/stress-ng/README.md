@@ -52,9 +52,40 @@ After setting up the alias `alias my-stressng='./stress-ng-helpers.sh'`:
 | Command | Description | Example |
 |---------|-------------|---------|
 | `my-stressng noisy [duration]` | Combined noisy neighbor | `my-stressng noisy 300s` |
+| `my-stressng noisy [duration]` | Combined noisy neighbor | `my-stressng noisy 300s` |
 | `my-stressng status` | Show running stress pods | `my-stressng status` |
+| `my-stressng nodes` | List available nodes | `my-stressng nodes` |
 | `my-stressng cleanup` | Remove all stress pods | `my-stressng cleanup` |
 | `my-stressng help` | Show help | `my-stressng help` |
+
+## 🎯 Node Selection
+
+The helper script now supports targeting specific nodes for deployment:
+
+### Node Selection Syntax
+```bash
+my-stressng <command> [args...] --node <node-name>
+my-stressng <command> [args...] -n <node-name>  # Short form
+```
+
+### Examples
+```bash
+# Deploy CPU stress to specific node
+my-stressng cpu 4 120s --node node-0
+
+# Deploy noisy neighbor to another node
+my-stressng noisy 0 --node node-1
+
+# Deploy VM stress to specific node using short form
+my-stressng vm 2 1G 60s -n node-2
+```
+
+### List Available Nodes
+```bash
+my-stressng nodes
+```
+
+This will show all available nodes with their status and roles.
 
 ## 📋 kubectl Examples
 
@@ -140,12 +171,19 @@ kubectl run limited-stress --image=yourusername/stress-ng --restart=Never \
 ### Target Specific Nodes
 ```bash
 # Helper shorthand:
-# Cannot use helper shorthand, must directly use kubectl with --overrides flag
+my-stressng cpu 4 300s --node node-0
+my-stressng noisy 0 --node node-1
+my-stressng vm 2 1G 60s -n node-2
 
-# kubectl command:
+# Equivalent kubectl command:
 kubectl run node-stress --image=yourusername/stress-ng --restart=Never \
-  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-node-1"}}}' \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"node-0"}}}' \
   -- --cpu 4 --timeout 300s
+```
+
+**List available nodes:**
+```bash
+my-stressng nodes
 ```
 
 ## 🧹 Cleanup
