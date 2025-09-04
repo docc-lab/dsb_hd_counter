@@ -93,7 +93,7 @@ my_stressng() {
         memory)
             local workers=${args[1]:-1}
             local duration=${args[2]:-60s}
-            local cmd=$(create_kubectl_cmd "mem-stress" "$current_image" "--brk $workers --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "mem-stress" "$current_image" "--stream $workers --timeout $duration" "$node")
             eval $cmd
             ;;
         vm)
@@ -118,21 +118,21 @@ my_stressng() {
         network)
             local workers=${args[1]:-2}
             local duration=${args[2]:-60s}
-            local cmd=$(create_kubectl_cmd "sock-stress" "$current_image" "--sock $workers --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "udp-stress" "$current_image" "--udp $workers --timeout $duration" "$node")
             eval $cmd
             ;;
         noisy)
             local duration=${args[1]:-0}  # 0 = infinite
-            local cmd=$(create_kubectl_cmd "noisy-neighbor" "$current_image" "--cpu 2 --vm 1 --vm-bytes 1G --brk 1 --io 2 --sock 1 --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "noisy-neighbor" "$current_image" "--cpu 2 --vm 1 --vm-bytes 1G --stream 1 --io 2 --udp 1 --timeout $duration" "$node")
             eval $cmd
             ;;
         cleanup)
-            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress sock-stress noisy-neighbor heavy-load 2>/dev/null || true
+            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress udp-stress noisy-neighbor heavy-load 2>/dev/null || true
             echo "Cleaned up stress test pods"
             ;;
         status)
             echo "Current stress test pods:"
-            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|sock-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
+            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|udp-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
             ;;
         nodes)
             echo "Available nodes:"

@@ -41,11 +41,11 @@ After setting up the alias `alias my-stressng='./stress-ng-helpers.sh'`:
 | Command | Description | Example |
 |---------|-------------|---------|
 | `my-stressng cpu [workers] [duration]` | CPU stress | `my-stressng cpu 4 120s` |
-| `my-stressng memory [workers] [duration]` | Memory pressure | `my-stressng memory 2 60s` |
+| `my-stressng memory [workers] [duration]` | STREAM memory bandwidth | `my-stressng memory 2 60s` |
 | `my-stressng vm [workers] [size] [duration]` | Virtual memory stress | `my-stressng vm 2 1G 60s` |
 | `my-stressng pagefault [workers] [duration]` | Page fault stress | `my-stressng pagefault 1 30s` |
 | `my-stressng io [workers] [duration]` | I/O stress | `my-stressng io 2 60s` |
-| `my-stressng network [workers] [duration]` | Network stress | `my-stressng network 1 45s` |
+| `my-stressng network [workers] [duration]` | UDP network stress | `my-stressng network 1 45s` |
 
 ### Special Commands
 
@@ -100,13 +100,13 @@ my-stressng cpu 4 120s
 kubectl run cpu-stress --image=yourusername/stress-ng --restart=Never -- --cpu 4 --timeout 120s
 ```
 
-**Memory pressure - heap expansion**
+**Memory pressure - STREAM memory bandwidth**
 ```bash
 # Helper shorthand:
 my-stressng memory 2 60s
 
 # Equivalent kubectl command:
-kubectl run mem-stress --image=yourusername/stress-ng --restart=Never -- --brk 2 --timeout 60s
+kubectl run mem-stress --image=yourusername/stress-ng --restart=Never -- --stream 2 --timeout 60s
 ```
 
 **VM stress - 2 workers with 1GB each**
@@ -136,13 +136,13 @@ my-stressng io 2 60s
 kubectl run io-stress --image=yourusername/stress-ng --restart=Never -- --io 2 --timeout 60s
 ```
 
-**Network stress**
+**Network stress - UDP**
 ```bash
 # Helper shorthand:
 my-stressng network 2 60s
 
 # Equivalent kubectl command:
-kubectl run network-stress --image=yourusername/stress-ng --restart=Never -- --sock 2 --timeout 60s
+kubectl run network-stress --image=yourusername/stress-ng --restart=Never -- --udp 2 --timeout 60s
 ```
 
 ### Advanced Examples
@@ -154,7 +154,7 @@ my-stressng noisy 0  # 0 = infinite duration
 
 # Equivalent kubectl command:
 kubectl run noisy-neighbor --image=yourusername/stress-ng --restart=Never -- \
-  --cpu 2 --vm 1 --vm-bytes 1G --brk 1 --io 2 --sock 1 --timeout 0
+  --cpu 2 --vm 1 --vm-bytes 1G --stream 1 --io 2 --udp 1 --timeout 0
 ```
 
 
@@ -192,7 +192,7 @@ my-stressng nodes
 my-stressng cleanup
 
 # Equivalent kubectl commands:
-kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress network-stress noisy-neighbor heavy-load limited-stress node-stress
+kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress udp-stress noisy-neighbor heavy-load limited-stress node-stress
 ```
 
 ## 📊 Monitoring Impact
@@ -219,10 +219,10 @@ watch kubectl get pods -o wide
 - `--cpu N` - Number of CPU workers (0 = all CPUs)
 - `--vm N` - Number of VM workers
 - `--vm-bytes SIZE` - Memory per VM worker (256M, 512M, 1G, 2G)
-- `--brk N` - Memory pressure via heap expansion
+- `--stream N` - STREAM memory bandwidth workers
 - `--fault N` - Page fault workers
 - `--io N` - I/O workers
-- `--sock N` - Socket workers
+- `--udp N` - UDP network workers
 - `--timeout TIME` - Duration (60s, 5m, 1h, 0 = infinite)
 
 ### Memory Sizes
