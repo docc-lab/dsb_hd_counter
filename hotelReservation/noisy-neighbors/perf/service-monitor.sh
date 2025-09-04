@@ -9,6 +9,7 @@ declare -A COUNTER_SETS=(
     ["scheduling"]="context-switches,cpu-migrations,page-faults,minor-faults,major-faults"
     ["bandwidth"]="cycles,instructions,cache-references,cache-misses,bus-cycles"
     ["interference"]="cycles,instructions,cache-misses,context-switches,page-faults,L1-dcache-load-misses"
+    ["network"]="syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_accept,syscalls:sys_enter_connect,syscalls:sys_enter_socket,syscalls:sys_enter_bind"
 )
 
 resolve_service_to_pod() {
@@ -151,6 +152,7 @@ if [[ $# -eq 0 ]]; then
     echo "  $0 search default 60 cpu             # CPU interference study"
     echo "  $0 mongodb-user default 120 memory   # Memory interference study"
     echo "  $0 memcached-profile default 90 bandwidth  # Bandwidth study"
+    echo "  $0 frontend default 60 network       # Network syscall monitoring"
     echo ""
     echo "Available services in default namespace:"
     kubectl get pods --no-headers 2>/dev/null | awk '{print $1}' | sed 's/-[^-]*-[^-]*$//' | sort -u | sed 's/^/  /' || echo "  (kubectl not available)"
