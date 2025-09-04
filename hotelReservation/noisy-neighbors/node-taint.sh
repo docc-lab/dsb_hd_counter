@@ -66,10 +66,27 @@ kubectl patch deployment "$SERVICE_NAME" -p '{
 }'
 echo "✓ Toleration added successfully"
 
+# Trigger rollout to apply tolerations to running pods
+echo "3. Rolling out deployment to apply tolerations..."
+kubectl rollout restart deployment "$SERVICE_NAME"
+echo "✓ Rollout triggered"
+
+echo "4. Waiting for rollout to complete..."
+kubectl rollout status deployment "$SERVICE_NAME" --timeout=60s
+echo "✓ Rollout completed successfully"
+
 echo
 echo "=== Operation completed ==="
-echo "The deployment '$SERVICE_NAME' can now be scheduled on the tainted node '$NODE_NAME'"
-echo
-echo "Verify with:"
-echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
-echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+if [ "$UNTOLERATE_MODE" == "true" ]; then
+    echo "The taint has been removed from node '$NODE_NAME' and tolerations removed from deployment '$SERVICE_NAME'"
+    echo
+    echo "Verify with:"
+    echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
+    echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+else
+    echo "The deployment '$SERVICE_NAME' can now be scheduled on the tainted node '$NODE_NAME'"
+    echo
+    echo "Verify with:"
+    echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
+    echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+fi
