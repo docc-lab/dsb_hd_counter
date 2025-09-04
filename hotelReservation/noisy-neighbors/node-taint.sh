@@ -79,14 +79,17 @@ echo
 echo "=== Operation completed ==="
 if [ "$UNTOLERATE_MODE" == "true" ]; then
     echo "The taint has been removed from node '$NODE_NAME' and tolerations removed from deployment '$SERVICE_NAME'"
-    echo
-    echo "Verify with:"
-    echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
-    echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+    if [ "$RESTART_ALL" == "true" ]; then
+        echo "All deployments have been restarted and can now be scheduled on any available node"
+    fi
 else
     echo "The deployment '$SERVICE_NAME' can now be scheduled on the tainted node '$NODE_NAME'"
-    echo
-    echo "Verify with:"
-    echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
-    echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+    if [ "$RESTART_ALL" == "true" ]; then
+        echo "All other deployments have been restarted and will avoid the tainted node (unless they have tolerations)"
+    fi
 fi
+echo
+echo "Verify with:"
+echo "  kubectl describe node $NODE_NAME | grep -A5 Taints"
+echo "  kubectl get deployment $SERVICE_NAME -o yaml | grep -A10 tolerations"
+echo "  kubectl get pods -o wide  # Check pod distribution across nodes"
