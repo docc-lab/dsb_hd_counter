@@ -53,7 +53,8 @@ create_kubectl_cmd() {
     
     if [[ -n "$node" ]]; then
         # Add both nodeSelector and toleration for tainted nodes
-        cmd="$cmd --overrides='{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},\"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Equal\",\"value\":\"special\",\"effect\":\"NoSchedule\"}]}}'"
+        local overrides="{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},\"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Equal\",\"value\":\"special\",\"effect\":\"NoSchedule\"}]}}"
+        cmd="$cmd --overrides='$overrides'"
     fi
     
     cmd="$cmd -- $args"
