@@ -60,7 +60,7 @@ After setting up the alias `alias my-stressng='./stress-ng-helpers.sh'`:
 
 ## 🎯 Node Selection
 
-The helper script now supports targeting specific nodes for deployment:
+The helper script now supports targeting specific nodes for deployment with automatic toleration for tainted nodes:
 
 ### Node Selection Syntax
 ```bash
@@ -68,15 +68,23 @@ my-stressng <command> [args...] --node <node-name>
 my-stressng <command> [args...] -n <node-name>  # Short form
 ```
 
+### Toleration Support
+When using the `--node` parameter, the stress pods automatically include toleration for nodes tainted with:
+- **Key**: `dedicated`
+- **Value**: `special`
+- **Effect**: `NoSchedule`
+
+This allows stress pods to be scheduled on tainted nodes that are dedicated for specific workloads.
+
 ### Examples
 ```bash
-# Deploy CPU stress to specific node
+# Deploy CPU stress to specific node (includes toleration)
 my-stressng cpu 4 120s --node node-0
 
-# Deploy noisy neighbor to another node
+# Deploy noisy neighbor to tainted node (includes toleration)
 my-stressng noisy 0 --node node-1
 
-# Deploy VM stress to specific node using short form
+# Deploy VM stress to specific node using short form (includes toleration)
 my-stressng vm 2 1G 60s -n node-2
 ```
 
@@ -86,6 +94,9 @@ my-stressng nodes
 ```
 
 This will show all available nodes with their status and roles.
+
+### Working with Tainted Nodes
+If you have nodes tainted using the `node-taint.sh` script (with `dedicated=special:NoSchedule`), the stress pods will automatically include the necessary toleration when using the `--node` parameter. This ensures they can be scheduled on tainted nodes that are dedicated for specific workloads.
 
 ## 📋 kubectl Examples
 
@@ -175,9 +186,9 @@ my-stressng cpu 4 300s --node node-0
 my-stressng noisy 0 --node node-1
 my-stressng vm 2 1G 60s -n node-2
 
-# Equivalent kubectl command:
+# Equivalent kubectl command (includes toleration for tainted nodes):
 kubectl run node-stress --image=yourusername/stress-ng --restart=Never \
-  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"node-0"}}}' \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"node-0"},"tolerations":[{"key":"dedicated","operator":"Equal","value":"special","effect":"NoSchedule"}]}}' \
   -- --cpu 4 --timeout 300s
 ```
 

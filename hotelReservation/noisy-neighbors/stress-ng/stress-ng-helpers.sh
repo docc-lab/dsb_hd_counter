@@ -42,7 +42,7 @@ extract_image_tag_param() {
     echo "$image_tag"
 }
 
-# Function to create kubectl command with optional node selection
+# Function to create kubectl command with optional node selection and toleration
 create_kubectl_cmd() {
     local pod_name="$1"
     local image="$2"
@@ -52,7 +52,8 @@ create_kubectl_cmd() {
     local cmd="kubectl run $pod_name --image=$image --restart=Never"
     
     if [[ -n "$node" ]]; then
-        cmd="$cmd --overrides='{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"}}}'"
+        # Add both nodeSelector and toleration for tainted nodes
+        cmd="$cmd --overrides='{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},\"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Equal\",\"value\":\"special\",\"effect\":\"NoSchedule\"}]}}'"
     fi
     
     cmd="$cmd -- $args"
@@ -160,7 +161,7 @@ my_stressng() {
             echo "  help                               # Show this help"
             echo ""
             echo "Options:"
-            echo "  --node <node-name>                 # Deploy pod to specific node"
+            echo "  --node <node-name>                 # Deploy pod to specific node (includes toleration for tainted nodes)"
             echo "  -n <node-name>                     # Short form for node selection"
             echo "  --image-tag <tag>                  # Use specific image tag (default: latest)"
             echo "  -t <tag>                           # Short form for image tag selection"
