@@ -7,7 +7,7 @@ set -e
 # Configuration
 DATA_DIR="${DATA_DIR:-./experiment_data}"
 HOTEL_MANIFESTS_DIR="${HOTEL_MANIFESTS_DIR:-./hotelReservation}"
-WRK2_DIR="${WRK2_DIR:-../wrk2}"
+WRK2_DIR="${WRK2_DIR:-../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Your existing script paths
