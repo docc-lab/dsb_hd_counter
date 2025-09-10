@@ -81,25 +81,29 @@ deploy_victim_services() {
     log "Deploying victim services: $services"
     
     for service in $services; do
-        local manifest_file="$HOTEL_MANIFESTS_DIR/${service}.yaml"
+        local service_dir="$HOTEL_MANIFESTS_DIR/kubernetes/${service}"
         
-        if [[ ! -f "$manifest_file" ]]; then
-            log "WARNING: Manifest not found for service $service: $manifest_file"
+        if [[ ! -d "$service_dir" ]]; then
+            log "WARNING: Service directory not found for $service: $service_dir"
             continue
         fi
         
-        log "Deploying $service..."
+        log "Deploying $service from $service_dir..."
         
-        # Apply the manifest
-        kubectl apply -f "$manifest_file"
-        
-        # Add toleration and node selector to the deployment
-        "$TAINT_SCRIPT" "$target_node" "$service"
-        
-        # Wait for deployment to be ready
-        kubectl rollout status deployment "$service" --timeout=120s
-        
-        log "Service $service deployed and ready"
+        # Apply all YAML files in the service directory
+        if ls "$service_dir"/*.yaml 1> /dev/null 2>&1; then
+            kubectl apply -f "$service_dir/"
+            
+            # Add toleration and node selector to the deployment
+            "$TAINT_SCRIPT" "$target_node" "$service"
+            
+            # Wait for deployment to be ready
+            kubectl rollout status deployment "$service" --timeout=120s
+            
+            log "Service $service deployed and ready"
+        else
+            log "WARNING: No YAML files found in $service_dir"
+        fi
     done
     
     # Record deployed services
@@ -300,7 +304,7 @@ generate_metadata() {
     },
     "system_info": {
         "kubernetes_version": "$(kubectl version --client --short 2>/dev/null | cut -d' ' -f3 || echo 'unknown')",
-        "target_node_info": $(kubectl get node "$TARGET_NODE" -o json | jq '{name: .metadata.name, capacity: .status.capacity, allocatable: .status.allocatable}'),
+        "target_node_info": $(kubectl get node "$TARGET_NODE" -o json 2>/dev/null | { if command -v jq >/dev/null 2>&1; then jq '{name: .metadata.name, capacity: .status.capacity, allocatable: .status.allocatable}'; else echo '{"name": "'$TARGET_NODE'", "info": "jq not available"}'; fi } 2>/dev/null || echo '{"name": "'$TARGET_NODE'", "error": "node info unavailable"}'),
         "available_stressors": [$(get_available_stressors | tr '\n' ',' | sed 's/,$//' | sed 's/\([^,]*\)/"\1"/g')]
     },
     "scripts_used": {
