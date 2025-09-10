@@ -89,7 +89,7 @@ deploy_victim_services() {
     log "$exp_dir" "Deploying victim services: $services"
     
     for service in $services; do
-        local service_dir="$HOTEL_MANIFESTS_DIR/kubernetes/${service}"
+        local service_dir="../kubernetes/${service}"
         
         if [[ ! -d "$service_dir" ]]; then
             log "$exp_dir" "WARNING: Service directory not found for $service: $service_dir"
