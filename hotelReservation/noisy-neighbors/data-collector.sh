@@ -166,6 +166,9 @@ check_and_untolerate_pods() {
             kubectl rollout status deployment "$deployment" -n default --timeout=60s 2>/dev/null || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
         done
         
+        # Save list of untolerated deployments for cleanup
+        echo "${deployments_to_untolerate[@]}" > "$exp_dir/metadata/untolerated_deployments.txt"
+        
         # Verify target node is clear and wait if needed
         local max_attempts=6
         local attempt=1
@@ -236,6 +239,27 @@ deploy_victim_services() {
     
     # Record deployed services
     echo "$services" > "$exp_dir/metadata/deployed_services.txt"
+}
+
+# Remove anti-affinity rules from deployments
+remove_anti_affinity() {
+    local deployments="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Removing anti-affinity rules from deployments: $deployments"
+    
+    for deployment in $deployments; do
+        log "$exp_dir" "  Removing anti-affinity from $deployment"
+        kubectl patch deployment "$deployment" -n default --type='merge' -p '{
+          "spec": {
+            "template": {
+              "spec": {
+                "affinity": null
+              }
+            }
+          }
+        }' 2>/dev/null || log "$exp_dir" "    Warning: Failed to remove anti-affinity from $deployment"
+    done
 }
 
 # Cleanup victim services
@@ -621,6 +645,12 @@ run_experiment() {
     # Check and untolerate existing pods on target node first
     check_and_untolerate_pods "$TARGET_NODE" "$exp_dir"
     
+    # Read the list of untolerated deployments for later cleanup
+    local untolerated_deployments=""
+    if [[ -f "$exp_dir/metadata/untolerated_deployments.txt" ]]; then
+        untolerated_deployments=$(cat "$exp_dir/metadata/untolerated_deployments.txt")
+    fi
+    
     # Deploy victim services
     deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
     
@@ -645,6 +675,11 @@ run_experiment() {
     
     # Cleanup
     cleanup_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
+    
+    # Remove anti-affinity rules from untolerated deployments
+    if [[ -n "$untolerated_deployments" ]]; then
+        remove_anti_affinity "$untolerated_deployments" "$exp_dir"
+    fi
     
     log "$exp_dir" "Experiment completed successfully"
 }
