@@ -80,6 +80,45 @@ validate_config() {
     echo "Configuration validation passed"
 }
 
+# Cleanup any existing stress pods
+cleanup_existing_stress_pods() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Cleaning up any existing stress pods..."
+    
+    # Clean up stress pods (both running and completed)
+    local stress_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase!=Running -o name 2>/dev/null | grep -E "(stress|cpu-stress|mem-stress|io-stress)" || echo "")
+    local running_stress_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Running -o name 2>/dev/null | grep -E "(stress|cpu-stress|mem-stress|io-stress)" || echo "")
+    
+    # Delete completed/failed stress pods
+    if [[ -n "$stress_pods" ]]; then
+        echo "$stress_pods" | while read -r pod; do
+            if [[ -n "$pod" ]]; then
+                log "$exp_dir" "  Deleting completed/failed stress pod: $pod"
+                kubectl delete "$pod" --ignore-not-found=true 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    # Delete running stress pods
+    if [[ -n "$running_stress_pods" ]]; then
+        echo "$running_stress_pods" | while read -r pod; do
+            if [[ -n "$pod" ]]; then
+                log "$exp_dir" "  Deleting running stress pod: $pod"
+                kubectl delete "$pod" --ignore-not-found=true 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    # Also run the stress script cleanup
+    if [[ -f "$STRESS_SCRIPT" ]]; then
+        log "$exp_dir" "Running stress script cleanup..."
+        "$STRESS_SCRIPT" cleanup 2>/dev/null || log "$exp_dir" "  Warning: Stress script cleanup failed"
+    fi
+    
+    log "$exp_dir" "Stress pod cleanup completed"
+}
+
 # Check and untolerate existing pods on target node
 check_and_untolerate_pods() {
     local target_node="$1"
@@ -239,6 +278,30 @@ deploy_victim_services() {
     
     # Record deployed services
     echo "$services" > "$exp_dir/metadata/deployed_services.txt"
+}
+
+# Clean up pending pods that might be stuck
+cleanup_pending_pods() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Cleaning up any pending pods that might be stuck..."
+    
+    # Get pending pods in default namespace
+    local pending_pods=$(kubectl get pods -n default --field-selector=status.phase=Pending -o name 2>/dev/null || echo "")
+    
+    if [[ -n "$pending_pods" ]]; then
+        echo "$pending_pods" | while read -r pod; do
+            if [[ -n "$pod" ]]; then
+                log "$exp_dir" "  Deleting pending pod: $pod"
+                kubectl delete "$pod" --ignore-not-found=true 2>/dev/null || true
+            fi
+        done
+        
+        # Wait a moment for cleanup
+        sleep 5
+    else
+        log "$exp_dir" "No pending pods found"
+    fi
 }
 
 # Remove anti-affinity rules from deployments
@@ -641,6 +704,20 @@ run_experiment() {
     log "$exp_dir" "Starting experiment: $EXPERIMENT_NAME"
     log "$exp_dir" "Total iterations: $total_iterations"
     log "$exp_dir" "Data directory: $exp_dir"
+    
+    # Clean up any existing stress pods first
+    cleanup_existing_stress_pods "$exp_dir"
+    
+    # Clean up any pending pods that might be stuck
+    cleanup_pending_pods "$exp_dir"
+    
+    # Remove any existing anti-affinity rules that might be causing issues
+    log "$exp_dir" "Removing any existing anti-affinity rules from all deployments..."
+    local all_deployments=$(kubectl get deployments -n default -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')
+    if [[ -n "$all_deployments" ]]; then
+        remove_anti_affinity "$all_deployments" "$exp_dir"
+        sleep 10  # Wait for changes to take effect
+    fi
     
     # Check and untolerate existing pods on target node first
     check_and_untolerate_pods "$TARGET_NODE" "$exp_dir"
