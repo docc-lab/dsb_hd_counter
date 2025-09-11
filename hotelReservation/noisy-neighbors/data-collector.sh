@@ -85,47 +85,60 @@ check_and_untolerate_pods() {
     local target_node="$1"
     local exp_dir="$2"
     
-    log "$exp_dir" "Checking existing pods on target node: $target_node"
+    log "$exp_dir" "Checking existing user deployments on target node: $target_node"
     
-    # Get all pods on the target node
-    local existing_pods=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$target_node" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.namespace}{"\n"}{end}' | grep -v "^$")
+    # Get only deployments in default namespace that have pods on the target node
+    local deployments_to_untolerate=()
     
-    if [[ -n "$existing_pods" ]]; then
-        log "$exp_dir" "Found existing pods on $target_node, untolerating them:"
-        echo "$existing_pods" | while read -r pod_name namespace; do
-            if [[ -n "$pod_name" && -n "$namespace" ]]; then
-                log "$exp_dir" "  - $pod_name (namespace: $namespace)"
-                
-                # Get the deployment name from the pod
-                local deployment=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || echo "")
-                
-                if [[ -n "$deployment" ]]; then
-                    # Remove toleration from deployment
-                    "$TAINT_SCRIPT" "$target_node" "$deployment" --untolerate --namespace "$namespace" 2>/dev/null || log "$exp_dir" "    Warning: Failed to untolerate $deployment"
+    # Get all deployments in default namespace
+    local deployments=$(kubectl get deployments -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    
+    if [[ -n "$deployments" ]]; then
+        while read -r deployment; do
+            if [[ -n "$deployment" ]]; then
+                # Check if this deployment has pods on the target node
+                local pods_on_node=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+                if [[ "$pods_on_node" -gt 0 ]]; then
+                    deployments_to_untolerate+=("$deployment")
+                    log "$exp_dir" "  Found deployment '$deployment' with $pods_on_node pod(s) on $target_node"
                 fi
             fi
+        done <<< "$deployments"
+    fi
+    
+    if [[ ${#deployments_to_untolerate[@]} -gt 0 ]]; then
+        log "$exp_dir" "Untolerating ${#deployments_to_untolerate[@]} deployment(s) to clear target node..."
+        
+        for deployment in "${deployments_to_untolerate[@]}"; do
+            log "$exp_dir" "  Untolerating deployment: $deployment"
+            "$TAINT_SCRIPT" "$target_node" "$deployment" --untolerate 2>/dev/null || log "$exp_dir" "    Warning: Failed to untolerate $deployment (may not have tolerations)"
         done
         
         # Wait for pods to be rescheduled
-        log "$exp_dir" "Waiting for pods to be rescheduled..."
+        log "$exp_dir" "Waiting for pods to be rescheduled away from $target_node..."
         sleep 30
         
-        # Trigger rollout for any remaining deployments that might need it
-        kubectl get deployments --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.namespace}{"\n"}{end}' | while read -r deployment namespace; do
-            if [[ -n "$deployment" && -n "$namespace" ]]; then
-                # Check if deployment has pods on target node
-                local pods_on_node=$(kubectl get pods -n "$namespace" -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
-                if [[ "$pods_on_node" -gt 0 ]]; then
-                    log "$exp_dir" "Triggering rollout for deployment $deployment in namespace $namespace"
-                    kubectl rollout restart deployment "$deployment" -n "$namespace" 2>/dev/null || log "$exp_dir" "    Warning: Failed to restart $deployment"
-                fi
+        # Check if any pods are still on the target node and force restart if needed
+        for deployment in "${deployments_to_untolerate[@]}"; do
+            local remaining_pods=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+            if [[ "$remaining_pods" -gt 0 ]]; then
+                log "$exp_dir" "  $deployment still has $remaining_pods pod(s) on $target_node, forcing restart..."
+                kubectl rollout restart deployment "$deployment" -n default 2>/dev/null || log "$exp_dir" "    Warning: Failed to restart $deployment"
             fi
         done
         
-        # Wait for rollouts to complete
-        sleep 60
+        # Final wait for rollouts to complete
+        log "$exp_dir" "Waiting for rollouts to complete..."
+        for deployment in "${deployments_to_untolerate[@]}"; do
+            kubectl rollout status deployment "$deployment" -n default --timeout=60s 2>/dev/null || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
+        done
+        
+        # Verify target node is clear
+        local final_user_pods=$(kubectl get pods -n default --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+        log "$exp_dir" "Target node $target_node now has $final_user_pods user pod(s) (system pods are ignored)"
+        
     else
-        log "$exp_dir" "No existing pods found on target node $target_node"
+        log "$exp_dir" "No user deployments found on target node $target_node"
     fi
 }
 
