@@ -80,6 +80,55 @@ validate_config() {
     echo "Configuration validation passed"
 }
 
+# Check and untolerate existing pods on target node
+check_and_untolerate_pods() {
+    local target_node="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Checking existing pods on target node: $target_node"
+    
+    # Get all pods on the target node
+    local existing_pods=$(kubectl get pods --all-namespaces --field-selector=spec.nodeName="$target_node" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.namespace}{"\n"}{end}' | grep -v "^$")
+    
+    if [[ -n "$existing_pods" ]]; then
+        log "$exp_dir" "Found existing pods on $target_node, untolerating them:"
+        echo "$existing_pods" | while read -r pod_name namespace; do
+            if [[ -n "$pod_name" && -n "$namespace" ]]; then
+                log "$exp_dir" "  - $pod_name (namespace: $namespace)"
+                
+                # Get the deployment name from the pod
+                local deployment=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || echo "")
+                
+                if [[ -n "$deployment" ]]; then
+                    # Remove toleration from deployment
+                    "$TAINT_SCRIPT" "$target_node" "$deployment" --untolerate --namespace "$namespace" 2>/dev/null || log "$exp_dir" "    Warning: Failed to untolerate $deployment"
+                fi
+            fi
+        done
+        
+        # Wait for pods to be rescheduled
+        log "$exp_dir" "Waiting for pods to be rescheduled..."
+        sleep 30
+        
+        # Trigger rollout for any remaining deployments that might need it
+        kubectl get deployments --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.namespace}{"\n"}{end}' | while read -r deployment namespace; do
+            if [[ -n "$deployment" && -n "$namespace" ]]; then
+                # Check if deployment has pods on target node
+                local pods_on_node=$(kubectl get pods -n "$namespace" -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+                if [[ "$pods_on_node" -gt 0 ]]; then
+                    log "$exp_dir" "Triggering rollout for deployment $deployment in namespace $namespace"
+                    kubectl rollout restart deployment "$deployment" -n "$namespace" 2>/dev/null || log "$exp_dir" "    Warning: Failed to restart $deployment"
+                fi
+            fi
+        done
+        
+        # Wait for rollouts to complete
+        sleep 60
+    else
+        log "$exp_dir" "No existing pods found on target node $target_node"
+    fi
+}
+
 # Deploy victim services on target node
 deploy_victim_services() {
     local services="$1"
@@ -283,15 +332,39 @@ run_iteration() {
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
-    # Start monitoring (runs for full duration)
-    local monitor_pids=($(start_monitoring "$VICTIM_SERVICES" "$EXPERIMENT_DURATION" "$PERF_COUNTER_SET" "$exp_dir" "$iteration"))
+    # Calculate adjusted durations to account for startup delays
+    # Add 10s to stressor duration and 5s to workload duration
+    local stress_duration=$((EXPERIMENT_DURATION + 10))
+    local workload_duration=$((EXPERIMENT_DURATION + 5))
+    
+    # Start noisy neighbor first
+    log "$exp_dir" "Starting noisy neighbor: $NOISY_NEIGHBOR_TYPE with extended duration: ${stress_duration}s"
+    
+    # Modify stress args to include extended duration if the original args contain a duration
+    local modified_stress_args="${NOISY_NEIGHBOR_ARGS:-}"
+    if [[ "$modified_stress_args" =~ ([0-9]+)s ]]; then
+        # Replace existing duration with extended duration
+        modified_stress_args=$(echo "$modified_stress_args" | sed "s/[0-9]\+s/${stress_duration}s/")
+        log "$exp_dir" "Modified stress args: $modified_stress_args"
+    else
+        log "$exp_dir" "Original stress args: $modified_stress_args (no duration modification needed)"
+    fi
+    
+    "$STRESS_SCRIPT" "$NOISY_NEIGHBOR_TYPE" $modified_stress_args --node "$TARGET_NODE" \
+        > "$exp_dir/raw/stress/stress_iter${iteration}.txt" 2>&1 &
+    local stress_pid=$!
+    
+    # Wait 5 seconds before starting workload generation
+    log "$exp_dir" "Waiting 5s before starting workload generation..."
+    sleep 5
     
     # Start workload generation and latency collection
     local wrk2_pid=""
     if [[ -n "${WRK2_TARGET_SERVICE:-}" ]]; then
+        log "$exp_dir" "Starting workload generation (duration: ${workload_duration}s)"
         wrk2_pid=$(start_workload_and_latency \
             "${WRK2_TARGET_SERVICE}" \
-            "$EXPERIMENT_DURATION" \
+            "$workload_duration" \
             "$exp_dir" \
             "$iteration" \
             "${WRK2_SCRIPT:-}" \
@@ -300,22 +373,23 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Wait a bit for monitoring to stabilize
-    sleep 10
+    # Wait another 5 seconds before starting performance monitoring
+    log "$exp_dir" "Waiting 5s before starting performance monitoring..."
+    sleep 5
     
-    # Start noisy neighbor
-    log "$exp_dir" "Starting noisy neighbor: $NOISY_NEIGHBOR_TYPE with args: ${NOISY_NEIGHBOR_ARGS:-}"
-    "$STRESS_SCRIPT" "$NOISY_NEIGHBOR_TYPE" ${NOISY_NEIGHBOR_ARGS} --node "$TARGET_NODE" \
-        > "$exp_dir/raw/stress/stress_iter${iteration}.txt" 2>&1 &
-    local stress_pid=$!
+    # Start monitoring (runs for original experiment duration)
+    log "$exp_dir" "Starting performance monitoring (duration: ${EXPERIMENT_DURATION}s)"
+    local monitor_pids=($(start_monitoring "$VICTIM_SERVICES" "$EXPERIMENT_DURATION" "$PERF_COUNTER_SET" "$exp_dir" "$iteration"))
     
     # Collect metrics during stress
     sleep 30  # Let stress ramp up
     collect_system_metrics "$exp_dir" "$iteration" "during"
     
     # Wait for experiment to complete
-    local remaining_time=$((EXPERIMENT_DURATION - 40))  # 10s initial + 30s ramp
+    # Total delays so far: 5s (stressor->workload) + 5s (workload->monitoring) + 30s (ramp) = 40s
+    local remaining_time=$((EXPERIMENT_DURATION - 40))
     if [[ $remaining_time -gt 0 ]]; then
+        log "$exp_dir" "Waiting ${remaining_time}s for experiment to complete..."
         sleep "$remaining_time"
     fi
     
@@ -359,6 +433,16 @@ generate_metadata() {
             "command": "$NOISY_NEIGHBOR_TYPE ${NOISY_NEIGHBOR_ARGS:-}"
         },
         "experiment_duration": $EXPERIMENT_DURATION,
+        "timing": {
+            "base_duration": $EXPERIMENT_DURATION,
+            "stressor_duration": "$((EXPERIMENT_DURATION + 10))",
+            "workload_duration": "$((EXPERIMENT_DURATION + 5))",
+            "monitoring_duration": $EXPERIMENT_DURATION,
+            "startup_delays": {
+                "stressor_to_workload": 5,
+                "workload_to_monitoring": 5
+            }
+        },
         "iterations": ${ITERATIONS:-3},
         "iteration_delay": ${ITERATION_DELAY:-60},
         "wrk2_config": {
@@ -462,6 +546,9 @@ run_experiment() {
     log "$exp_dir" "Starting experiment: $EXPERIMENT_NAME"
     log "$exp_dir" "Total iterations: $total_iterations"
     log "$exp_dir" "Data directory: $exp_dir"
+    
+    # Check and untolerate existing pods on target node first
+    check_and_untolerate_pods "$TARGET_NODE" "$exp_dir"
     
     # Deploy victim services
     deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
