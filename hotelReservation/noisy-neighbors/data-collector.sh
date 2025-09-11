@@ -117,6 +117,30 @@ check_and_untolerate_pods() {
         for deployment in "${deployments_to_untolerate[@]}"; do
             log "$exp_dir" "  Untolerating deployment: $deployment"
             "$TAINT_SCRIPT" "$target_node" "$deployment" --untolerate 2>/dev/null || log "$exp_dir" "    Warning: Failed to untolerate $deployment (may not have tolerations)"
+            
+            # Add node anti-affinity to prevent scheduling back on target node
+            log "$exp_dir" "  Adding anti-affinity to keep $deployment away from $target_node"
+            kubectl patch deployment "$deployment" -n default --type='merge' -p "{
+              \"spec\": {
+                \"template\": {
+                  \"spec\": {
+                    \"affinity\": {
+                      \"nodeAffinity\": {
+                        \"requiredDuringSchedulingIgnoredDuringExecution\": {
+                          \"nodeSelectorTerms\": [{
+                            \"matchExpressions\": [{
+                              \"key\": \"kubernetes.io/hostname\",
+                              \"operator\": \"NotIn\",
+                              \"values\": [\"$target_node\"]
+                            }]
+                          }]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }" 2>/dev/null || log "$exp_dir" "    Warning: Failed to add anti-affinity to $deployment"
         done
         
         # Wait for pods to be rescheduled
@@ -142,9 +166,34 @@ check_and_untolerate_pods() {
             kubectl rollout status deployment "$deployment" -n default --timeout=60s 2>/dev/null || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
         done
         
-        # Verify target node is clear
-        local final_user_pods=$(kubectl get pods -n default --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
-        log "$exp_dir" "Target node $target_node now has $final_user_pods user pod(s) (system pods are ignored)"
+        # Verify target node is clear and wait if needed
+        local max_attempts=6
+        local attempt=1
+        while [[ $attempt -le $max_attempts ]]; do
+            local final_user_pods=$(kubectl get pods -n default --field-selector=spec.nodeName="$target_node" --field-selector=status.phase=Running -o name 2>/dev/null | wc -l)
+            log "$exp_dir" "Attempt $attempt/$max_attempts: Target node $target_node has $final_user_pods running user pod(s)"
+            
+            if [[ $final_user_pods -eq 0 ]]; then
+                log "$exp_dir" "✓ Target node $target_node is now clear of user pods"
+                break
+            fi
+            
+            if [[ $attempt -lt $max_attempts ]]; then
+                log "$exp_dir" "Waiting 15s for remaining pods to reschedule..."
+                sleep 15
+            else
+                log "$exp_dir" "WARNING: Target node still has $final_user_pods user pods after $max_attempts attempts"
+                # Force one more round of restarts for any remaining deployments
+                for deployment in "${deployments_to_untolerate[@]}"; do
+                    local remaining=$(kubectl get pods -n default -l io.kompose.service="$deployment" --field-selector=spec.nodeName="$target_node" --field-selector=status.phase=Running -o name 2>/dev/null | wc -l)
+                    if [[ $remaining -gt 0 ]]; then
+                        log "$exp_dir" "  Force restarting $deployment (still has $remaining pod(s) on $target_node)"
+                        kubectl rollout restart deployment "$deployment" -n default 2>/dev/null
+                    fi
+                done
+            fi
+            ((attempt++))
+        done
         
     else
         log "$exp_dir" "No user deployments found on target node $target_node"
