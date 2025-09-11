@@ -97,7 +97,12 @@ check_and_untolerate_pods() {
         while read -r deployment; do
             if [[ -n "$deployment" ]]; then
                 # Check if this deployment has pods on the target node
-                local pods_on_node=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+                # Try both common label patterns: app= and io.kompose.service=
+                local pods_on_node=$(kubectl get pods -n default -l io.kompose.service="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+                if [[ "$pods_on_node" -eq 0 ]]; then
+                    # Fallback to app label if no pods found with io.kompose.service
+                    pods_on_node=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+                fi
                 if [[ "$pods_on_node" -gt 0 ]]; then
                     deployments_to_untolerate+=("$deployment")
                     log "$exp_dir" "  Found deployment '$deployment' with $pods_on_node pod(s) on $target_node"
@@ -120,7 +125,11 @@ check_and_untolerate_pods() {
         
         # Check if any pods are still on the target node and force restart if needed
         for deployment in "${deployments_to_untolerate[@]}"; do
-            local remaining_pods=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+            # Check with the correct label (try io.kompose.service first, then app)
+            local remaining_pods=$(kubectl get pods -n default -l io.kompose.service="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+            if [[ "$remaining_pods" -eq 0 ]]; then
+                remaining_pods=$(kubectl get pods -n default -l app="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+            fi
             if [[ "$remaining_pods" -gt 0 ]]; then
                 log "$exp_dir" "  $deployment still has $remaining_pods pod(s) on $target_node, forcing restart..."
                 kubectl rollout restart deployment "$deployment" -n default 2>/dev/null || log "$exp_dir" "    Warning: Failed to restart $deployment"
