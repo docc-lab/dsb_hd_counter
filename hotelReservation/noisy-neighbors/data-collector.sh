@@ -821,6 +821,9 @@ main() {
     echo "Experiment completed successfully!"
     echo "Data location: $exp_dir"
     echo "Summary: $exp_dir/processed/experiment_summary.txt"
+
+    rsync -av ./"$exp_dir" "$4"@homework.eecs.tufts.edu:/r/tcal/work/contention/
+    
 }
 
 # Execute main function if script is run directly
