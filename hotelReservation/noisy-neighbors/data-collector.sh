@@ -642,6 +642,9 @@ generate_metadata() {
     }
 }
 EOF
+
+sudo lshw -json > $exp_dir/metadata/hardware.json
+
 }
 
 # Aggregate iteration data into summary files
