@@ -292,6 +292,136 @@ deploy_victim_services() {
     echo "$services" > "$exp_dir/metadata/deployed_services.txt"
 }
 
+# Configure Jaeger tracing for all hotel reservation services
+configure_jaeger_tracing() {
+    local exp_dir="$1"
+    
+    # Get sampling rate from config or use default
+    local sampling_rate="${JAEGER_SAMPLE_RATIO:-0.01}"
+    
+    # Skip Jaeger configuration if sampling rate is 0
+    if [[ "$sampling_rate" == "0" || "$sampling_rate" == "0.0" ]]; then
+        log "$exp_dir" "Jaeger sampling rate is 0 - skipping Jaeger configuration"
+        echo "=== JAEGER CONFIGURATION ===" > "$exp_dir/metadata/jaeger_config.txt"
+        echo "Skipped at: $(date -Iseconds)" >> "$exp_dir/metadata/jaeger_config.txt"
+        echo "Reason: Sampling rate set to 0" >> "$exp_dir/metadata/jaeger_config.txt"
+        echo "Sampling rate: $sampling_rate" >> "$exp_dir/metadata/jaeger_config.txt"
+        return 0
+    fi
+    
+    log "$exp_dir" "Configuring Jaeger tracing for all hotel reservation services..."
+    log "$exp_dir" "Using Jaeger sampling rate: $sampling_rate"
+    
+    # List of all hotel reservation services that need Jaeger configuration
+    local all_services=(
+        "frontend"
+        "search" 
+        "geo"
+        "profile"
+        "rate"
+        "recommendation"
+        "reservation"
+        "user"
+        "review"
+        "attractions"
+    )
+    
+    # Wait for all deployments to be available before configuring
+    log "$exp_dir" "Waiting for deployments to be ready before Jaeger configuration..."
+    for service in "${all_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            kubectl wait --for=condition=available --timeout=300s deployment/"$service" 2>/dev/null || \
+                log "$exp_dir" "WARNING: Timeout waiting for $service deployment"
+        fi
+    done
+    
+    # Configure each service
+    local configured_count=0
+    for service in "${all_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            log "$exp_dir" "Configuring Jaeger for $service..."
+            
+            # Set HTTP collector endpoint
+            kubectl set env deployment/"$service" JAEGER_ENDPOINT=http://jaeger:14268/api/traces 2>/dev/null || \
+                log "$exp_dir" "WARNING: Failed to set JAEGER_ENDPOINT for $service"
+            
+            # Set sampling rate
+            kubectl set env deployment/"$service" JAEGER_SAMPLE_RATIO="$sampling_rate" 2>/dev/null || \
+                log "$exp_dir" "WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
+            
+            # Remove UDP agent configuration
+            kubectl set env deployment/"$service" JAEGER_AGENT_HOST- 2>/dev/null || \
+                log "$exp_dir" "WARNING: Failed to remove JAEGER_AGENT_HOST for $service"
+            
+            ((configured_count++))
+        else
+            log "$exp_dir" "Service $service not found, skipping Jaeger configuration"
+        fi
+    done
+    
+    log "$exp_dir" "Jaeger environment variables set for $configured_count services. Waiting for rollouts..."
+    
+    # Wait for all rollouts to complete
+    for service in "${all_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            kubectl rollout status deployment/"$service" --timeout=120s 2>/dev/null || \
+                log "$exp_dir" "WARNING: Rollout timeout for $service"
+        fi
+    done
+    
+    log "$exp_dir" "Waiting for services to stabilize after Jaeger configuration..."
+    sleep 30
+    
+    # Verification
+    log "$exp_dir" "Verifying Jaeger configuration..."
+    
+    # Check sampling rate on a few key services
+    for service in "frontend" "search"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            local sample_log=$(kubectl logs deployment/"$service" 2>/dev/null | grep "sample ratio" | tail -1)
+            if [[ -n "$sample_log" ]]; then
+                log "$exp_dir" "  $service: $sample_log"
+            else
+                log "$exp_dir" "  $service: No sample ratio log found"
+            fi
+        fi
+    done
+    
+    # Check Jaeger service registration
+    local jaeger_services=$(kubectl exec -it deployment/jaeger -- wget -qO- "http://localhost:16686/api/services" 2>/dev/null | grep -o '"[^"]*"' | grep -v "data\|total\|limit\|offset\|errors" | head -5)
+    if [[ -n "$jaeger_services" ]]; then
+        log "$exp_dir" "  Registered services in Jaeger: $jaeger_services"
+    else
+        log "$exp_dir" "  WARNING: Could not verify Jaeger service registration"
+    fi
+    
+    # Test connectivity with a simple request
+    local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    if [[ "$connectivity_test" == "200" ]]; then
+        log "$exp_dir" "  Frontend connectivity test passed (HTTP 200)"
+    else
+        log "$exp_dir" "  Frontend connectivity test failed (HTTP $connectivity_test)"
+    fi
+    
+    log "$exp_dir" "Jaeger configuration completed. Services ready for tracing experiments."
+    
+    # Save configuration details to metadata
+    {
+        echo "=== JAEGER CONFIGURATION ==="
+        echo "Configured at: $(date -Iseconds)"
+        echo "Sampling rate: $sampling_rate"
+        echo "Services configured: $configured_count"
+        echo "Endpoint: http://jaeger:14268/api/traces"
+        echo ""
+        echo "Configured services:"
+        for service in "${all_services[@]}"; do
+            if kubectl get deployment "$service" &>/dev/null; then
+                echo "  - $service"
+            fi
+        done
+    } > "$exp_dir/metadata/jaeger_config.txt"
+}
+
 # Clean up pending pods that might be stuck
 cleanup_pending_pods() {
     local exp_dir="$1"
@@ -746,6 +876,9 @@ run_experiment() {
     # Wait for services to stabilize
     sleep 30
     
+    # Configure Jaeger tracing for all services after deployment
+    configure_jaeger_tracing "$exp_dir"
+    
     # Run iterations
     for iteration in $(seq 1 $total_iterations); do
         log "$exp_dir" "=== Iteration $iteration/$total_iterations ==="
@@ -788,6 +921,9 @@ main() {
         echo "EXPERIMENT_DURATION=300"
         echo "ITERATIONS=5"
         echo "ITERATION_DELAY=120"
+        echo "# Jaeger tracing configuration:"
+        echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
+        echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
         echo "# wrk2 configuration:"
         echo "WRK2_TARGET_SERVICE='frontend'"
         echo "WRK2_TARGET_IP='192.168.202.238'"
