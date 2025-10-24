@@ -381,6 +381,41 @@ configure_jaeger_tracing() {
         fi
     done
     
+    # Verify all services are actually running and ready
+    log "$exp_dir" "Verifying all services are running after Jaeger configuration..."
+    local failed_services=()
+    for service in "${all_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            local ready_replicas=$(kubectl get deployment "$service" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local desired_replicas=$(kubectl get deployment "$service" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+            
+            if [[ "$ready_replicas" == "$desired_replicas" && "$ready_replicas" != "0" ]]; then
+                log "$exp_dir" "  ✓ $service: $ready_replicas/$desired_replicas pods ready"
+            else
+                log "$exp_dir" "  ✗ $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
+                failed_services+=("$service")
+            fi
+        fi
+    done
+    
+    # If services failed, try to recover them
+    if [[ ${#failed_services[@]} -gt 0 ]]; then
+        log "$exp_dir" "Attempting to recover failed services: ${failed_services[*]}"
+        for service in "${failed_services[@]}"; do
+            log "$exp_dir" "  Checking $service pods..."
+            kubectl get pods -l app="$service" -o wide
+            
+            # Try restarting failed service
+            log "$exp_dir" "  Restarting $service..."
+            kubectl rollout restart deployment/"$service" 2>/dev/null
+            kubectl rollout status deployment/"$service" --timeout=60s 2>/dev/null || \
+                log "$exp_dir" "  WARNING: Recovery timeout for $service"
+        done
+        
+        # Additional wait for recovery
+        sleep 30
+    fi
+    
     log "$exp_dir" "Waiting for services to stabilize after Jaeger configuration..."
     sleep 30
     
@@ -457,6 +492,43 @@ refresh_consul_service_discovery() {
     local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | head -10)
     if [[ -n "$consul_services" ]]; then
         log "$exp_dir" "  Current services: $consul_services"
+        
+        # Count registered services
+        local registered_count=$(echo "$consul_services" | wc -l)
+        log "$exp_dir" "  Total services registered: $registered_count"
+        
+        # Check for missing services
+        local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+        local missing_services=()
+        
+        for expected in "${expected_services[@]}"; do
+            if ! echo "$consul_services" | grep -q "$expected"; then
+                missing_services+=("$expected")
+            fi
+        done
+        
+        if [[ ${#missing_services[@]} -gt 0 ]]; then
+            log "$exp_dir" "  WARNING: Missing services in Consul: ${missing_services[*]}"
+            
+            # Try to trigger re-registration for missing services
+            for missing in "${missing_services[@]}"; do
+                local service_name=${missing#srv-}  # Remove srv- prefix
+                if kubectl get deployment "$service_name" &>/dev/null; then
+                    log "$exp_dir" "    Attempting to re-register $service_name..."
+                    kubectl rollout restart deployment/"$service_name" 2>/dev/null
+                fi
+            done
+            
+            # Wait for re-registration
+            sleep 20
+            
+            # Re-check registrations
+            consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | head -10)
+            registered_count=$(echo "$consul_services" | wc -l)
+            log "$exp_dir" "  After re-registration attempt: $registered_count services"
+        else
+            log "$exp_dir" "  ✓ All expected services are registered"
+        fi
     else
         log "$exp_dir" "  WARNING: No services found in Consul registry"
     fi
