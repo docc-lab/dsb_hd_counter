@@ -312,6 +312,9 @@ configure_jaeger_tracing() {
     log "$exp_dir" "Configuring Jaeger tracing for all hotel reservation services..."
     log "$exp_dir" "Using Jaeger sampling rate: $sampling_rate"
     
+    # Temporarily disable exit on error for Jaeger configuration
+    set +e
+    
     # List of all hotel reservation services that need Jaeger configuration
     local all_services=(
         "frontend"
@@ -342,16 +345,25 @@ configure_jaeger_tracing() {
             log "$exp_dir" "Configuring Jaeger for $service..."
             
             # Set HTTP collector endpoint
-            kubectl set env deployment/"$service" JAEGER_ENDPOINT=http://jaeger:14268/api/traces 2>/dev/null || \
-                log "$exp_dir" "WARNING: Failed to set JAEGER_ENDPOINT for $service"
+            if kubectl set env deployment/"$service" JAEGER_ENDPOINT=http://jaeger:14268/api/traces 2>/dev/null; then
+                log "$exp_dir" "  ✓ Set JAEGER_ENDPOINT for $service"
+            else
+                log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_ENDPOINT for $service"
+            fi
             
             # Set sampling rate
-            kubectl set env deployment/"$service" JAEGER_SAMPLE_RATIO="$sampling_rate" 2>/dev/null || \
-                log "$exp_dir" "WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
+            if kubectl set env deployment/"$service" JAEGER_SAMPLE_RATIO="$sampling_rate" 2>/dev/null; then
+                log "$exp_dir" "  ✓ Set JAEGER_SAMPLE_RATIO for $service"
+            else
+                log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
+            fi
             
             # Remove UDP agent configuration
-            kubectl set env deployment/"$service" JAEGER_AGENT_HOST- 2>/dev/null || \
-                log "$exp_dir" "WARNING: Failed to remove JAEGER_AGENT_HOST for $service"
+            if kubectl set env deployment/"$service" JAEGER_AGENT_HOST- 2>/dev/null; then
+                log "$exp_dir" "  ✓ Removed JAEGER_AGENT_HOST for $service"
+            else
+                log "$exp_dir" "  ✗ WARNING: Failed to remove JAEGER_AGENT_HOST for $service (may not exist)"
+            fi
             
             ((configured_count++))
         else
@@ -404,6 +416,9 @@ configure_jaeger_tracing() {
     fi
     
     log "$exp_dir" "Jaeger configuration completed. Services ready for tracing experiments."
+    
+    # Re-enable exit on error
+    set -e
     
     # Save configuration details to metadata
     {
