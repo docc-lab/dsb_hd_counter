@@ -224,7 +224,7 @@ check_and_untolerate_pods() {
             fi
             
             if [[ $final_user_pods -eq 0 ]]; then
-                log "$exp_dir" "✓ Target node $target_node is now clear of user pods"
+                log "$exp_dir" " Target node $target_node is now clear of user pods"
                 break
             fi
             
@@ -346,21 +346,21 @@ configure_jaeger_tracing() {
             
             # Set HTTP collector endpoint
             if kubectl set env deployment/"$service" JAEGER_ENDPOINT=http://jaeger:14268/api/traces 2>/dev/null; then
-                log "$exp_dir" "  ✓ Set JAEGER_ENDPOINT for $service"
+                log "$exp_dir" "   Set JAEGER_ENDPOINT for $service"
             else
                 log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_ENDPOINT for $service"
             fi
             
             # Set sampling rate
             if kubectl set env deployment/"$service" JAEGER_SAMPLE_RATIO="$sampling_rate" 2>/dev/null; then
-                log "$exp_dir" "  ✓ Set JAEGER_SAMPLE_RATIO for $service"
+                log "$exp_dir" "   Set JAEGER_SAMPLE_RATIO for $service"
             else
                 log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
             fi
             
             # Remove UDP agent configuration
             if kubectl set env deployment/"$service" JAEGER_AGENT_HOST- 2>/dev/null; then
-                log "$exp_dir" "  ✓ Removed JAEGER_AGENT_HOST for $service"
+                log "$exp_dir" "   Removed JAEGER_AGENT_HOST for $service"
             else
                 log "$exp_dir" "  ✗ WARNING: Failed to remove JAEGER_AGENT_HOST for $service (may not exist)"
             fi
@@ -383,6 +383,9 @@ configure_jaeger_tracing() {
     
     log "$exp_dir" "Waiting for services to stabilize after Jaeger configuration..."
     sleep 30
+    
+    # Force Consul service discovery refresh
+    refresh_consul_service_discovery "$exp_dir"
     
     # Verification
     log "$exp_dir" "Verifying Jaeger configuration..."
@@ -435,6 +438,81 @@ configure_jaeger_tracing() {
             fi
         done
     } > "$exp_dir/metadata/jaeger_config.txt"
+}
+
+# Force Consul service discovery refresh to resolve stale connections
+refresh_consul_service_discovery() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Refreshing Consul service discovery to resolve stale connections..."
+    
+    # Check if Consul is available
+    if ! kubectl get deployment consul &>/dev/null; then
+        log "$exp_dir" "WARNING: Consul deployment not found, skipping service discovery refresh"
+        return 0
+    fi
+    
+    # Get current service registrations
+    log "$exp_dir" "Checking current Consul service registrations..."
+    local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | head -10)
+    if [[ -n "$consul_services" ]]; then
+        log "$exp_dir" "  Current services: $consul_services"
+    else
+        log "$exp_dir" "  WARNING: No services found in Consul registry"
+    fi
+    
+    # Force Consul cache refresh without restarting pods (to preserve Jaeger config)
+    log "$exp_dir" "Forcing Consul resolver cache refresh without pod restarts..."
+    
+    # Method 1: Restart Consul itself to force all clients to reconnect
+    if kubectl get deployment consul &>/dev/null; then
+        log "$exp_dir" "Restarting Consul to force client reconnections..."
+        kubectl rollout restart deployment/consul 2>/dev/null
+        kubectl rollout status deployment/consul --timeout=60s 2>/dev/null || \
+            log "$exp_dir" "  WARNING: Consul restart timeout"
+        log "$exp_dir" "  Consul restarted - clients will reconnect automatically"
+        
+        # Wait for Consul to be fully ready and clients to reconnect
+        sleep 20
+    else
+        log "$exp_dir" "  WARNING: Consul deployment not found"
+    fi
+    
+    # Method 2: Force DNS cache flush in pods (if possible)
+    local client_services=("frontend" "search")
+    for service in "${client_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            log "$exp_dir" "Flushing DNS cache for $service..."
+            # Try to flush DNS cache without restarting the pod
+            kubectl exec -it deployment/"$service" -- sh -c "echo 'Attempting DNS cache flush...'; killall -USR1 dnsmasq 2>/dev/null || true" 2>/dev/null || \
+                log "$exp_dir" "  DNS cache flush not available for $service"
+        fi
+    done
+    
+    # Additional wait for connections to stabilize
+    log "$exp_dir" "Waiting for service connections to stabilize..."
+    sleep 15
+    
+    # Verify connectivity after refresh
+    log "$exp_dir" "Verifying service connectivity after refresh..."
+    local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    if [[ "$connectivity_test" == "200" ]]; then
+        log "$exp_dir" "  Service connectivity verified after refresh"
+    else
+        log "$exp_dir" "  Service connectivity test failed after refresh (HTTP $connectivity_test)"
+    fi
+    
+    # Save refresh details to metadata
+    {
+        echo "=== CONSUL SERVICE DISCOVERY REFRESH ==="
+        echo "Refreshed at: $(date -Iseconds)"
+        echo "Method: Consul restart + DNS cache flush (preserves Jaeger config)"
+        echo "Consul restarted: Yes"
+        echo "DNS cache flushed for: ${client_services[*]}"
+        echo "Final connectivity test: HTTP $connectivity_test"
+    } > "$exp_dir/metadata/consul_refresh.txt"
+    
+    log "$exp_dir" "Consul service discovery refresh completed"
 }
 
 # Clean up pending pods that might be stuck

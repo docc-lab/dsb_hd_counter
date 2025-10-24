@@ -70,7 +70,7 @@ if [ "$UNTOLERATE_MODE" == "true" ]; then
     # Remove taint from node
     echo "1. Removing taint from node '$NODE_NAME'..."
     kubectl taint nodes "$NODE_NAME" "$TAINT_KEY-" || echo "Note: Taint may not exist or already removed"
-    echo "✓ Taint removal attempted"
+    echo " Taint removal attempted"
 
     # Remove toleration from deployment
     echo "2. Removing toleration from deployment '$SERVICE_NAME'..."
@@ -84,16 +84,16 @@ if [ "$UNTOLERATE_MODE" == "true" ]; then
         }
       }
     }'
-    echo "✓ Tolerations removed successfully"
+    echo " Tolerations removed successfully"
 
     # Trigger rollout to apply changes
     echo "3. Rolling out deployment to apply changes..."
     kubectl rollout restart deployment "$SERVICE_NAME"
-    echo "✓ Rollout triggered"
+    echo " Rollout triggered"
 
     echo "4. Waiting for rollout to complete..."
     kubectl rollout status deployment "$SERVICE_NAME" --timeout=60s
-    echo "✓ Rollout completed successfully"
+    echo " Rollout completed successfully"
     
     # Restart all deployments if requested
     if [ "$RESTART_ALL" == "true" ]; then
@@ -110,14 +110,14 @@ if [ "$UNTOLERATE_MODE" == "true" ]; then
             fi
         done
         
-        echo "✓ All other deployments restart triggered"
+        echo " All other deployments restart triggered"
         echo "6. Waiting for all deployments to stabilize..."
         echo "$deployments" | while read -r deployment; do
             deployment_name=$(echo "$deployment" | cut -d'/' -f2)
             echo "  Waiting for $deployment_name..."
             kubectl rollout status "$deployment" --timeout=30s
         done
-        echo "✓ All deployments stabilized"
+        echo " All deployments stabilized"
     fi
 
 else
@@ -125,7 +125,7 @@ else
     # Taint the node
     echo "1. Tainting node '$NODE_NAME'..."
     kubectl taint nodes "$NODE_NAME" "$TAINT_KEY=$TAINT_VALUE:$TAINT_EFFECT" --overwrite
-    echo "✓ Node tainted successfully"
+    echo " Node tainted successfully"
 
     # Add toleration to the service
     echo "2. Adding toleration to deployment '$SERVICE_NAME'..."
@@ -145,16 +145,16 @@ else
         }
       }
     }'
-    echo "✓ Toleration added successfully"
+    echo " Toleration added successfully"
 
     # Trigger rollout to apply tolerations to running pods
     echo "3. Rolling out deployment to apply tolerations..."
     kubectl rollout restart deployment "$SERVICE_NAME"
-    echo "✓ Rollout triggered"
+    echo " Rollout triggered"
 
     echo "4. Waiting for rollout to complete..."
     kubectl rollout status deployment "$SERVICE_NAME" --timeout=60s
-    echo "✓ Rollout completed successfully"
+    echo " Rollout completed successfully"
 
     # Restart all deployments if requested
     if [ "$RESTART_ALL" == "true" ]; then
@@ -171,13 +171,13 @@ else
             fi
         done
         
-        echo "✓ All deployments restart triggered"
+        echo " All deployments restart triggered"
         echo "6. Waiting for all deployments to stabilize..."
         echo "$deployments" | while read -r deployment; do
             echo "  Waiting for $deployment..."
             kubectl rollout status "$deployment" --timeout=30s
         done
-        echo "✓ All deployments completed"
+        echo " All deployments completed"
     fi
 fi
 
