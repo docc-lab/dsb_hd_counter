@@ -421,21 +421,21 @@ configure_jaeger_tracing() {
             if kubectl set env deployment/"$service" JAEGER_ENDPOINT=http://jaeger:14268/api/traces 2>/dev/null; then
                 log "$exp_dir" "   Set JAEGER_ENDPOINT for $service"
             else
-                log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_ENDPOINT for $service"
+                log "$exp_dir" "   WARNING: Failed to set JAEGER_ENDPOINT for $service"
             fi
             
             # Set sampling rate
             if kubectl set env deployment/"$service" JAEGER_SAMPLE_RATIO="$sampling_rate" 2>/dev/null; then
                 log "$exp_dir" "   Set JAEGER_SAMPLE_RATIO for $service"
             else
-                log "$exp_dir" "  ✗ WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
+                log "$exp_dir" "   WARNING: Failed to set JAEGER_SAMPLE_RATIO for $service"
             fi
             
             # Remove UDP agent configuration
             if kubectl set env deployment/"$service" JAEGER_AGENT_HOST- 2>/dev/null; then
                 log "$exp_dir" "   Removed JAEGER_AGENT_HOST for $service"
             else
-                log "$exp_dir" "  ✗ WARNING: Failed to remove JAEGER_AGENT_HOST for $service (may not exist)"
+                log "$exp_dir" "   WARNING: Failed to remove JAEGER_AGENT_HOST for $service (may not exist)"
             fi
             
             ((configured_count++))
@@ -463,9 +463,9 @@ configure_jaeger_tracing() {
             local desired_replicas=$(kubectl get deployment "$service" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
             
             if [[ "$ready_replicas" == "$desired_replicas" && "$ready_replicas" != "0" ]]; then
-                log "$exp_dir" "  ✓ $service: $ready_replicas/$desired_replicas pods ready"
+                log "$exp_dir" "   $service: $ready_replicas/$desired_replicas pods ready"
             else
-                log "$exp_dir" "  ✗ $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
+                log "$exp_dir" "   $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
                 failed_services+=("$service")
             fi
         fi
@@ -490,10 +490,16 @@ configure_jaeger_tracing() {
     fi
     
     log "$exp_dir" "Waiting for services to stabilize after Jaeger configuration..."
-    sleep 30
+    sleep 45  # Increased from 30s to 45s
     
-    # Force Consul service discovery refresh
-    refresh_consul_service_discovery "$exp_dir"
+    # Enhanced service registration validation and monitoring
+    log "$exp_dir" "Validating service registration in Consul..."
+    if ! validate_and_ensure_service_registration "$exp_dir" 2; then
+        log "$exp_dir" "WARNING: Service registration validation failed, performing refresh..."
+        refresh_consul_service_discovery "$exp_dir"
+    else
+        log "$exp_dir" " All services properly registered, skipping unnecessary Consul restart"
+    fi
     
     # Verification
     log "$exp_dir" "Verifying Jaeger configuration..."
@@ -548,11 +554,153 @@ configure_jaeger_tracing() {
     } > "$exp_dir/metadata/jaeger_config.txt"
 }
 
-# Force Consul service discovery refresh to resolve stale connections
+# Monitor and validate Consul service registration
+monitor_consul_service_registration() {
+    local exp_dir="$1"
+    local max_wait_time="${2:-120}"  # Maximum wait time in seconds
+    local check_interval="${3:-10}"  # Check interval in seconds
+    
+    log "$exp_dir" "Monitoring Consul service registration..."
+    
+    # Check if Consul is available
+    if ! kubectl get deployment consul &>/dev/null; then
+        log "$exp_dir" "WARNING: Consul deployment not found, skipping service registration monitoring"
+        return 1
+    fi
+    
+    local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    local wait_time=0
+    local all_registered=false
+    
+    while [[ $wait_time -lt $max_wait_time && "$all_registered" == "false" ]]; do
+        # Get current service registrations
+        local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+        local registered_count=0
+        local missing_services=()
+        
+        if [[ -n "$consul_services" ]]; then
+            registered_count=$(echo "$consul_services" | wc -l)
+            
+            # Check for missing services
+            for expected in "${expected_services[@]}"; do
+                if ! echo "$consul_services" | grep -q "$expected"; then
+                    missing_services+=("$expected")
+                fi
+            done
+            
+            if [[ ${#missing_services[@]} -eq 0 ]]; then
+                log "$exp_dir" "   All ${#expected_services[@]} expected services are registered in Consul"
+                all_registered=true
+                break
+            else
+                log "$exp_dir" "  Progress: $registered_count/${#expected_services[@]} services registered. Missing: ${missing_services[*]}"
+            fi
+        else
+            log "$exp_dir" "  No services found in Consul registry yet"
+        fi
+        
+        if [[ "$all_registered" == "false" ]]; then
+            sleep $check_interval
+            wait_time=$((wait_time + check_interval))
+        fi
+    done
+    
+    if [[ "$all_registered" == "true" ]]; then
+        log "$exp_dir" " Service registration monitoring completed successfully"
+        return 0
+    else
+        log "$exp_dir" " Service registration monitoring failed - not all services registered after ${max_wait_time}s"
+        
+        # Log final state for debugging
+        log "$exp_dir" "Final Consul service state:"
+        kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | while read -r service; do
+            log "$exp_dir" "    $service"
+        done
+        
+        return 1
+    fi
+}
+
+# Enhanced service registration validation with retry logic
+validate_and_ensure_service_registration() {
+    local exp_dir="$1"
+    local max_attempts="${2:-3}"
+    
+    log "$exp_dir" "Validating and ensuring all services are registered in Consul..."
+    
+    local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    
+    for attempt in $(seq 1 $max_attempts); do
+        log "$exp_dir" "Validation attempt $attempt/$max_attempts"
+        
+        # Check current registrations
+        local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+        local missing_services=()
+        
+        if [[ -n "$consul_services" ]]; then
+            local registered_count=$(echo "$consul_services" | wc -l)
+            log "$exp_dir" "  Currently registered: $registered_count services"
+            
+            # Check for missing services
+            for expected in "${expected_services[@]}"; do
+                if ! echo "$consul_services" | grep -q "$expected"; then
+                    missing_services+=("$expected")
+                fi
+            done
+            
+            if [[ ${#missing_services[@]} -eq 0 ]]; then
+                log "$exp_dir" "   All services are properly registered"
+                
+                # Test connectivity to ensure services are actually reachable
+                log "$exp_dir" "  Testing service connectivity..."
+                local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+                if [[ "$connectivity_test" == "200" ]]; then
+                    log "$exp_dir" "   Service connectivity test passed (HTTP 200)"
+                    return 0
+                else
+                    log "$exp_dir" "   Service connectivity test failed (HTTP $connectivity_test)"
+                    if [[ $attempt -lt $max_attempts ]]; then
+                        log "$exp_dir" "  Will retry service registration..."
+                    fi
+                fi
+            else
+                log "$exp_dir" "  Missing services in Consul: ${missing_services[*]}"
+            fi
+        else
+            log "$exp_dir" "  No services found in Consul registry"
+        fi
+        
+        # If not the last attempt, try to fix registration issues
+        if [[ $attempt -lt $max_attempts ]]; then
+            log "$exp_dir" "  Attempting to fix service registration issues..."
+            
+            # Restart services that should be registered but aren't
+            for missing in "${missing_services[@]}"; do
+                local service_name=${missing#srv-}  # Remove srv- prefix
+                if kubectl get deployment "$service_name" &>/dev/null; then
+                    log "$exp_dir" "    Restarting $service_name to trigger re-registration..."
+                    kubectl rollout restart deployment/"$service_name" 2>/dev/null
+                fi
+            done
+            
+            # Wait for services to restart and register
+            log "$exp_dir" "  Waiting 60s for services to restart and register..."
+            sleep 60
+            
+            # Monitor registration progress
+            monitor_consul_service_registration "$exp_dir" 60 5
+        fi
+    done
+    
+    log "$exp_dir" " Service registration validation failed after $max_attempts attempts"
+    return 1
+}
+
+# Lightweight Consul service discovery refresh (no restarts)
 refresh_consul_service_discovery() {
     local exp_dir="$1"
     
-    log "$exp_dir" "Refreshing Consul service discovery to resolve stale connections..."
+    log "$exp_dir" "Performing lightweight Consul service discovery refresh..."
     
     # Check if Consul is available
     if ! kubectl get deployment consul &>/dev/null; then
@@ -560,104 +708,231 @@ refresh_consul_service_discovery() {
         return 0
     fi
     
-    # Get current service registrations
-    log "$exp_dir" "Checking current Consul service registrations..."
-    local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | head -10)
-    if [[ -n "$consul_services" ]]; then
-        log "$exp_dir" "  Current services: $consul_services"
-        
-        # Count registered services
-        local registered_count=$(echo "$consul_services" | wc -l)
-        log "$exp_dir" "  Total services registered: $registered_count"
-        
-        # Check for missing services
-        local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
-        local missing_services=()
-        
-        for expected in "${expected_services[@]}"; do
-            if ! echo "$consul_services" | grep -q "$expected"; then
-                missing_services+=("$expected")
-            fi
-        done
-        
-        if [[ ${#missing_services[@]} -gt 0 ]]; then
-            log "$exp_dir" "  WARNING: Missing services in Consul: ${missing_services[*]}"
-            
-            # Try to trigger re-registration for missing services
-            for missing in "${missing_services[@]}"; do
-                local service_name=${missing#srv-}  # Remove srv- prefix
-                if kubectl get deployment "$service_name" &>/dev/null; then
-                    log "$exp_dir" "    Attempting to re-register $service_name..."
-                    kubectl rollout restart deployment/"$service_name" 2>/dev/null
-                fi
-            done
-            
-            # Wait for re-registration
-            sleep 20
-            
-            # Re-check registrations
-            consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | head -10)
-            registered_count=$(echo "$consul_services" | wc -l)
-            log "$exp_dir" "  After re-registration attempt: $registered_count services"
-        else
-            log "$exp_dir" "  ✓ All expected services are registered"
-        fi
-    else
-        log "$exp_dir" "  WARNING: No services found in Consul registry"
+    # First, validate current service registration without any restarts
+    if validate_and_ensure_service_registration "$exp_dir" 1; then
+        log "$exp_dir" " All services already properly registered, no refresh needed"
+        return 0
     fi
     
-    # Force Consul cache refresh without restarting pods (to preserve Jaeger config)
-    log "$exp_dir" "Forcing Consul resolver cache refresh without pod restarts..."
+    log "$exp_dir" "Service registration issues detected, performing refresh..."
     
-    # Method 1: Restart Consul itself to force all clients to reconnect
-    if kubectl get deployment consul &>/dev/null; then
-        log "$exp_dir" "Restarting Consul to force client reconnections..."
-        kubectl rollout restart deployment/consul 2>/dev/null
-        kubectl rollout status deployment/consul --timeout=60s 2>/dev/null || \
-            log "$exp_dir" "  WARNING: Consul restart timeout"
-        log "$exp_dir" "  Consul restarted - clients will reconnect automatically"
-        
-        # Wait for Consul to be fully ready and clients to reconnect
-        sleep 20
+    # Only restart Consul if absolutely necessary
+    log "$exp_dir" "Restarting Consul to refresh service discovery (preserving service pods)..."
+    kubectl rollout restart deployment/consul 2>/dev/null
+    kubectl rollout status deployment/consul --timeout=60s 2>/dev/null || \
+        log "$exp_dir" "  WARNING: Consul restart timeout"
+    
+    # Wait for Consul to be fully ready
+    log "$exp_dir" "Waiting for Consul to stabilize and services to re-register..."
+    sleep 30
+    
+    # Monitor service registration with extended timeout
+    if monitor_consul_service_registration "$exp_dir" 120 10; then
+        log "$exp_dir" " Service registration refresh completed successfully"
     else
-        log "$exp_dir" "  WARNING: Consul deployment not found"
+        log "$exp_dir" " Service registration refresh failed"
+        return 1
     fi
     
-    # Method 2: Force DNS cache flush in pods (if possible)
-    local client_services=("frontend" "search")
-    for service in "${client_services[@]}"; do
-        if kubectl get deployment "$service" &>/dev/null; then
-            log "$exp_dir" "Flushing DNS cache for $service..."
-            # Try to flush DNS cache without restarting the pod
-            kubectl exec -it deployment/"$service" -- sh -c "echo 'Attempting DNS cache flush...'; killall -USR1 dnsmasq 2>/dev/null || true" 2>/dev/null || \
-                log "$exp_dir" "  DNS cache flush not available for $service"
-        fi
-    done
+    # Additional wait for connections to fully stabilize
+    log "$exp_dir" "Allowing additional time for service connections to stabilize..."
+    sleep 30
     
-    # Additional wait for connections to stabilize
-    log "$exp_dir" "Waiting for service connections to stabilize..."
-    sleep 15
-    
-    # Verify connectivity after refresh
+    # Final connectivity verification
     log "$exp_dir" "Verifying service connectivity after refresh..."
     local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$connectivity_test" == "200" ]]; then
-        log "$exp_dir" "  Service connectivity verified after refresh"
+        log "$exp_dir" "   Service connectivity verified (HTTP 200)"
     else
-        log "$exp_dir" "  Service connectivity test failed after refresh (HTTP $connectivity_test)"
+        log "$exp_dir" "   Service connectivity test failed (HTTP $connectivity_test)"
     fi
     
     # Save refresh details to metadata
     {
         echo "=== CONSUL SERVICE DISCOVERY REFRESH ==="
         echo "Refreshed at: $(date -Iseconds)"
-        echo "Method: Consul restart + DNS cache flush (preserves Jaeger config)"
+        echo "Method: Consul restart only (preserves service pods and Jaeger config)"
         echo "Consul restarted: Yes"
-        echo "DNS cache flushed for: ${client_services[*]}"
+        echo "Service pods restarted: No"
         echo "Final connectivity test: HTTP $connectivity_test"
+        echo "Total wait time: ~80s (30s + 30s + monitoring time)"
     } > "$exp_dir/metadata/consul_refresh.txt"
     
     log "$exp_dir" "Consul service discovery refresh completed"
+}
+
+# Comprehensive system readiness validation
+validate_system_readiness() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "=== COMPREHENSIVE SYSTEM READINESS VALIDATION ==="
+    
+    local validation_failed=false
+    
+    # 1. Validate all expected services are running
+    log "$exp_dir" "1. Validating service deployments..."
+    local expected_services=("frontend" "search" "geo" "profile" "rate" "recommendation" "reservation" "user")
+    local failed_deployments=()
+    
+    for service in "${expected_services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            local ready_replicas=$(kubectl get deployment "$service" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local desired_replicas=$(kubectl get deployment "$service" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+            
+            if [[ "$ready_replicas" == "$desired_replicas" && "$ready_replicas" != "0" ]]; then
+                log "$exp_dir" "   ✓ $service: $ready_replicas/$desired_replicas pods ready"
+            else
+                log "$exp_dir" "   ✗ $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
+                failed_deployments+=("$service")
+                validation_failed=true
+            fi
+        else
+            log "$exp_dir" "   ✗ $service: deployment not found (FAILED)"
+            failed_deployments+=("$service")
+            validation_failed=true
+        fi
+    done
+    
+    # 2. Validate Consul service registration
+    log "$exp_dir" "2. Validating Consul service registration..."
+    local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+    local expected_consul_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    local missing_consul_services=()
+    
+    if [[ -n "$consul_services" ]]; then
+        local registered_count=$(echo "$consul_services" | wc -l)
+        log "$exp_dir" "   Registered services: $registered_count"
+        
+        for expected in "${expected_consul_services[@]}"; do
+            if echo "$consul_services" | grep -q "$expected"; then
+                log "$exp_dir" "   ✓ $expected: registered"
+            else
+                log "$exp_dir" "   ✗ $expected: missing from Consul"
+                missing_consul_services+=("$expected")
+                validation_failed=true
+            fi
+        done
+    else
+        log "$exp_dir" "   ✗ No services found in Consul registry (CRITICAL FAILURE)"
+        validation_failed=true
+    fi
+    
+    # 3. Test critical service connectivity
+    log "$exp_dir" "3. Testing critical service connectivity..."
+    
+    # Test recommendations endpoint (should work)
+    local rec_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    if [[ "$rec_test" == "200" ]]; then
+        log "$exp_dir" "   ✓ Recommendations endpoint: HTTP 200"
+    else
+        log "$exp_dir" "   ✗ Recommendations endpoint: HTTP $rec_test (FAILED)"
+        validation_failed=true
+    fi
+    
+    # Test hotels endpoint (requires search service via Consul)
+    local hotel_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    if [[ "$hotel_test" == "200" ]]; then
+        log "$exp_dir" "   ✓ Hotels endpoint: HTTP 200"
+    else
+        log "$exp_dir" "   ✗ Hotels endpoint: HTTP $hotel_test (FAILED - likely Consul issue)"
+        validation_failed=true
+    fi
+    
+    # 4. Validate Consul health
+    log "$exp_dir" "4. Validating Consul health..."
+    local consul_leader=$(kubectl exec -it deployment/consul -- consul operator raft list-peers 2>/dev/null | grep -c "leader" || echo "0")
+    if [[ "$consul_leader" == "1" ]]; then
+        log "$exp_dir" "   ✓ Consul has active leader"
+    else
+        log "$exp_dir" "   ✗ Consul leader election issue (FAILED)"
+        validation_failed=true
+    fi
+    
+    # 5. Summary
+    log "$exp_dir" "=== VALIDATION SUMMARY ==="
+    if [[ "$validation_failed" == "true" ]]; then
+        log "$exp_dir" "✗ VALIDATION FAILED"
+        log "$exp_dir" "Failed deployments: ${failed_deployments[*]:-none}"
+        log "$exp_dir" "Missing Consul services: ${missing_consul_services[*]:-none}"
+        log "$exp_dir" "Recommendations test: HTTP $rec_test"
+        log "$exp_dir" "Hotels test: HTTP $hotel_test"
+        
+        # Debug failed services for better troubleshooting
+        for failed_service in "${failed_deployments[@]}"; do
+            debug_service_registration "$exp_dir" "$failed_service"
+        done
+        
+        # Debug missing Consul services
+        for missing_service in "${missing_consul_services[@]}"; do
+            local service_name=${missing_service#srv-}  # Remove srv- prefix
+            debug_service_registration "$exp_dir" "$service_name"
+        done
+        
+        # Save validation failure details
+        {
+            echo "=== SYSTEM VALIDATION FAILURE ==="
+            echo "Failed at: $(date -Iseconds)"
+            echo "Failed deployments: ${failed_deployments[*]:-none}"
+            echo "Missing Consul services: ${missing_consul_services[*]:-none}"
+            echo "Recommendations endpoint: HTTP $rec_test"
+            echo "Hotels endpoint: HTTP $hotel_test"
+            echo "Consul leader status: $consul_leader"
+        } > "$exp_dir/metadata/validation_failure.txt"
+        
+        return 1
+    else
+        log "$exp_dir" "✓ ALL VALIDATIONS PASSED"
+        log "$exp_dir" "System is ready for experiments"
+        
+        # Save successful validation details
+        {
+            echo "=== SYSTEM VALIDATION SUCCESS ==="
+            echo "Validated at: $(date -Iseconds)"
+            echo "All deployments: ready"
+            echo "Consul services: ${#expected_consul_services[@]}/${#expected_consul_services[@]} registered"
+            echo "Recommendations endpoint: HTTP $rec_test"
+            echo "Hotels endpoint: HTTP $hotel_test"
+            echo "Consul leader status: active"
+        } > "$exp_dir/metadata/validation_success.txt"
+        
+        return 0
+    fi
+}
+
+# Debug service registration issues
+debug_service_registration() {
+    local exp_dir="$1"
+    local service_name="$2"
+    
+    log "$exp_dir" "=== DEBUGGING SERVICE REGISTRATION: $service_name ==="
+    
+    # Check if deployment exists and is ready
+    if kubectl get deployment "$service_name" &>/dev/null; then
+        local ready_replicas=$(kubectl get deployment "$service_name" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        local desired_replicas=$(kubectl get deployment "$service_name" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        log "$exp_dir" "  Deployment status: $ready_replicas/$desired_replicas pods ready"
+        
+        # Get pod details
+        log "$exp_dir" "  Pod details:"
+        kubectl get pods -l app="$service_name" -o wide | while read -r line; do
+            log "$exp_dir" "    $line"
+        done
+        
+        # Check recent logs for registration attempts
+        log "$exp_dir" "  Recent logs (last 20 lines):"
+        kubectl logs deployment/"$service_name" --tail=20 2>/dev/null | while read -r line; do
+            log "$exp_dir" "    $line"
+        done | grep -E "(consul|register|error)" || log "$exp_dir" "    No registration-related logs found"
+        
+        # Check if service can connect to Consul
+        log "$exp_dir" "  Testing Consul connectivity from $service_name:"
+        kubectl exec -it deployment/"$service_name" -- sh -c "nc -z consul 8500 && echo 'Consul reachable' || echo 'Consul unreachable'" 2>/dev/null || \
+            log "$exp_dir" "    Could not test Consul connectivity"
+    else
+        log "$exp_dir" "  Deployment $service_name does not exist"
+    fi
+    
+    log "$exp_dir" "=== END DEBUG: $service_name ==="
 }
 
 # Clean up pending pods that might be stuck
@@ -892,9 +1167,9 @@ run_iteration() {
         > "$exp_dir/raw/stress/stress_iter${iteration}.txt" 2>&1 &
     local stress_pid=$!
     
-    # Wait 5 seconds before starting workload generation
-    log "$exp_dir" "Waiting 5s before starting workload generation..."
-    sleep 5
+    # Wait longer before starting workload generation to ensure services are ready
+    log "$exp_dir" "Waiting 15s before starting workload generation..."
+    sleep 15
     
     # Start workload generation and latency collection
     local wrk2_pid=""
@@ -911,9 +1186,9 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Wait another 5 seconds before starting performance monitoring
-    log "$exp_dir" "Waiting 5s before starting performance monitoring..."
-    sleep 5
+    # Wait before starting performance monitoring
+    log "$exp_dir" "Waiting 10s before starting performance monitoring..."
+    sleep 10
     
     # Start monitoring (runs for original experiment duration)
     log "$exp_dir" "Starting performance monitoring (duration: ${EXPERIMENT_DURATION}s)"
@@ -924,8 +1199,8 @@ run_iteration() {
     collect_system_metrics "$exp_dir" "$iteration" "during"
     
     # Wait for experiment to complete
-    # Total delays so far: 5s (stressor->workload) + 5s (workload->monitoring) + 30s (ramp) = 40s
-    local remaining_time=$((EXPERIMENT_DURATION - 40))
+    # Total delays so far: 15s (stressor->workload) + 10s (workload->monitoring) + 30s (ramp) = 55s
+    local remaining_time=$((EXPERIMENT_DURATION - 55))
     if [[ $remaining_time -gt 0 ]]; then
         log "$exp_dir" "Waiting ${remaining_time}s for experiment to complete..."
         sleep "$remaining_time"
@@ -1111,11 +1386,24 @@ run_experiment() {
     # Deploy victim services
     deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
     
-    # Wait for services to stabilize
-    sleep 30
+    # Wait for services to stabilize after deployment
+    log "$exp_dir" "Waiting for services to stabilize after deployment..."
+    sleep 45  # Increased from 30s to 45s
+    
+    # Monitor initial service registration
+    log "$exp_dir" "Monitoring initial service registration in Consul..."
+    monitor_consul_service_registration "$exp_dir" 90 10
     
     # Configure Jaeger tracing for all services after deployment
     configure_jaeger_tracing "$exp_dir"
+    
+    # Final validation before starting experiments
+    log "$exp_dir" "Performing final system validation before starting experiments..."
+    if ! validate_system_readiness "$exp_dir"; then
+        log "$exp_dir" "ERROR: System validation failed. Aborting experiment."
+        exit 1
+    fi
+    log "$exp_dir" " System validation passed. Ready to start experiments."
     
     # Run iterations
     for iteration in $(seq 1 $total_iterations); do
