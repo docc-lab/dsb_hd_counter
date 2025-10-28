@@ -105,7 +105,7 @@ func (c *Client) Register(name string, id string, ip string, port int) error {
 		TCP:                            fmt.Sprintf("%s:%d", ip, port),
 		Interval:                       "10s",
 		Timeout:                        "3s",
-		DeregisterCriticalServiceAfter: "60s", // Give more time before deregistering
+		DeregisterCriticalServiceAfter: "90s", // Must be >= 1 minute per Consul requirements
 	}
 	
 	reg := &consul.AgentServiceRegistration{
