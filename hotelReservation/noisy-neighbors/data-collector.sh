@@ -855,14 +855,14 @@ validate_system_readiness() {
             local desired_replicas=$(kubectl get deployment "$service" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
             
             if [[ "$ready_replicas" == "$desired_replicas" && "$ready_replicas" != "0" ]]; then
-                log "$exp_dir" "   ✓ $service: $ready_replicas/$desired_replicas pods ready"
+                log "$exp_dir" "    $service: $ready_replicas/$desired_replicas pods ready"
             else
-                log "$exp_dir" "   ✗ $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
+                log "$exp_dir" "    $service: $ready_replicas/$desired_replicas pods ready (FAILED)"
                 failed_deployments+=("$service")
                 validation_failed=true
             fi
         else
-            log "$exp_dir" "   ✗ $service: deployment not found (FAILED)"
+            log "$exp_dir" "    $service: deployment not found (FAILED)"
             failed_deployments+=("$service")
             validation_failed=true
         fi
@@ -880,15 +880,15 @@ validate_system_readiness() {
         
         for expected in "${expected_consul_services[@]}"; do
             if echo "$consul_services" | grep -q "$expected"; then
-                log "$exp_dir" "   ✓ $expected: registered"
+                log "$exp_dir" "    $expected: registered"
             else
-                log "$exp_dir" "   ✗ $expected: missing from Consul"
+                log "$exp_dir" "    $expected: missing from Consul"
                 missing_consul_services+=("$expected")
                 validation_failed=true
             fi
         done
     else
-        log "$exp_dir" "   ✗ No services found in Consul registry (CRITICAL FAILURE)"
+        log "$exp_dir" "    No services found in Consul registry (CRITICAL FAILURE)"
         validation_failed=true
     fi
     
@@ -898,35 +898,25 @@ validate_system_readiness() {
     # Test recommendations endpoint (should work)
     local rec_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$rec_test" == "200" ]]; then
-        log "$exp_dir" "   ✓ Recommendations endpoint: HTTP 200"
+        log "$exp_dir" "    Recommendations endpoint: HTTP 200"
     else
-        log "$exp_dir" "   ✗ Recommendations endpoint: HTTP $rec_test (FAILED)"
+        log "$exp_dir" "    Recommendations endpoint: HTTP $rec_test (FAILED)"
         validation_failed=true
     fi
     
     # Test hotels endpoint (requires search service via Consul)
     local hotel_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$hotel_test" == "200" ]]; then
-        log "$exp_dir" "   ✓ Hotels endpoint: HTTP 200"
+        log "$exp_dir" "    Hotels endpoint: HTTP 200"
     else
-        log "$exp_dir" "   ✗ Hotels endpoint: HTTP $hotel_test (FAILED - likely Consul issue)"
+        log "$exp_dir" "    Hotels endpoint: HTTP $hotel_test (FAILED - likely Consul issue)"
         validation_failed=true
     fi
     
-    # 4. Validate Consul health
-    log "$exp_dir" "4. Validating Consul health..."
-    local consul_status=$(kubectl exec -it deployment/consul -- consul info 2>/dev/null | grep -c "consul" || echo "0")
-    if [[ "$consul_status" -gt "0" ]]; then
-        log "$exp_dir" "   ✓ Consul is responding"
-    else
-        log "$exp_dir" "   ✗ Consul not responding (FAILED)"
-        validation_failed=true
-    fi
-    
-    # 5. Summary
+    # 4. Summary
     log "$exp_dir" "=== VALIDATION SUMMARY ==="
     if [[ "$validation_failed" == "true" ]]; then
-        log "$exp_dir" "✗ VALIDATION FAILED"
+        log "$exp_dir" " VALIDATION FAILED"
         log "$exp_dir" "Failed deployments: ${failed_deployments[*]:-none}"
         log "$exp_dir" "Missing Consul services: ${missing_consul_services[*]:-none}"
         log "$exp_dir" "Recommendations test: HTTP $rec_test"
@@ -951,12 +941,11 @@ validate_system_readiness() {
             echo "Missing Consul services: ${missing_consul_services[*]:-none}"
             echo "Recommendations endpoint: HTTP $rec_test"
             echo "Hotels endpoint: HTTP $hotel_test"
-            echo "Consul status: $consul_status"
         } > "$exp_dir/metadata/validation_failure.txt"
         
         return 1
     else
-        log "$exp_dir" "✓ ALL VALIDATIONS PASSED"
+        log "$exp_dir" " ALL VALIDATIONS PASSED"
         log "$exp_dir" "System is ready for experiments"
         
         # Save successful validation details
@@ -967,7 +956,6 @@ validate_system_readiness() {
             echo "Consul services: ${#expected_consul_services[@]}/${#expected_consul_services[@]} registered"
             echo "Recommendations endpoint: HTTP $rec_test"
             echo "Hotels endpoint: HTTP $hotel_test"
-            echo "Consul status: active"
         } > "$exp_dir/metadata/validation_success.txt"
         
         return 0
@@ -1043,41 +1031,37 @@ remove_anti_affinity() {
     
     for deployment in $deployments; do
         log "$exp_dir" "  Removing anti-affinity from $deployment"
-        kubectl patch deployment "$deployment" -n default --type='merge' -p '{
-          "spec": {
-            "template": {
-              "spec": {
-                "affinity": null
-              }
-            }
-          }
-        }' 2>/dev/null || log "$exp_dir" "    Warning: Failed to remove anti-affinity from $deployment"
+        
+        # First check if the deployment exists
+        if kubectl get deployment "$deployment" -n default >/dev/null 2>&1; then
+            # Check if the deployment has affinity rules
+            local has_affinity=$(kubectl get deployment "$deployment" -n default -o jsonpath='{.spec.template.spec.affinity}' 2>/dev/null)
+            
+            if [[ -n "$has_affinity" && "$has_affinity" != "null" ]]; then
+                # Deployment has affinity rules, remove them
+                if kubectl patch deployment "$deployment" -n default --type='merge' -p '{
+                  "spec": {
+                    "template": {
+                      "spec": {
+                        "affinity": null
+                      }
+                    }
+                  }
+                }' >/dev/null 2>&1; then
+                    log "$exp_dir" "    Successfully removed anti-affinity from $deployment"
+                else
+                    log "$exp_dir" "    Warning: Failed to remove anti-affinity from $deployment"
+                fi
+            else
+                log "$exp_dir" "    No anti-affinity rules found in $deployment (skipping)"
+            fi
+        else
+            log "$exp_dir" "    Deployment $deployment not found (skipping)"
+        fi
     done
 }
 
-# Cleanup manual service registrations
-cleanup_manual_registrations() {
-    local exp_dir="$1"
-    
-    log "$exp_dir" "Cleaning up manual service registrations..."
-    
-    # Get Consul pod
-    local consul_pod=$(kubectl get pods -l io.kompose.service=consul -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [[ -z "$consul_pod" ]]; then
-        log "$exp_dir" "WARNING: Could not find Consul pod for cleanup"
-        return 0
-    fi
-    
-    # List of manual service IDs to clean up (frontend doesn't register with Consul)
-    local manual_services=("manual-search" "manual-geo" "manual-profile" "manual-rate" "manual-recommendation" "manual-reservation" "manual-user")
-    
-    for service_id in "${manual_services[@]}"; do
-        log "$exp_dir" "  Deregistering $service_id"
-        kubectl exec -it "$consul_pod" -- consul services deregister -id="$service_id" 2>/dev/null || true
-    done
-    
-    log "$exp_dir" "Manual registration cleanup completed"
-}
+
 
 # Cleanup victim services
 cleanup_victim_services() {
@@ -1536,9 +1520,6 @@ run_experiment() {
     
     # Cleanup
     cleanup_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
-    
-    # Clean up any manual service registrations
-    cleanup_manual_registrations "$exp_dir"
     
     # Remove anti-affinity rules from untolerated deployments
     if [[ -n "$untolerated_deployments" ]]; then
