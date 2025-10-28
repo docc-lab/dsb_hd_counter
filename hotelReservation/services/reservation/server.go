@@ -373,15 +373,31 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 			for k := range itemsMap {
 				delete(queryMap, k)
 			}
-			wg.Add(len(queryMap))
+			// Cap the number of goroutines
+			maxGoroutines := 50
+			actualGoroutines := len(queryMap)
+			if actualGoroutines > maxGoroutines {
+				actualGoroutines = maxGoroutines
+			}
+			
+			wg.Add(actualGoroutines)
+			commands := make([]string, 0, len(queryMap))
+			for command := range queryMap {
+				commands = append(commands, command)
+			}
+			
 			go func() {
 				wg.Wait()
 				close(ch)
 			}()
-			for command := range queryMap {
-				go func(comm string) {
+			
+			// Distribute work among limited goroutines
+			for i := 0; i < actualGoroutines; i++ {
+				go func(workerID int) {
 					defer wg.Done()
-
+					// Each worker processes a subset of commands
+					for j := workerID; j < len(commands); j += actualGoroutines {
+						comm := commands[j]
 					var reserve []reservation
 
 					queryItem := queryMap[comm]
@@ -419,8 +435,8 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
 					}
-				}(command)
-			}
+				}
+			}(i)
 		}
 	}
 

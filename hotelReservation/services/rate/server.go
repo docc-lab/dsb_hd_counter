@@ -147,9 +147,26 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 			delete(rateMap, hotelId)
 		}
 
-		wg.Add(len(rateMap))
+		// Cap the number of goroutines
+		maxGoroutines := 50
+		actualGoroutines := len(rateMap)
+		if actualGoroutines > maxGoroutines {
+			actualGoroutines = maxGoroutines
+		}
+		
+		wg.Add(actualGoroutines)
+		hotelIds := make([]string, 0, len(rateMap))
 		for hotelId := range rateMap {
-			go func(id string) {
+			hotelIds = append(hotelIds, hotelId)
+		}
+		
+		// Distribute work among limited goroutines
+		for i := 0; i < actualGoroutines; i++ {
+			go func(workerID int) {
+				defer wg.Done()
+				// Each worker processes a subset of hotels
+				for j := workerID; j < len(hotelIds); j += actualGoroutines {
+					id := hotelIds[j]
 				log.Trace().Msgf("memc miss, hotelId = %s", id)
 				log.Trace().Msg("memcached miss, set up mongo connection")
 
@@ -188,8 +205,8 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 				}
 				go s.MemcClient.Set(&memcache.Item{Key: id, Value: []byte(memcStr)})
 
-				defer wg.Done()
-			}(hotelId)
+				}
+			}(i)
 		}
 	}
 	wg.Wait()
