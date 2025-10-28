@@ -279,119 +279,53 @@ deploy_victim_services() {
             # Wait a moment for the deployment to be created
             sleep 5
             
-            # Deploy with retry logic
-            local max_attempts=3
-            local attempt=1
-            local success=false
+            # Use the proven working method: clean deployment first, then apply taint
+            log "$exp_dir" "Deploying $service using proven clean-then-taint method..."
             
-            while [[ $attempt -le $max_attempts && "$success" == "false" ]]; do
-                log "$exp_dir" "Attempt $attempt/$max_attempts: Adding taint and toleration for $service..."
-                
-                # Add toleration and node selector to the deployment
-                if "$TAINT_SCRIPT" "$target_node" "$service"; then
-                    log "$exp_dir" "  Taint script completed successfully"
-                    
-                    # Wait for deployment to be ready with extended timeout
-                    if kubectl rollout status deployment "$service" --timeout=180s; then
-                        log "$exp_dir" "  Service $service deployed and ready"
-                        success=true
-                    else
-                        log "$exp_dir" "  WARNING: Rollout timeout for $service (attempt $attempt)"
-                        
-                        # Check for pending pods and clean them up
-                        local pending_pods=$(kubectl get pods -l io.kompose.service="$service" --field-selector=status.phase=Pending -o name 2>/dev/null)
-                        if [[ -n "$pending_pods" ]]; then
-                            log "$exp_dir" "  Found pending pods for $service, cleaning up..."
-                            echo "$pending_pods" | xargs -r kubectl delete --force --grace-period=0
-                            sleep 10
-                        fi
-                        
-                        # If not the last attempt, remove taint/toleration and retry
-                        if [[ $attempt -lt $max_attempts ]]; then
-                            log "$exp_dir" "  Removing taint/toleration before retry..."
-                            "$TAINT_SCRIPT" "$target_node" "$service" --untolerate 2>/dev/null || true
-                            
-                            # Apply emergency patch to ensure clean state
-                            log "$exp_dir" "  Applying emergency patch to ensure clean state..."
-                            kubectl patch deployment "$service" --type='merge' -p '{
-                              "spec": {
-                                "template": {
-                                  "spec": {
-                                    "tolerations": null,
-                                    "nodeSelector": null
-                                  }
-                                }
-                              }
-                            }' 2>/dev/null || true
-                            
-                            # Wait for clean deployment
-                            kubectl rollout status deployment "$service" --timeout=60s 2>/dev/null || true
-                            sleep 15
-                        fi
-                    fi
-                else
-                    log "$exp_dir" "  WARNING: Taint script failed for $service (attempt $attempt)"
-                    
-                    # Clean up any stuck pods before retry
-                    local stuck_pods=$(kubectl get pods -l io.kompose.service="$service" --field-selector=status.phase=Pending -o name 2>/dev/null)
-                    if [[ -n "$stuck_pods" ]]; then
-                        log "$exp_dir" "  Cleaning up stuck pods..."
-                        echo "$stuck_pods" | xargs -r kubectl delete --force --grace-period=0
-                        sleep 10
-                    fi
-                fi
-                
-                ((attempt++))
-            done
+            # Step 1: Ensure completely clean deployment state
+            log "$exp_dir" "  Step 1: Ensuring clean deployment state..."
             
-            if [[ "$success" == "false" ]]; then
-                log "$exp_dir" "ERROR: Failed to deploy $service after $max_attempts attempts"
-                
-                # Aggressive cleanup - delete all stuck pods first
-                log "$exp_dir" "  Performing aggressive cleanup for $service..."
-                local all_stuck_pods=$(kubectl get pods -l io.kompose.service="$service" --field-selector=status.phase=Pending -o name 2>/dev/null)
-                if [[ -n "$all_stuck_pods" ]]; then
-                    log "$exp_dir" "  Force deleting all stuck pods..."
-                    echo "$all_stuck_pods" | xargs -r kubectl delete --force --grace-period=0
-                    sleep 10
-                fi
-                
-                # Remove taint from node completely
-                log "$exp_dir" "  Removing taint from node $target_node..."
-                "$TAINT_SCRIPT" "$target_node" "$service" --untolerate 2>/dev/null || true
-                
-                # Apply emergency patch to ensure completely clean state
-                log "$exp_dir" "  Applying emergency patch for clean deployment..."
-                kubectl patch deployment "$service" --type='merge' -p '{
+            # Clean up any existing stuck pods
+            local stuck_pods=$(kubectl get pods -l io.kompose.service="$service" --field-selector=status.phase=Pending -o name 2>/dev/null)
+            if [[ -n "$stuck_pods" ]]; then
+                log "$exp_dir" "  Cleaning up existing stuck pods..."
+                echo "$stuck_pods" | xargs -r kubectl delete --force --grace-period=0
+                sleep 10
+            fi
+            
+            # Remove any existing taint/toleration to ensure clean state
+            "$TAINT_SCRIPT" "$target_node" "$service" --untolerate 2>/dev/null || true
+            
+            # Apply emergency patch to ensure completely clean state
+            kubectl patch deployment "$service" --type='merge' -p '{
+              "spec": {
+                "template": {
                   "spec": {
-                    "template": {
-                      "spec": {
-                        "tolerations": null,
-                        "nodeSelector": null,
-                        "affinity": null
-                      }
-                    }
+                    "tolerations": null,
+                    "nodeSelector": null,
+                    "affinity": null
                   }
-                }' 2>/dev/null || true
+                }
+              }
+            }' 2>/dev/null || true
+            
+            # Force restart to apply clean configuration
+            kubectl rollout restart deployment "$service" 2>/dev/null || true
+            
+            # Step 2: Wait for clean deployment to be ready
+            log "$exp_dir" "  Step 2: Waiting for clean deployment to be ready..."
+            if kubectl rollout status deployment "$service" --timeout=90s; then
+                log "$exp_dir" "  Clean deployment successful"
                 
-                # Force restart to apply clean configuration
-                kubectl rollout restart deployment "$service" 2>/dev/null || true
-                
-                # Wait for it to schedule normally on any available node
-                log "$exp_dir" "  Waiting for clean deployment to schedule..."
-                if kubectl rollout status deployment "$service" --timeout=90s; then
-                    log "$exp_dir" "  Clean deployment successful, now re-applying taint..."
-                    
-                    # Re-apply taint for final attempt
-                    if "$TAINT_SCRIPT" "$target_node" "$service"; then
-                        log "$exp_dir" "  Final taint application successful"
-                        kubectl rollout status deployment "$service" --timeout=120s || log "$exp_dir" "  Final deployment failed but continuing..."
-                    else
-                        log "$exp_dir" "  Final taint application failed, leaving service on any available node"
-                    fi
+                # Step 3: Apply taint and toleration
+                log "$exp_dir" "  Step 3: Applying taint and toleration..."
+                if "$TAINT_SCRIPT" "$target_node" "$service"; then
+                    log "$exp_dir" "  Service $service successfully deployed and pinned to $target_node"
                 else
-                    log "$exp_dir" "  Emergency cleanup failed - service may not be functional"
+                    log "$exp_dir" "  WARNING: Taint application failed, but service is running on available nodes"
                 fi
+            else
+                log "$exp_dir" "  ERROR: Clean deployment failed for $service"
             fi
         else
             log "$exp_dir" "WARNING: No YAML files found in $service_dir"
