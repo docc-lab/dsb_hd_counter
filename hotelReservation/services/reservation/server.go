@@ -391,13 +391,13 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 				close(ch)
 			}()
 			
-			// Distribute work among limited goroutines
-			for i := 0; i < actualGoroutines; i++ {
-				go func(workerID int) {
-					defer wg.Done()
-					// Each worker processes a subset of commands
-					for j := workerID; j < len(commands); j += actualGoroutines {
-						comm := commands[j]
+		// Distribute work among limited goroutines
+		for i := 0; i < actualGoroutines; i++ {
+			go func(workerID int) {
+				defer wg.Done()
+				// Each worker processes a subset of commands
+				for j := workerID; j < len(commands); j += actualGoroutines {
+					comm := commands[j]
 					var reserve []reservation
 
 					queryItem := queryMap[comm]
@@ -430,11 +430,11 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 					var res bool
 					if count+int(req.RoomNumber) <= cacheCap[queryItem["hotelId"]] {
 						res = true
-						}
+					}
 					ch <- taskRes{
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
-						}
+					}
 				} // Close inner for j loop
 			}
 		}(i)
