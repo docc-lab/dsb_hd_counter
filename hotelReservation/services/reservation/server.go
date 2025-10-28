@@ -435,8 +435,10 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
 					}
+					}
 				}
 			}(i)
+		}
 		}
 	}
 
