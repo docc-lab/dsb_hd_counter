@@ -100,12 +100,12 @@ func (c *Client) Register(name string, id string, ip string, port int) error {
 		}
 	}
 	
-	// Add health check for gRPC services
+	// Add TCP health check for gRPC services (more reliable than gRPC health check)
 	healthCheck := &consul.AgentServiceCheck{
-		GRPC:                           fmt.Sprintf("%s:%d", ip, port),
+		TCP:                            fmt.Sprintf("%s:%d", ip, port),
 		Interval:                       "10s",
 		Timeout:                        "3s",
-		DeregisterCriticalServiceAfter: "30s",
+		DeregisterCriticalServiceAfter: "60s", // Give more time before deregistering
 	}
 	
 	reg := &consul.AgentServiceRegistration{
