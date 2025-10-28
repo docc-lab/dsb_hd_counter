@@ -434,13 +434,14 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 					ch <- taskRes{
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
-					}
+						}
 				} // Close inner for j loop
 			}
 		}(i)
 	}
-	}
+	} // Close if err == memcache.ErrCacheMiss block
 }
+
 
 	for task := range ch {
 		if !task.checkRes {
