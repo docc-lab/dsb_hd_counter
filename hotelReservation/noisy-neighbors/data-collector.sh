@@ -545,7 +545,7 @@ monitor_consul_service_registration() {
         return 1
     fi
     
-    local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    local expected_services=("srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
     local wait_time=0
     local all_registered=false
     
@@ -605,7 +605,7 @@ validate_and_ensure_service_registration() {
     
     log "$exp_dir" "Validating and ensuring all services are registered in Consul..."
     
-    local expected_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    local expected_services=("srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
     
     for attempt in $(seq 1 $max_attempts); do
         log "$exp_dir" "Validation attempt $attempt/$max_attempts"
@@ -692,9 +692,8 @@ manual_register_all_services() {
         return 1
     fi
     
-    # List of services to register manually
+    # List of services to register manually (frontend doesn't register with Consul)
     local services_to_register=(
-        "frontend:srv-frontend:5000"
         "search:srv-search:8082"
         "geo:srv-geo:8083"
         "profile:srv-profile:8081"
@@ -773,7 +772,7 @@ refresh_consul_service_discovery() {
     # Restart all services to force re-registration (more aggressive approach)
     log "$exp_dir" "Restarting all services to force fresh registration..."
     
-    local all_services=("frontend" "search" "geo" "profile" "rate" "recommendation" "reservation" "user")
+    local all_services=("search" "geo" "profile" "rate" "recommendation" "reservation" "user")
     
     # Restart services in dependency order
     for service in "${all_services[@]}"; do
@@ -872,7 +871,7 @@ validate_system_readiness() {
     # 2. Validate Consul service registration
     log "$exp_dir" "2. Validating Consul service registration..."
     local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
-    local expected_consul_services=("srv-frontend" "srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
+    local expected_consul_services=("srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
     local missing_consul_services=()
     
     if [[ -n "$consul_services" ]]; then
@@ -1069,8 +1068,8 @@ cleanup_manual_registrations() {
         return 0
     fi
     
-    # List of manual service IDs to clean up
-    local manual_services=("manual-frontend" "manual-search" "manual-geo" "manual-profile" "manual-rate" "manual-recommendation" "manual-reservation" "manual-user")
+    # List of manual service IDs to clean up (frontend doesn't register with Consul)
+    local manual_services=("manual-search" "manual-geo" "manual-profile" "manual-rate" "manual-recommendation" "manual-reservation" "manual-user")
     
     for service_id in "${manual_services[@]}"; do
         log "$exp_dir" "  Deregistering $service_id"
