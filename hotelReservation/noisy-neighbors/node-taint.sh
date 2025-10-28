@@ -93,7 +93,7 @@ if [ "$UNTOLERATE_MODE" == "true" ]; then
     echo " Rollout triggered"
 
     echo "4. Waiting for rollout to complete..."
-    kubectl rollout status deployment "$SERVICE_NAME" --timeout=60s
+    kubectl rollout status deployment "$SERVICE_NAME" --timeout=120s
     echo " Rollout completed successfully"
     
     # Restart all deployments if requested
@@ -157,7 +157,7 @@ else
     echo " Rollout triggered"
 
     echo "4. Waiting for rollout to complete..."
-    kubectl rollout status deployment "$SERVICE_NAME" --timeout=60s
+    kubectl rollout status deployment "$SERVICE_NAME" --timeout=120s
     echo " Rollout completed successfully"
 
     # Restart all deployments if requested
