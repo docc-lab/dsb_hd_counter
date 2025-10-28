@@ -430,17 +430,17 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 					var res bool
 					if count+int(req.RoomNumber) <= cacheCap[queryItem["hotelId"]] {
 						res = true
-					}
+						}
 					ch <- taskRes{
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
 					}
-					}
-				}
-			}(i)
-		}
-		}
+				} // Close inner for j loop
+			}
+		}(i)
 	}
+	}
+}
 
 	for task := range ch {
 		if !task.checkRes {
