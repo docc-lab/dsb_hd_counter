@@ -110,14 +110,14 @@ FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 
-WORKDIR /root/
+WORKDIR /
 
-# Copy the binary from builder stage
-COPY --from=builder /workspace/build/${service} ./${service}
-COPY --from=builder /workspace/config.json .
+# Copy the binary from builder stage to a PATH directory
+COPY --from=builder /workspace/build/${service} /usr/local/bin/${service}
+COPY --from=builder /workspace/config.json /config.json
 
-# Make binary executable
-RUN chmod +x ./${service}
+# Ensure binary is executable
+RUN chmod +x /usr/local/bin/${service}
 
 # Environment variables for timing control
 ENV ENABLE_TIMING=true
@@ -125,7 +125,8 @@ ENV STATS_FILE=timing_stats_${service}.json
 
 EXPOSE 8081
 
-CMD ["./${service}"]
+# Use absolute path so K8s command overrides still work
+ENTRYPOINT ["/usr/local/bin/${service}"]
 EOF
 
     echo "$dockerfile_path"
