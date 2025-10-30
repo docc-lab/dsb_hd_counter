@@ -22,8 +22,8 @@ import (
 )
 
 /*
-#cgo CFLAGS: -I.
-#cgo LDFLAGS: -L. -lperf_api
+#cgo CFLAGS: -I../perf
+#cgo LDFLAGS: -L../perf -lperf_api
 #include "../perf/perf_api.h"
 */
 import "C"
