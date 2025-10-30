@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/interceptor"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/interceptor"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tls"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	consul "github.com/hashicorp/consul/api"
 	opentracing "github.com/opentracing/opentracing-go"

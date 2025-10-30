@@ -3,16 +3,17 @@ package search
 import (
 	"fmt"
 	"net"
+	"os"
 	"time"
 
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-	geo "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/geo/proto"
-	rate "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/rate/proto"
-	pb "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/search/proto"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/dialer"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/interceptor"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
+	geo "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/geo/proto"
+	rate "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/rate/proto"
+	pb "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/search/proto"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tls"
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	_ "github.com/mbobakov/grpc-consul-resolver"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/rs/zerolog/log"
@@ -22,8 +23,8 @@ import (
 )
 
 /*
-#cgo CFLAGS: -I.
-#cgo LDFLAGS: -L. -lperf_api
+#cgo CFLAGS: -I../perf
+#cgo LDFLAGS: -L../perf -lperf_api
 #include "../perf/perf_api.h"
 */
 import "C"
@@ -62,6 +63,24 @@ func (s *Server) Run() error {
 
 	s.uuid = uuid.New().String()
 
+	// Configure timing interceptor (can be controlled via environment variables)
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	statsFile := os.Getenv("STATS_FILE")
+	if statsFile == "" {
+		statsFile = "timing_stats_search.json"
+	}
+
+	timingConfig := interceptor.TimingConfig{
+		EnableTiming: enableTiming,
+		ServiceName:  name,
+		StatsFile:    statsFile,
+	}
+
+	serverOpts := interceptor.ServerOptions{
+		TimingConfig: timingConfig,
+		Tracer:       s.Tracer,
+	}
+
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Timeout: 120 * time.Second,
@@ -69,9 +88,13 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		serverOpts.GetServerInterceptor(), // This includes both tracing and timing
+	}
+
+	if enableTiming {
+		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
+	} else {
+		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -127,16 +150,33 @@ func (s *Server) initRateClient(name string) error {
 }
 
 func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
+	// Check if timing is enabled to decide which interceptor to use
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	
 	if s.KnativeDns != "" {
-		return dialer.Dial(
-			fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
-			dialer.WithTracer(s.Tracer))
+		if enableTiming {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
+				dialer.WithTracerAndTiming(s.Tracer))
+		} else {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
+				dialer.WithTracer(s.Tracer))
+		}
 	} else {
-		return dialer.Dial(
-			fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
-			dialer.WithTracer(s.Tracer),
-			dialer.WithBalancer(s.Registry.Client),
-		)
+		if enableTiming {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
+				dialer.WithTracerAndTiming(s.Tracer),
+				dialer.WithBalancer(s.Registry.Client),
+			)
+		} else {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
+				dialer.WithTracer(s.Tracer),
+				dialer.WithBalancer(s.Registry.Client),
+			)
+		}
 	}
 }
 

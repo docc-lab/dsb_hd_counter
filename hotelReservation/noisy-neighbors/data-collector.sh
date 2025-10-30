@@ -577,6 +577,11 @@ deploy_victim_services() {
     
     log "$exp_dir" "Deploying victim services: $services"
     
+    # Remove anti-affinity rules from victim services before deploying to target node
+    log "$exp_dir" "Removing anti-affinity rules from victim services: $services"
+    remove_anti_affinity "$services" "$exp_dir"
+    sleep 5  # Wait for affinity rules to be removed
+    
     for service in $services; do
         # Check if this service supports timing integration
         if validate_timing_service "$service"; then
