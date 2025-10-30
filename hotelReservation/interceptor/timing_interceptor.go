@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -83,6 +84,18 @@ const (
 	pauseTimeKey  contextKey = "pause_time"
 )
 
+// timingContext holds mutable timing state that can be updated by client interceptors
+// Uses lock-free atomic operations for thread-safe updates
+type timingContext struct {
+	// Stack-based approach: activeCallCount represents the depth of the call stack
+	// When 0: service is processing (not blocked)
+	// When >0: service is blocked waiting for downstream calls
+	activeCallCount   int32  // atomic counter - acts as stack depth
+	pauseStartTimeNs  int64  // atomic - nanoseconds when blocking started (0 if not blocking)
+	totalPausedTimeNs int64  // atomic - accumulated paused time in nanoseconds
+	totalCallCount    int32  // atomic - total number of downstream calls made
+}
+
 // TimingServerInterceptor creates a server-side unary interceptor with local timing functionality
 func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 	if !config.EnableTiming {
@@ -107,9 +120,17 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 			Timestamp:   arrivalTime,
 		}
 		
-		// Store timing data in context for client interceptor to access
+		// Create mutable timing context that can be updated by client interceptors (lock-free)
+		timingCtx := &timingContext{
+			activeCallCount:   0,
+			pauseStartTimeNs:  0,
+			totalPausedTimeNs: 0,
+			totalCallCount:    0,
+		}
+		
+		// Store timing data and mutable context for client interceptor to access
 		ctx = context.WithValue(ctx, timingDataKey, timingData)
-		ctx = context.WithValue(ctx, pauseTimeKey, time.Duration(0))
+		ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
 
 		log.Info().
 			Str("method", info.FullMethod).
@@ -123,7 +144,13 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 
 		// Calculate timing metrics
 		totalTime := processingEnd.Sub(arrivalTime)
-		pausedTime, _ := ctx.Value(pauseTimeKey).(time.Duration)
+		
+		// Get the accumulated paused time from the mutable context (lock-free atomic read)
+		pausedTimeNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
+		pausedTime := time.Duration(pausedTimeNs)
+		blockingCount := atomic.LoadInt32(&timingCtx.totalCallCount)
+		activeCount := atomic.LoadInt32(&timingCtx.activeCallCount)
+		
 		processingTime := totalTime - pausedTime
 
 		// Update timing data
@@ -135,6 +162,8 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		log.Info().
 			Str("method", info.FullMethod).
 			Str("service", config.ServiceName).
+			Int32("downstream_calls", blockingCount).
+			Int32("active_calls_at_end", activeCount).
 			Dur("total_time", totalTime).
 			Dur("processing_time", processingTime).
 			Dur("blocking_time", pausedTime).
@@ -156,50 +185,90 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 }
 
 // TimingClientInterceptor creates a client-side unary interceptor that pauses timing during blocking calls
+// Uses lock-free atomic operations with a stack-based approach:
+// - Push (increment counter) when making a call
+// - Pop (decrement counter) when receiving response
+// - Empty stack (counter=0) means service is processing (not blocked)
+// - Non-empty stack (counter>0) means service is blocked
 func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		// Check if we have timing data in context (meaning timing is enabled)
+		// Check if we have timing context (meaning timing is enabled)
 		timingData, hasTimingData := ctx.Value(timingDataKey).(*TimingData)
+		timingCtx, hasTimingCtx := ctx.Value(pauseTimeKey).(*timingContext)
 		
-		if !hasTimingData {
+		if !hasTimingData || !hasTimingCtx {
 			// No timing data, just make the call normally
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}
 
-		log.Info().
-			Str("method", method).
-			Str("service", timingData.ServiceName).
-			Msg("Starting downstream gRPC call (pausing timer)")
-
-		// Record when we start the blocking call
-		blockingStart := time.Now()
+		// PUSH onto call stack (lock-free atomic increment)
+		// If this is the first call (0→1), we transition to blocking state
+		oldCount := atomic.AddInt32(&timingCtx.activeCallCount, 1) - 1
+		currentCount := oldCount + 1
+		
+		if oldCount == 0 {
+			// Stack was empty, now has 1 item - START blocking period
+			pauseStartNs := time.Now().UnixNano()
+			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
+			
+			log.Info().
+				Str("outgoing_method", method).
+				Str("parent_service", timingData.ServiceName).
+				Str("parent_method", timingData.Method).
+				Int32("stack_depth", currentCount).
+				Msg("Starting downstream call - PAUSING parent timer (stack 0→1)")
+		} else {
+			log.Info().
+				Str("outgoing_method", method).
+				Str("parent_service", timingData.ServiceName).
+				Str("parent_method", timingData.Method).
+				Int32("stack_depth", currentCount).
+				Msg("Starting downstream call - already blocked (stack depth increased)")
+		}
+		
+		// Increment total call counter
+		atomic.AddInt32(&timingCtx.totalCallCount, 1)
 		
 		// Make the actual call (this is the blocking part)
+		callStart := time.Now()
 		err := invoker(ctx, method, req, reply, cc, opts...)
+		callDuration := time.Since(callStart)
 		
-		// Record when the blocking call ends
-		blockingEnd := time.Now()
-		blockingDuration := blockingEnd.Sub(blockingStart)
+		// POP from call stack (lock-free atomic decrement)
+		// If this was the last call (1→0), we transition to processing state
+		newCount := atomic.AddInt32(&timingCtx.activeCallCount, -1)
 		
-		// Add the blocking time to the total paused time
-		currentPausedTime, _ := ctx.Value(pauseTimeKey).(time.Duration)
-		newPausedTime := currentPausedTime + blockingDuration
-		
-		// Update the context with new paused time (this propagates back to server interceptor)
-		// Note: We can't modify context values directly, but the server interceptor will
-		// calculate the total paused time by tracking all blocking calls
-		
-		log.Info().
-			Str("method", method).
-			Str("service", timingData.ServiceName).
-			Dur("blocking_duration", blockingDuration).
-			Dur("total_paused_time", newPausedTime).
-			Msg("Downstream gRPC call completed (resuming timer)")
-
-		// We need to store the paused time back in context somehow
-		// Since context is immutable, we'll use a different approach
-		// Store it in a way that the server interceptor can access it
-		ctx = context.WithValue(ctx, pauseTimeKey, newPausedTime)
+		if newCount == 0 {
+			// Stack is now empty - END blocking period and accumulate time
+			pauseStartNs := atomic.LoadInt64(&timingCtx.pauseStartTimeNs)
+			if pauseStartNs > 0 {
+				blockingDurationNs := time.Now().UnixNano() - pauseStartNs
+				atomic.AddInt64(&timingCtx.totalPausedTimeNs, blockingDurationNs)
+				atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
+				
+				totalPausedNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
+				
+				log.Info().
+					Str("outgoing_method", method).
+					Str("parent_service", timingData.ServiceName).
+					Str("parent_method", timingData.Method).
+					Int32("stack_depth", newCount).
+					Dur("this_call_duration", callDuration).
+					Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
+					Float64("blocking_period_ms", float64(blockingDurationNs)/1000000).
+					Float64("total_paused_ms", float64(totalPausedNs)/1000000).
+					Msg("Downstream call completed - RESUMING parent timer (stack 1→0)")
+			}
+		} else {
+			log.Info().
+				Str("outgoing_method", method).
+				Str("parent_service", timingData.ServiceName).
+				Str("parent_method", timingData.Method).
+				Int32("stack_depth", newCount).
+				Dur("this_call_duration", callDuration).
+				Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
+				Msg("Downstream call completed - still blocked (stack depth decreased)")
+		}
 		
 		return err
 	}

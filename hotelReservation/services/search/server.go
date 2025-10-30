@@ -150,16 +150,33 @@ func (s *Server) initRateClient(name string) error {
 }
 
 func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
+	// Check if timing is enabled to decide which interceptor to use
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	
 	if s.KnativeDns != "" {
-		return dialer.Dial(
-			fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
-			dialer.WithTracer(s.Tracer))
+		if enableTiming {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
+				dialer.WithTracerAndTiming(s.Tracer))
+		} else {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s.%s", s.ConsulAddr, name, s.KnativeDns),
+				dialer.WithTracer(s.Tracer))
+		}
 	} else {
-		return dialer.Dial(
-			fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
-			dialer.WithTracer(s.Tracer),
-			dialer.WithBalancer(s.Registry.Client),
-		)
+		if enableTiming {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
+				dialer.WithTracerAndTiming(s.Tracer),
+				dialer.WithBalancer(s.Registry.Client),
+			)
+		} else {
+			return dialer.Dial(
+				fmt.Sprintf("consul://%s/%s", s.ConsulAddr, name),
+				dialer.WithTracer(s.Tracer),
+				dialer.WithBalancer(s.Registry.Client),
+			)
+		}
 	}
 }
 
