@@ -136,6 +136,7 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 			Str("method", info.FullMethod).
 			Str("service", config.ServiceName).
 			Time("arrival_time", arrivalTime).
+			Float64("blocking_time_ms", 0.0). // Add field for log collection filter
 			Msg("gRPC call arrived")
 
 		// Call the actual handler
@@ -216,6 +217,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 				Str("parent_service", timingData.ServiceName).
 				Str("parent_method", timingData.Method).
 				Int32("stack_depth", currentCount).
+				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
 				Msg("Starting downstream call - PAUSING parent timer (stack 0→1)")
 		} else {
 			log.Info().
@@ -223,6 +225,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 				Str("parent_service", timingData.ServiceName).
 				Str("parent_method", timingData.Method).
 				Int32("stack_depth", currentCount).
+				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
 				Msg("Starting downstream call - already blocked (stack depth increased)")
 		}
 		
@@ -257,6 +260,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 					Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
 					Float64("blocking_period_ms", float64(blockingDurationNs)/1000000).
 					Float64("total_paused_ms", float64(totalPausedNs)/1000000).
+					Float64("blocking_time_ms", float64(totalPausedNs)/1000000). // Add field for log collection filter
 					Msg("Downstream call completed - RESUMING parent timer (stack 1→0)")
 			}
 		} else {
@@ -267,6 +271,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 				Int32("stack_depth", newCount).
 				Dur("this_call_duration", callDuration).
 				Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
+				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
 				Msg("Downstream call completed - still blocked (stack depth decreased)")
 		}
 		
