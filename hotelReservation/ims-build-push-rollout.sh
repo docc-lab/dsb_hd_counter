@@ -105,10 +105,10 @@ RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs servic
 ENV CGO_ENABLED=1
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 
-# Runtime stage
-FROM alpine:latest
+# Runtime stage - use Debian for glibc compatibility with CGO binaries
+FROM debian:bookworm-slim
 
-RUN apk --no-cache add ca-certificates
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /
 
