@@ -1,5 +1,5 @@
 #!/bin/bash
-# Integrated Data Collection Framework
+# Integrated Data Collection Framework with Service Execution Time Integration
 # Usage: ./data-collector.sh <experiment-config-file>
 
 set -e
@@ -10,7 +10,29 @@ HOTEL_MANIFESTS_DIR="${HOTEL_MANIFESTS_DIR:-./hotelReservation}"
 WRK2_DIR="${WRK2_DIR:-../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Your existing script paths
+# Timing image configuration
+TIMING_REGISTRY="royno7"
+TIMING_IMAGE_PREFIX="service-withtimer"
+TIMING_TAG="v1-withtimer"
+
+# Valid services for timing integration and their timing-enabled images
+declare -A TIMING_IMAGES=(
+    ["user"]="${TIMING_REGISTRY}/user-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["frontend"]="${TIMING_REGISTRY}/frontend-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["search"]="${TIMING_REGISTRY}/search-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["profile"]="${TIMING_REGISTRY}/profile-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["rate"]="${TIMING_REGISTRY}/rate-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["recommendation"]="${TIMING_REGISTRY}/recommendation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["reservation"]="${TIMING_REGISTRY}/reservation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["geo"]="${TIMING_REGISTRY}/geo-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+)
+
+VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
+
+# Path to timing image build script
+TIMING_BUILD_SCRIPT="../build-timing-images.sh"
+
+# existing script paths
 STRESS_SCRIPT="$SCRIPTS_DIR/stress-ng/stress-ng-helpers.sh"
 MONITOR_SCRIPT="$SCRIPTS_DIR/perf/service-monitor.sh"
 TAINT_SCRIPT="$SCRIPTS_DIR/node-taint.sh"
@@ -25,8 +47,9 @@ create_exp_directory() {
     local exp_id="$1"
     local exp_dir="$DATA_DIR/$exp_id"
     
-    mkdir -p "$exp_dir"/{raw,processed,logs,metadata}
+    mkdir -p "$exp_dir"/{raw,processed,logs,metadata,timing}
     mkdir -p "$exp_dir/raw"/{perf,latency,system,stress}
+    mkdir -p "$exp_dir/timing"/{data,tmp}
     
     echo "$exp_dir"
 }
@@ -36,6 +59,276 @@ log() {
     local exp_dir="$1"
     shift
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$exp_dir/logs/collector.log"
+}
+
+# Validate timing service
+validate_timing_service() {
+    local service="$1"
+    
+    for valid_service in "${VALID_TIMING_SERVICES[@]}"; do
+        if [[ "$service" == "$valid_service" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Get container name for a service
+get_container_name() {
+    local service="$1"
+    
+    case $service in
+        "user")
+            echo "hotel-reserv-user"
+            ;;
+        "frontend")
+            echo "hotel-reserv-frontend"
+            ;;
+        "search")
+            echo "hotel-reserv-search"
+            ;;
+        "profile")
+            echo "hotel-reserv-profile"
+            ;;
+        "rate")
+            echo "hotel-reserv-rate"
+            ;;
+        "recommendation")
+            echo "hotel-reserv-recommendation"
+            ;;
+        "reservation")
+            echo "hotel-reserv-reservation"
+            ;;
+        "geo")
+            echo "hotel-reserv-geo"
+            ;;
+        *)
+            echo "hotel-reserv-$service"
+            ;;
+    esac
+}
+
+# Check if timing image exists, build if needed
+ensure_timing_image_exists() {
+    local service="$1"
+    local exp_dir="$2"
+    
+    local timing_image="${TIMING_IMAGES[$service]}"
+    
+    log "$exp_dir" "Checking if timing image exists: $timing_image"
+    
+    # Check if image exists in registry (try to pull)
+    if docker pull "$timing_image" &>/dev/null; then
+        log "$exp_dir" "Timing image already exists: $timing_image"
+        return 0
+    fi
+    
+    log "$exp_dir" "Timing image not found, building: $timing_image"
+    
+    # Check if build script exists
+    if [[ ! -f "$TIMING_BUILD_SCRIPT" ]]; then
+        log "$exp_dir" "ERROR: Timing build script not found: $TIMING_BUILD_SCRIPT"
+        return 1
+    fi
+    
+    # Build the timing image
+    log "$exp_dir" "Building timing image for $service using $TIMING_BUILD_SCRIPT"
+    if "$TIMING_BUILD_SCRIPT" "$service" "$TIMING_TAG" >> "$exp_dir/logs/collector.log" 2>&1; then
+        log "$exp_dir" "Successfully built timing image: $timing_image"
+        return 0
+    else
+        log "$exp_dir" "ERROR: Failed to build timing image for $service"
+        return 1
+    fi
+}
+
+# Store original deployment configuration for cleanup
+store_original_config() {
+    local service="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Storing original configuration for $service"
+    
+    # Get current image
+    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    
+    # Get current environment variables
+    local current_env=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
+    
+    # Store in file for cleanup
+    echo "$service:$current_image:$current_env" >> "$exp_dir/timing/original_configs.txt"
+    
+    log "$exp_dir" "Stored original config - Image: $current_image"
+}
+
+# Update deployment to use timing-enabled image and environment
+update_deployment_for_timing() {
+    local service="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Updating deployment for $service with timing configuration"
+    
+    # Check if timing image is available for this service
+    if [[ -z "${TIMING_IMAGES[$service]}" ]]; then
+        log "$exp_dir" "ERROR: No timing image defined for service $service"
+        return 1
+    fi
+    
+    local timing_image="${TIMING_IMAGES[$service]}"
+    local container_name=$(get_container_name "$service")
+    
+    # Store original configuration for cleanup
+    store_original_config "$service" "$exp_dir"
+    
+    # Update image
+    log "$exp_dir" "Setting image for $service: $timing_image"
+    if ! kubectl set image "deployment/$service" "$container_name=$timing_image"; then
+        log "$exp_dir" "ERROR: Failed to set image for $service"
+        return 1
+    fi
+    
+    # Set environment variables
+    log "$exp_dir" "Setting environment variables for $service"
+    if ! kubectl set env "deployment/$service" ENABLE_TIMING=true; then
+        log "$exp_dir" "ERROR: Failed to set ENABLE_TIMING for $service"
+        return 1
+    fi
+    
+    if ! kubectl set env "deployment/$service" "STATS_FILE=timing_stats_${service}.json"; then
+        log "$exp_dir" "ERROR: Failed to set STATS_FILE for $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "Successfully updated deployment configuration for $service"
+    return 0
+}
+
+# Deploy timing-enabled service
+deploy_timing_service() {
+    local service="$1"
+    local target_node="$2"
+    local exp_dir="$3"
+    
+    log "$exp_dir" "Deploying timing-enabled $service service"
+    
+    # First deploy the regular service if it's not already deployed
+    deploy_regular_service "$service" "$target_node" "$exp_dir"
+    
+    # Ensure timing image exists (build if needed)
+    if ! ensure_timing_image_exists "$service" "$exp_dir"; then
+        log "$exp_dir" "ERROR: Failed to ensure timing image exists for $service"
+        return 1
+    fi
+    
+    # Update deployment to use timing configuration
+    if ! update_deployment_for_timing "$service" "$exp_dir"; then
+        log "$exp_dir" "ERROR: Failed to update deployment for timing"
+        return 1
+    fi
+    
+    # Wait for rollout to complete
+    log "$exp_dir" "Waiting for $service rollout to complete"
+    log "$exp_dir" "Current pods before rollout:"
+    kubectl get pods -l io.kompose.service="$service" -o wide | tee -a "$exp_dir/logs/collector.log"
+    
+    if kubectl rollout status deployment "$service" --timeout=300s; then
+        log "$exp_dir" "Successfully deployed timing-enabled $service"
+        
+        # Verify the deployment
+        log "$exp_dir" "Verifying timing configuration for $service"
+        kubectl describe deployment "$service" | grep -A 5 Environment | tee -a "$exp_dir/logs/collector.log"
+        
+        return 0
+    else
+        log "$exp_dir" "ERROR: Rollout failed for $service"
+        log "$exp_dir" "Current pods after rollout failure:"
+        kubectl get pods -l io.kompose.service="$service" -o wide | tee -a "$exp_dir/logs/collector.log"
+        log "$exp_dir" "Checking for pod events:"
+        kubectl get events --field-selector involvedObject.kind=Pod --sort-by='.lastTimestamp' | tail -10 | tee -a "$exp_dir/logs/collector.log"
+        return 1
+    fi
+}
+
+# Retrieve timing data from service pod
+retrieve_timing_data() {
+    local service="$1"
+    local exp_dir="$2"
+    local iteration="$3"
+    
+    log "$exp_dir" "Retrieving timing data from $service service"
+    
+    # Get pod name
+    local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod_name" ]]; then
+        log "$exp_dir" "WARNING: No pod found for service $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "Found pod: $pod_name"
+    
+    # Retrieve timing stats file
+    local stats_file="timing_stats_${service}.json"
+    local output_file="$exp_dir/timing/data/${service}_timing_iter${iteration}.json"
+    
+    if kubectl exec "$pod_name" -- test -f "$stats_file" 2>/dev/null; then
+        log "$exp_dir" "Retrieving $stats_file from $pod_name"
+        kubectl exec "$pod_name" -- cat "$stats_file" > "$output_file" 2>/dev/null
+        
+        if [[ -s "$output_file" ]]; then
+            log "$exp_dir" "Successfully retrieved timing data: $output_file"
+            
+            # Also get logs with timing information
+            local log_file="$exp_dir/timing/data/${service}_logs_iter${iteration}.txt"
+            kubectl logs "$pod_name" | grep -E "(processing_time_ms|total_time_ms|blocking_time_ms)" > "$log_file" 2>/dev/null || true
+            
+            return 0
+        else
+            log "$exp_dir" "WARNING: Retrieved timing file is empty"
+            return 1
+        fi
+    else
+        log "$exp_dir" "WARNING: Timing stats file not found in pod $pod_name"
+        return 1
+    fi
+}
+
+# Cleanup timing-related resources
+cleanup_timing_resources() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Cleaning up timing-related resources"
+    
+    if [[ -f "$exp_dir/timing/original_configs.txt" ]]; then
+        while IFS=':' read -r service original_image original_env; do
+            if [[ -n "$service" && -n "$original_image" ]]; then
+                log "$exp_dir" "Restoring original configuration for $service"
+                
+                local container_name=$(get_container_name "$service")
+                
+                # Restore original image
+                log "$exp_dir" "Restoring image for $service: $original_image"
+                if kubectl set image "deployment/$service" "$container_name=$original_image" 2>/dev/null; then
+                    log "$exp_dir" "Successfully restored image for $service"
+                else
+                    log "$exp_dir" "WARNING: Failed to restore image for $service"
+                fi
+                
+                # Remove timing environment variables
+                log "$exp_dir" "Removing timing environment variables for $service"
+                kubectl set env "deployment/$service" ENABLE_TIMING- 2>/dev/null || true
+                kubectl set env "deployment/$service" STATS_FILE- 2>/dev/null || true
+                
+                # Wait for rollout
+                kubectl rollout status deployment "$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service rollout"
+                
+                log "$exp_dir" "Restored configuration for $service"
+            fi
+        done < "$exp_dir/timing/original_configs.txt"
+    fi
+    
+    # Clean up temporary files
+    rm -rf "$exp_dir/timing/tmp" 2>/dev/null || true
+    log "$exp_dir" "Cleaned up temporary timing files"
 }
 
 # Validate configuration
@@ -75,6 +368,28 @@ validate_config() {
     # Check if wrk2 exists
     if [[ -n "${WRK2_TARGET_SERVICE:-}" && ! -f "$WRK2_DIR/wrk" ]]; then
         echo "WARNING: wrk2 not found at: $WRK2_DIR/wrk (will skip workload generation)"
+    fi
+    
+    # Check Docker access for timing image building (if needed)
+    if ! docker info &>/dev/null; then
+        echo "WARNING: Docker is not accessible. Timing images cannot be built automatically."
+        echo "Please ensure timing images exist in registry or make Docker available."
+    fi
+    
+    # Validate victim services for timing integration
+    local timing_services=""
+    for service in $VICTIM_SERVICES; do
+        if validate_timing_service "$service"; then
+            timing_services="$timing_services $service"
+        else
+            echo "WARNING: Service '$service' is not supported for timing integration (will use regular deployment)"
+        fi
+    done
+    
+    if [[ -n "$timing_services" ]]; then
+        echo "Timing integration will be enabled for:$timing_services"
+    else
+        echo "No victim services support timing integration - running without timing data collection"
     fi
     
     echo "Configuration validation passed"
@@ -263,77 +578,55 @@ deploy_victim_services() {
     log "$exp_dir" "Deploying victim services: $services"
     
     for service in $services; do
-        local service_dir="../kubernetes/${service}"
-        
-        if [[ ! -d "$service_dir" ]]; then
-            log "$exp_dir" "WARNING: Service directory not found for $service: $service_dir"
-            continue
-        fi
-        
-        log "$exp_dir" "Deploying $service from $service_dir..."
-        
-        # Apply all YAML files in the service directory
-        if ls "$service_dir"/*.yaml 1> /dev/null 2>&1; then
-            kubectl apply -f "$service_dir/"
-            
-            # Wait a moment for the deployment to be created
-            sleep 5
-            
-            # Use the proven working method: clean deployment first, then apply taint
-            log "$exp_dir" "Deploying $service using proven clean-then-taint method..."
-            
-            # Step 1: Ensure completely clean deployment state
-            log "$exp_dir" "  Step 1: Ensuring clean deployment state..."
-            
-            # Clean up any existing stuck pods
-            local stuck_pods=$(kubectl get pods -l io.kompose.service="$service" --field-selector=status.phase=Pending -o name 2>/dev/null)
-            if [[ -n "$stuck_pods" ]]; then
-                log "$exp_dir" "  Cleaning up existing stuck pods..."
-                echo "$stuck_pods" | xargs -r kubectl delete --force --grace-period=0
-                sleep 10
-            fi
-            
-            # Remove any existing taint/toleration to ensure clean state
-            "$TAINT_SCRIPT" "$target_node" "$service" --untolerate 2>/dev/null || true
-            
-            # Apply emergency patch to ensure completely clean state
-            kubectl patch deployment "$service" --type='merge' -p '{
-              "spec": {
-                "template": {
-                  "spec": {
-                    "tolerations": null,
-                    "nodeSelector": null,
-                    "affinity": null
-                  }
-                }
-              }
-            }' 2>/dev/null || true
-            
-            # Force restart to apply clean configuration
-            kubectl rollout restart deployment "$service" 2>/dev/null || true
-            
-            # Step 2: Wait for clean deployment to be ready
-            log "$exp_dir" "  Step 2: Waiting for clean deployment to be ready..."
-            if kubectl rollout status deployment "$service" --timeout=90s; then
-                log "$exp_dir" "  Clean deployment successful"
-                
-                # Step 3: Apply taint and toleration
-                log "$exp_dir" "  Step 3: Applying taint and toleration..."
-                if "$TAINT_SCRIPT" "$target_node" "$service"; then
-                    log "$exp_dir" "  Service $service successfully deployed and pinned to $target_node"
-                else
-                    log "$exp_dir" "  WARNING: Taint application failed, but service is running on available nodes"
-                fi
-            else
-                log "$exp_dir" "  ERROR: Clean deployment failed for $service"
+        # Check if this service supports timing integration
+        if validate_timing_service "$service"; then
+            log "$exp_dir" "Deploying timing-enabled $service"
+            if ! deploy_timing_service "$service" "$target_node" "$exp_dir"; then
+                log "$exp_dir" "ERROR: Failed to deploy timing-enabled $service, falling back to regular deployment"
+                # Fall back to regular deployment
+                deploy_regular_service "$service" "$target_node" "$exp_dir"
             fi
         else
-            log "$exp_dir" "WARNING: No YAML files found in $service_dir"
+            # Deploy regular service
+            deploy_regular_service "$service" "$target_node" "$exp_dir"
         fi
     done
     
     # Record deployed services
     echo "$services" > "$exp_dir/metadata/deployed_services.txt"
+}
+
+# Deploy regular service (original logic)
+deploy_regular_service() {
+    local service="$1"
+    local target_node="$2"
+    local exp_dir="$3"
+    
+    local service_dir="../kubernetes/${service}"
+    
+    if [[ ! -d "$service_dir" ]]; then
+        log "$exp_dir" "WARNING: Service directory not found for $service: $service_dir"
+        return 1
+    fi
+    
+    log "$exp_dir" "Deploying $service from $service_dir..."
+    
+    # Apply all YAML files in the service directory
+    if ls "$service_dir"/*.yaml 1> /dev/null 2>&1; then
+        kubectl apply -f "$service_dir/"
+        
+        # Add toleration and node selector to the deployment
+        "$TAINT_SCRIPT" "$target_node" "$service"
+        
+        # Wait for deployment to be ready
+        kubectl rollout status deployment "$service" --timeout=120s
+        
+        log "$exp_dir" "Service $service deployed and ready"
+        return 0
+    else
+        log "$exp_dir" "WARNING: No YAML files found in $service_dir"
+        return 1
+    fi
 }
 
 # Configure Jaeger tracing for all hotel reservation services
@@ -1075,9 +1368,9 @@ cleanup_victim_services() {
         # Remove taint and toleration
         "$TAINT_SCRIPT" "$target_node" "$service" --untolerate
         
-        # Delete the deployment
-        kubectl delete deployment "$service" --ignore-not-found=true
-        kubectl delete service "$service" --ignore-not-found=true
+        # Delete the deployment TODO: figure out why I wanted to delete deployment during post exp clean...
+        # kubectl delete deployment "$service" --ignore-not-found=true
+        # kubectl delete service "$service" --ignore-not-found=true
         
         log "$exp_dir" "Service $service cleaned up"
     done
@@ -1292,6 +1585,14 @@ run_iteration() {
     # Collect end metrics
     collect_system_metrics "$exp_dir" "$iteration" "end"
     
+    # Retrieve timing data from all victim services that support it
+    log "$exp_dir" "Retrieving timing data from victim services"
+    for service in $VICTIM_SERVICES; do
+        if validate_timing_service "$service"; then
+            retrieve_timing_data "$service" "$exp_dir" "$iteration"
+        fi
+    done
+    
     # Wait for all monitoring to complete
     wait_for_processes "${monitor_pids[@]}"
     
@@ -1368,6 +1669,9 @@ generate_metadata() {
     }
 }
 EOF
+
+sudo lshw -json > $exp_dir/metadata/hardware.json
+
 }
 
 # Aggregate iteration data into summary files
@@ -1415,11 +1719,63 @@ aggregate_data() {
         } > "$exp_dir/processed/performance_summary.txt"
     fi
     
+    # Aggregate timing data if available
+    if ls "$exp_dir/timing/data/"*_timing_iter*.json 1> /dev/null 2>&1; then
+        {
+            echo "=== AGGREGATED TIMING METRICS ==="
+            echo "Generated: $(date -Iseconds)"
+            echo ""
+            
+            # Get list of services with timing data
+            local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u)
+            
+            for service in $timing_services; do
+                echo "=== SERVICE: $service ==="
+                echo ""
+                for i in $(seq 1 $total_iterations); do
+                    echo "--- ITERATION $i ---"
+                    local timing_file="$exp_dir/timing/data/${service}_timing_iter${i}.json"
+                    if [[ -f "$timing_file" ]]; then
+                        echo "Timing Statistics:"
+                        cat "$timing_file"
+                        echo ""
+                    fi
+                    
+                    local log_file="$exp_dir/timing/data/${service}_logs_iter${i}.txt"
+                    if [[ -f "$log_file" && -s "$log_file" ]]; then
+                        echo "Timing Logs:"
+                        cat "$log_file"
+                        echo ""
+                    fi
+                done
+                echo ""
+            done
+        } > "$exp_dir/processed/timing_summary.txt"
+    fi
+    
     # Create experiment summary
     {
         echo "=== EXPERIMENT SUMMARY ==="
         echo "Generated: $(date -Iseconds)"
         echo ""
+        
+        # Check if timing data was collected
+        local timing_enabled="false"
+        local timing_services_count=0
+        if [[ -d "$exp_dir/timing/data" ]]; then
+            timing_services_count=$(ls "$exp_dir/timing/data/"*_timing_iter*.json 2>/dev/null | wc -l)
+            if [[ $timing_services_count -gt 0 ]]; then
+                timing_enabled="true"
+            fi
+        fi
+        
+        echo "Timing Integration: $timing_enabled"
+        if [[ "$timing_enabled" == "true" ]]; then
+            echo "Timing data files: $timing_services_count"
+            local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u | tr '\n' ' ')
+            echo "Services with timing data: $timing_services"
+        fi
+        
         echo "Raw data files: $(find "$exp_dir/raw" -name "*.txt" -o -name "*.csv" | wc -l)"
         echo "Total data size: $(du -sh "$exp_dir" | cut -f1)"
         echo ""
@@ -1518,8 +1874,8 @@ run_experiment() {
     # Aggregate data
     aggregate_data "$exp_dir" "$total_iterations"
     
-    # Cleanup
-    cleanup_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
+    # Cleanup timing resources (restore original deployments)
+    cleanup_timing_resources "$exp_dir"
     
     # Remove anti-affinity rules from untolerated deployments
     if [[ -n "$untolerated_deployments" ]]; then
@@ -1527,6 +1883,21 @@ run_experiment() {
     fi
     
     log "$exp_dir" "Experiment completed successfully"
+    
+    # Show timing data summary if available
+    if [[ -f "$exp_dir/processed/timing_summary.txt" ]]; then
+        log "$exp_dir" "Timing data collected and aggregated:"
+        log "$exp_dir" "  Summary: $exp_dir/processed/timing_summary.txt"
+        log "$exp_dir" "  Raw data: $exp_dir/timing/data/"
+        
+        # Show which services had timing data
+        local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u | tr '\n' ' ')
+        if [[ -n "$timing_services" ]]; then
+            log "$exp_dir" "  Services with timing data:$timing_services"
+        fi
+    else
+        log "$exp_dir" "No timing data was collected in this experiment"
+    fi
 }
 
 # Main execution
@@ -1534,8 +1905,15 @@ main() {
     if [[ $# -eq 0 ]]; then
         echo "Usage: $0 <experiment-config-file>"
         echo ""
+        echo "This script automatically enables timing interceptors for victim services."
+        echo "It will use existing timing images or build them automatically if needed."
+        echo "Supported services: user, frontend, search, profile, rate, recommendation, reservation, geo"
+        echo ""
+        echo "To pre-build timing images manually, use: ../build-timing-images.sh"
+        echo "Timing data will be collected and aggregated automatically."
+        echo ""
         echo "Example config file:"
-        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact'"
+        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact with Timing'"
         echo "TARGET_NODE='node-1'"
         echo "VICTIM_SERVICES='frontend search user'"
         echo "PERF_COUNTER_SET='interference'"
@@ -1580,6 +1958,14 @@ main() {
     echo "Experiment completed successfully!"
     echo "Data location: $exp_dir"
     echo "Summary: $exp_dir/processed/experiment_summary.txt"
+    
+    # Show timing data information if available
+    if [[ -f "$exp_dir/processed/timing_summary.txt" ]]; then
+        echo "Timing data: $exp_dir/processed/timing_summary.txt"
+    fi
+
+    rsync -av ./"$exp_dir" "$4"@homework.eecs.tufts.edu:/r/tcal/work/contention/
+    
 }
 
 # Execute main function if script is run directly

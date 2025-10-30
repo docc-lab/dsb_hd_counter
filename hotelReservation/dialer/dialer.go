@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/interceptor"
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	consul "github.com/hashicorp/consul/api"
@@ -26,6 +27,25 @@ func WithTracer(tracer opentracing.Tracer) DialOption {
 func WithBalancer(registry *consul.Client) DialOption {
 	return func(name string) (grpc.DialOption, error) {
 		return grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`), nil
+	}
+}
+
+// WithTiming adds timing interceptor to client connections
+func WithTiming() DialOption {
+	return func(name string) (grpc.DialOption, error) {
+		return grpc.WithUnaryInterceptor(interceptor.TimingClientInterceptor()), nil
+	}
+}
+
+// WithTracerAndTiming combines tracing and timing interceptors
+func WithTracerAndTiming(tracer opentracing.Tracer) DialOption {
+	return func(name string) (grpc.DialOption, error) {
+		return grpc.WithUnaryInterceptor(
+			interceptor.ChainUnaryClientInterceptors(
+				otgrpc.OpenTracingClientInterceptor(tracer),
+				interceptor.TimingClientInterceptor(),
+			),
+		), nil
 	}
 }
 

@@ -4,13 +4,14 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
+	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/interceptor"
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
 	pb "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/user/proto"
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/opentracing/opentracing-go"
 	"github.com/rs/zerolog/log"
 	"go.mongodb.org/mongo-driver/bson"
@@ -20,18 +21,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-/*
-#cgo CFLAGS: -I.
-#cgo LDFLAGS: -L. -lperf_api
-#include "../perf/perf_api.h"
-*/
-import "C"
-
-type PerfHandles struct {
-    LeaderFD       int
-    InstructionsFD int
-    L1MissesFD     int
-}
+// Remove CGO dependency for perf_api - not needed for timing interceptor
 
 const name = "srv-user"
 
@@ -63,6 +53,24 @@ func (s *Server) Run() error {
 
 	s.uuid = uuid.New().String()
 
+	// Configure timing interceptor (can be controlled via environment variables)
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	statsFile := os.Getenv("STATS_FILE")
+	if statsFile == "" {
+		statsFile = "timing_stats_user.json"
+	}
+
+	timingConfig := interceptor.TimingConfig{
+		EnableTiming: enableTiming,
+		ServiceName:  name,
+		StatsFile:    statsFile,
+	}
+
+	serverOpts := interceptor.ServerOptions{
+		TimingConfig: timingConfig,
+		Tracer:       s.Tracer,
+	}
+
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Timeout: 120 * time.Second,
@@ -70,9 +78,13 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		serverOpts.GetServerInterceptor(), // This includes both tracing and timing
+	}
+
+	if enableTiming {
+		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
+	} else {
+		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -104,11 +116,6 @@ func (s *Server) Shutdown() {
 
 // CheckUser returns whether the username and password are correct.
 func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, error) {
-	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
-	}
-
 	res := new(pb.Result)
 
 	log.Trace().Msg("CheckUser")
@@ -122,11 +129,6 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 	}
 
 	log.Trace().Msgf("CheckUser %d", res.Correct)
-	
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
-	}
  
 	return res, nil
 }
