@@ -77,7 +77,7 @@ generate_timing_dockerfile() {
     cat > "$dockerfile_path" << EOF
 FROM golang:1.21 as builder
 
-RUN apt-get update && apt-get install -y gcc
+RUN apt-get update && apt-get install -y gcc make ar
 
 WORKDIR /workspace
 
@@ -98,8 +98,11 @@ COPY config.json config.json
 
 WORKDIR /workspace
 
-# Build the ${service} service with timing interceptor (no CGO needed)
-ENV CGO_ENABLED=0
+# Build perf_api static library for cgo users
+RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs services/perf/libperf_api.a services/perf/perf_api.o
+
+# Build the ${service} service with timing interceptor (CGO enabled for perf counters when needed)
+ENV CGO_ENABLED=1
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 
 # Runtime stage
