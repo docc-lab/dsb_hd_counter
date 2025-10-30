@@ -77,7 +77,7 @@ generate_timing_dockerfile() {
     cat > "$dockerfile_path" << EOF
 FROM golang:1.21 as builder
 
-RUN apt-get update && apt-get install -y gcc make ar
+RUN apt-get update && apt-get install -y gcc make binutils
 
 WORKDIR /workspace
 
