@@ -373,53 +373,70 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 			for k := range itemsMap {
 				delete(queryMap, k)
 			}
-			wg.Add(len(queryMap))
+			// Cap the number of goroutines
+			maxGoroutines := 50
+			actualGoroutines := len(queryMap)
+			if actualGoroutines > maxGoroutines {
+				actualGoroutines = maxGoroutines
+			}
+			
+			wg.Add(actualGoroutines)
+			commands := make([]string, 0, len(queryMap))
+			for command := range queryMap {
+				commands = append(commands, command)
+			}
+			
 			go func() {
 				wg.Wait()
 				close(ch)
 			}()
-			for command := range queryMap {
-				go func(comm string) {
+			
+			// Distribute work among limited goroutines
+			for i := 0; i < actualGoroutines; i++ {
+				go func(workerID int) {
 					defer wg.Done()
+					// Each worker processes a subset of commands
+					for j := workerID; j < len(commands); j += actualGoroutines {
+						comm := commands[j]
+						var reserve []reservation
 
-					var reserve []reservation
+						queryItem := queryMap[comm]
+						resCollection := s.MongoClient.Database("reservation-db").Collection("reservation")
+						filter := bson.D{{"hotelId", queryItem["hotelId"]}, {"inDate", queryItem["startDate"]}, {"outDate", queryItem["endDate"]}}
 
-					queryItem := queryMap[comm]
-					resCollection := s.MongoClient.Database("reservation-db").Collection("reservation")
-					filter := bson.D{{"hotelId", queryItem["hotelId"]}, {"inDate", queryItem["startDate"]}, {"outDate", queryItem["endDate"]}}
+						reserveMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number"+comm)
+						reserveMongoSpan.SetTag("span.kind", "client")
+						curr, err := resCollection.Find(context.TODO(), filter)
+						if err != nil {
+							log.Error().Msgf("Failed get reservation data: ", err)
+						}
+						curr.All(context.TODO(), &reserve)
+						if err != nil {
+							log.Error().Msgf("Failed get reservation data: ", err)
+						}
+						reserveMongoSpan.Finish()
 
-					reserveMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number"+comm)
-					reserveMongoSpan.SetTag("span.kind", "client")
-					curr, err := resCollection.Find(context.TODO(), filter)
-					if err != nil {
-						log.Error().Msgf("Failed get reservation data: ", err)
+						if err != nil {
+							log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error",
+								queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"], err.Error())
+						}
+						var count int
+						for _, r := range reserve {
+							log.Trace().Msgf("reservation check reservation number = %d", queryItem["hotelId"])
+							count += r.Number
+						}
+						// update memcached
+						go s.MemcClient.Set(&memcache.Item{Key: comm, Value: []byte(strconv.Itoa(count))})
+						var res bool
+						if count+int(req.RoomNumber) <= cacheCap[queryItem["hotelId"]] {
+							res = true
+						}
+						ch <- taskRes{
+							hotelId:  queryItem["hotelId"],
+							checkRes: res,
+						}
 					}
-					curr.All(context.TODO(), &reserve)
-					if err != nil {
-						log.Error().Msgf("Failed get reservation data: ", err)
-					}
-					reserveMongoSpan.Finish()
-
-					if err != nil {
-						log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error",
-							queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"], err.Error())
-					}
-					var count int
-					for _, r := range reserve {
-						log.Trace().Msgf("reservation check reservation number = %d", queryItem["hotelId"])
-						count += r.Number
-					}
-					// update memcached
-					go s.MemcClient.Set(&memcache.Item{Key: comm, Value: []byte(strconv.Itoa(count))})
-					var res bool
-					if count+int(req.RoomNumber) <= cacheCap[queryItem["hotelId"]] {
-						res = true
-					}
-					ch <- taskRes{
-						hotelId:  queryItem["hotelId"],
-						checkRes: res,
-					}
-				}(command)
+				}(i)
 			}
 		}
 	}

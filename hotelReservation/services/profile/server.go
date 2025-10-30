@@ -146,9 +146,26 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 			delete(profileMap, hotelId)
 		}
 
-		wg.Add(len(profileMap))
+		// Cap the number of goroutines
+		maxGoroutines := 50
+		actualGoroutines := len(profileMap)
+		if actualGoroutines > maxGoroutines {
+			actualGoroutines = maxGoroutines
+		}
+		
+		wg.Add(actualGoroutines)
+		hotelIds := make([]string, 0, len(profileMap))
 		for hotelId := range profileMap {
-			go func(hotelId string) {
+			hotelIds = append(hotelIds, hotelId)
+		}
+		
+		// Distribute work among limited goroutines
+		for i := 0; i < actualGoroutines; i++ {
+			go func(workerID int) {
+				defer wg.Done()
+				// Each worker processes a subset of hotels
+				for j := workerID; j < len(hotelIds); j += actualGoroutines {
+					hotelId := hotelIds[j]
 				var hotelProf *pb.Hotel
 
 				collection := s.MongoClient.Database("profile-db").Collection("hotels")
@@ -174,8 +191,8 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 
 				// write to memcached
 				go s.MemcClient.Set(&memcache.Item{Key: hotelId, Value: []byte(memcStr)})
-				defer wg.Done()
-			}(hotelId)
+				}
+			}(i)
 		}
 	}
 	wg.Wait()

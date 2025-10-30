@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	consul "github.com/hashicorp/consul/api"
 	"github.com/rs/zerolog/log"
@@ -14,12 +15,28 @@ func NewClient(addr string) (*Client, error) {
 	cfg := consul.DefaultConfig()
 	cfg.Address = addr
 
-	c, err := consul.NewClient(cfg)
-	if err != nil {
-		return nil, err
+	var c *consul.Client
+	var err error
+	
+	// Retry connection to Consul with backoff
+	for i := 0; i < 5; i++ {
+		c, err = consul.NewClient(cfg)
+		if err == nil {
+			// Test the connection
+			_, err = c.Status().Leader()
+			if err == nil {
+				log.Info().Msgf("Successfully connected to Consul at %s", addr)
+				return &Client{c}, nil
+			}
+		}
+		
+		log.Error().Msgf("Failed to connect to Consul (attempt %d/5): %v", i+1, err)
+		if i < 4 {
+			time.Sleep(time.Duration(i+1) * 2 * time.Second)
+		}
 	}
 
-	return &Client{c}, nil
+	return nil, fmt.Errorf("failed to connect to Consul after 5 attempts: %v", err)
 }
 
 // Client provides an interface for communicating with registry
@@ -82,14 +99,33 @@ func (c *Client) Register(name string, id string, ip string, port int) error {
 			return err
 		}
 	}
+	
+	// Register without health checks to prevent automatic deregistration
+	// Health checks were causing services to be deregistered due to network connectivity issues
 	reg := &consul.AgentServiceRegistration{
 		ID:      id,
 		Name:    name,
 		Port:    port,
 		Address: ip,
+		// No health check - services will stay registered until manually deregistered
 	}
+	
 	log.Info().Msgf("Trying to register service [ name: %s, id: %s, address: %s:%d ]", name, id, ip, port)
-	return c.Agent().ServiceRegister(reg)
+	
+	// Retry registration with backoff
+	for i := 0; i < 3; i++ {
+		err := c.Agent().ServiceRegister(reg)
+		if err == nil {
+			log.Info().Msgf("Successfully registered service [ name: %s, id: %s ]", name, id)
+			return nil
+		}
+		log.Error().Msgf("Failed to register service (attempt %d/3): %v", i+1, err)
+		if i < 2 {
+			time.Sleep(time.Duration(i+1) * time.Second)
+		}
+	}
+	
+	return fmt.Errorf("failed to register service after 3 attempts")
 }
 
 // Deregister removes the service address from registry
