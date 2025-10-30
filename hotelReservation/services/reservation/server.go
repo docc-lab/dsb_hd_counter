@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-	pb "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/reservation/proto"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
+	pb "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/reservation/proto"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tls"
 	"github.com/google/uuid"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/opentracing/opentracing-go"

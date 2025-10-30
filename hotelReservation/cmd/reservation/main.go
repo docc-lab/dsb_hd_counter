@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/reservation"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tracing"
-	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tune"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/reservation"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tracing"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
