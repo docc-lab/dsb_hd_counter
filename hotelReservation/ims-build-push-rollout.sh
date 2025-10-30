@@ -3,33 +3,42 @@
 # Configuration
 REGISTRY="docclabgroup"
 IMAGE_NAME="hotelreservation"
+TIMING_MODE=false
 
 # List of services that have kubernetes deployment files
 VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
 # Function to show usage
 show_usage() {
-    echo "Usage: $0 <service1 [service2 ...]|all> [tag]"
+    echo "Usage: $0 [--mode-timer] [--registry=REGISTRY] [--image-prefix=PREFIX] <service1 [service2 ...]|all> [tag]"
     echo ""
     echo "This script follows the working approach from kubernetes/scripts/:"
     echo "  • Builds a single 'hotelreservation' image (not per-service images)"
     echo "  • Updates deployment YAML files with new image"
     echo "  • Applies updated deployments to Kubernetes"
     echo ""
+    echo "Options:"
+    echo "  --mode-timer           Enable timing mode (generates timing-enabled Dockerfile)"
+    echo "  --registry=REGISTRY    Set Docker registry (default: docclabgroup)"
+    echo "  --image-prefix=PREFIX  Set image name prefix (default: hotelreservation)"
+    echo ""
     echo "Arguments:"
     echo "  service    Deploy specific service(s) (${VALID_SERVICES[*]})"
-    echo "  all        Deploy all valid services"
+    echo "  all        Deploy all valid services (NOT allowed in timing mode)"
     echo "  tag        Docker image tag (default: debug0.1)"
     echo ""
     echo "Examples:"
-    echo "  $0 frontend debug0.2                    # Deploy only frontend"
-    echo "  $0 frontend geo profile debug0.1        # Deploy multiple specific services"
-    echo "  $0 all debug0.1                         # Deploy all valid services"
-    echo "  $0 all                                  # Deploy all (default tag)"
+    echo "  $0 frontend debug0.2                                    # Deploy only frontend"
+    echo "  $0 frontend geo profile debug0.1                        # Deploy multiple specific services"
+    echo "  $0 all debug0.1                                         # Deploy all valid services"
+    echo "  $0 --mode-timer user v1-withtimer                       # Deploy user with timing"
+    echo "  $0 --mode-timer --registry=royno7 user v1-withtimer     # Deploy user with timing to royno7"
+    echo "  $0 all                                                  # Deploy all (default tag)"
     echo ""
     echo "Valid services: ${VALID_SERVICES[*]}"
     echo "Registry: ${REGISTRY}/${IMAGE_NAME}"
     echo "Note: 'review' and 'attractions' do not have kubernetes deployment files"
+    echo "Note: Timing mode only works with specific services, not 'all'"
     echo "Rollout timeout: 60 seconds per service"
 }
 
@@ -60,12 +69,78 @@ validate_service() {
     return 1
 }
 
+# Function to generate timing-enabled Dockerfile for a specific service
+generate_timing_dockerfile() {
+    local service=$1
+    local dockerfile_path="$(pwd)/Dockerfile.${service}-timing"
+    
+    cat > "$dockerfile_path" << EOF
+FROM golang:1.21 as builder
+
+RUN apt-get update && apt-get install -y gcc
+
+WORKDIR /workspace
+
+COPY go.sum go.sum
+COPY go.mod go.mod
+COPY vendor/ vendor/
+
+COPY cmd/ cmd/
+COPY dialer/ dialer/
+COPY interceptor/ interceptor/
+COPY registry/ registry/
+COPY services/ services/
+COPY tls/ tls/
+COPY tracing/ tracing/
+COPY tune/ tune/
+
+COPY config.json config.json
+
+WORKDIR /workspace
+
+# Build the ${service} service with timing interceptor (no CGO needed)
+ENV CGO_ENABLED=0
+RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
+
+# Runtime stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+# Copy the binary from builder stage
+COPY --from=builder /workspace/build/${service} ./${service}
+COPY --from=builder /workspace/config.json .
+
+# Make binary executable
+RUN chmod +x ./${service}
+
+# Environment variables for timing control
+ENV ENABLE_TIMING=true
+ENV STATS_FILE=timing_stats_${service}.json
+
+EXPOSE 8081
+
+CMD ["./${service}"]
+EOF
+
+    echo "$dockerfile_path"
+}
+
 # Function to build and push Docker image (single image for all services)
 build_and_push_docker() {
     local tag=$1
+    local service=$2
     local image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
 
-    log_info "Building and pushing single Docker image for all services"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        # In timing mode, build service-specific image
+        image_full_name="${REGISTRY}/${service}-withtimer:${tag}"
+        log_info "Building timing-enabled Docker image for $service"
+    else
+        log_info "Building and pushing single Docker image for all services"
+    fi
 
     # Get architecture and decide platform
     ARCH=$(uname -m)
@@ -90,11 +165,38 @@ build_and_push_docker() {
         log_info "Building Docker image: ${image_full_name}"
         log_info "Platform: ${PLATFORM}"
         
-        # Use docker buildx for better platform support
-        if ! sudo docker buildx build --no-cache -t "${image_full_name}" \
-            -f Dockerfile . --platform "${PLATFORM}" --push; then
-            log_error "Docker build/push failed"
-            return 1
+        if [[ "$TIMING_MODE" == "true" ]]; then
+            # Generate timing-enabled Dockerfile for specific service
+            log_info "Generating timing-enabled Dockerfile for $service"
+            local dockerfile_path=$(generate_timing_dockerfile "$service")
+            log_info "Using Dockerfile: ${dockerfile_path}"
+            
+            # Use regular docker build for timing mode
+            if ! sudo docker build --no-cache -t "${image_full_name}" -f "$dockerfile_path" .; then
+                log_error "Docker build failed for $service"
+                # Clean up temporary Dockerfile
+                rm -f "$dockerfile_path"
+                return 1
+            fi
+            
+            # Push the image separately
+            log_info "Pushing image: ${image_full_name}"
+            if ! sudo docker push "${image_full_name}"; then
+                log_error "Docker push failed for $service"
+                # Clean up temporary Dockerfile
+                rm -f "$dockerfile_path"
+                return 1
+            fi
+            
+            # Clean up temporary Dockerfile
+            rm -f "$dockerfile_path"
+        else
+            # Use docker buildx for better platform support (normal mode)
+            if ! sudo docker buildx build --no-cache -t "${image_full_name}" \
+                -f Dockerfile . --platform "${PLATFORM}" --push; then
+                log_error "Docker build/push failed"
+                return 1
+            fi
         fi
         log_success "Image built and pushed successfully"
     else
@@ -155,7 +257,11 @@ update_yaml_files() {
         fi
     done
     
-    log_info "Updating YAML files to use image: ${image_full_name}"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        log_info "Updating YAML files for timing mode (service-specific images)"
+    else
+        log_info "Updating YAML files to use image: ${image_full_name}"
+    fi
     
     # Update deployment YAML files for specified services
     for service in "${services[@]}"; do
@@ -177,10 +283,20 @@ update_yaml_files() {
             # Create backup
             cp "$deployment_file" "${deployment_file}.backup"
             
+            # Determine the correct image name for this service
+            local service_image_name="${image_full_name}"
+            if [[ "$TIMING_MODE" == "true" ]]; then
+                service_image_name="${REGISTRY}/${service}-withtimer:${tag}"
+            fi
+            
             # Update the image line
-            if sed -i 's|image: deathstarbench/hotel-reservation:latest|image: '"${image_full_name}"'|g' "$deployment_file"; then
-                if sed -i 's|image: '"${REGISTRY}/${IMAGE_NAME}"':.*|image: '"${image_full_name}"'|g' "$deployment_file"; then
-                    log_success "Updated $deployment_file"
+            if sed -i 's|image: deathstarbench/hotel-reservation:latest|image: '"${service_image_name}"'|g' "$deployment_file"; then
+                if sed -i 's|image: '"${REGISTRY}/${IMAGE_NAME}"':.*|image: '"${service_image_name}"'|g' "$deployment_file"; then
+                    # Also update any existing timing images
+                    if [[ "$TIMING_MODE" == "true" ]]; then
+                        sed -i 's|image: '"${REGISTRY}/${service}-withtimer"':.*|image: '"${service_image_name}"'|g' "$deployment_file"
+                    fi
+                    log_success "Updated $deployment_file with image: ${service_image_name}"
                     updated_files+=("$deployment_file")
                 else
                     log_error "Failed to update $deployment_file"
@@ -223,18 +339,54 @@ deploy_multiple_services() {
         fi
     done
     
+    # Check timing mode restrictions
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        # In timing mode, check if "all" is specified
+        for service in "${services[@]}"; do
+            if [[ "$service" == "all" ]]; then
+                log_error "Timing mode does not support 'all' services. Please specify individual services."
+                return 1
+            fi
+        done
+    fi
+    
     echo "=========================================="
-    echo "Deploying Hotel Reservation Services"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        echo "Deploying Timing-Enabled Hotel Reservation Services"
+    else
+        echo "Deploying Hotel Reservation Services"
+    fi
     echo "Services: ${services[*]}"
     echo "Tag: $tag"
-    echo "Image: ${REGISTRY}/${IMAGE_NAME}:${tag}"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        echo "Mode: Timing-enabled (service-specific images)"
+    else
+        echo "Image: ${REGISTRY}/${IMAGE_NAME}:${tag}"
+    fi
     echo "=========================================="
     
-    # Phase 1: Build and push single image (only once)
-    log_info "Phase 1: Building and pushing Docker image"
-    if ! build_and_push_docker "$tag"; then
-        log_error "Failed to build/push image"
-        return 1
+    # Phase 1: Build and push image(s)
+    log_info "Phase 1: Building and pushing Docker image(s)"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        # In timing mode, build each service individually
+        for service in "${services[@]}"; do
+            if ! build_and_push_docker "$tag" "$service"; then
+                log_error "Failed to build/push timing image for $service"
+                failed_services+=("$service")
+                continue
+            fi
+        done
+        
+        if [[ ${#failed_services[@]} -gt 0 ]]; then
+            log_error "Failed to build timing images for: ${failed_services[*]}"
+            return 1
+        fi
+    else
+        # Normal mode: build single image for all services
+        if ! build_and_push_docker "$tag" ""; then
+            log_error "Failed to build/push image"
+            return 1
+        fi
     fi
     
     # Phase 2: Update YAML files
@@ -302,67 +454,86 @@ deploy_multiple_services() {
 }
 
 # Main execution starts here
-log_info "Phase 1: Starting main execution"
+log_info "Starting main execution"
 cd "$(dirname "$0")" || { log_error "Failed to navigate to script directory"; exit 1; }
 
-# Check for help or invalid arguments
-if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]] || [[ -z "$1" ]]; then
-    show_usage
-    exit 0
-fi
+# Parse command line arguments
+services_to_deploy=()
+tag="debug0.1"  # Default tag
 
-# Check if user wants to deploy all services
-if [[ "$1" == "all" ]]; then
-    TAG="${2:-debug0.1}"  # Default to debug0.1 if no tag provided
-    log_info "Deploying all valid services with tag: $TAG"
-    deploy_multiple_services "${VALID_SERVICES[@]}" "$TAG"
-    exit $?
-fi
-
-# Check if multiple services provided
-if [[ $# -gt 1 ]]; then
-    # Validate all provided services
-    services_to_deploy=()
-    tag="debug0.1"  # Default tag
-    
-    for arg in "$@"; do
-        # Check if this argument is a valid service
-        if validate_service "$arg"; then
-            services_to_deploy+=("$arg")
-        else
-            # Check if this looks like a tag (contains dots, numbers, or common tag patterns)
-            if [[ "$arg" =~ ^[a-zA-Z0-9._-]+$ && ! "$arg" =~ ^(review|attractions)$ ]]; then
-                tag="$arg"
-            else
-                log_error "Invalid service: '$arg'"
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --mode-timer)
+            TIMING_MODE=true
+            shift
+            ;;
+        --registry=*)
+            REGISTRY="${1#*=}"
+            shift
+            ;;
+        --image-prefix=*)
+            IMAGE_NAME="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        all)
+            if [[ "$TIMING_MODE" == "true" ]]; then
+                log_error "Timing mode does not support 'all' services. Please specify individual services."
                 echo ""
                 show_usage
                 exit 1
             fi
-        fi
-    done
-    
-    if [[ ${#services_to_deploy[@]} -eq 0 ]]; then
-        log_error "No valid services specified"
-        echo ""
-        show_usage
-        exit 1
-    fi
-    
-    log_info "Deploying multiple services: ${services_to_deploy[*]} with tag: $tag"
-    deploy_multiple_services "${services_to_deploy[@]}" "$tag"
-    exit $?
-fi
+            services_to_deploy=("${VALID_SERVICES[@]}")
+            shift
+            break
+            ;;
+        *)
+            # Check if this argument is a valid service
+            if validate_service "$1"; then
+                services_to_deploy+=("$1")
+            else
+                # Check if this looks like a tag (contains dots, numbers, or common tag patterns)
+                if [[ "$1" =~ ^[a-zA-Z0-9._-]+$ && ! "$1" =~ ^(review|attractions)$ ]]; then
+                    tag="$1"
+                else
+                    log_error "Invalid service: '$1'"
+                    echo ""
+                    show_usage
+                    exit 1
+                fi
+            fi
+            shift
+            ;;
+    esac
+done
 
-# Single service deployment
-if ! validate_service "$1"; then
-    log_error "Service '$1' is not a valid deployable service."
+# If no services specified, show usage
+if [[ ${#services_to_deploy[@]} -eq 0 ]]; then
+    log_error "No services specified"
     echo ""
     show_usage
     exit 1
 fi
 
-log_info "Service '$1' validated successfully"
+# Check timing mode restrictions
+if [[ "$TIMING_MODE" == "true" ]]; then
+    # In timing mode, check if "all" is specified
+    for service in "${services_to_deploy[@]}"; do
+        if [[ "$service" == "all" ]]; then
+            log_error "Timing mode does not support 'all' services. Please specify individual services."
+            exit 1
+        fi
+    done
+fi
 
-# Deploy single service using the new approach
-deploy_multiple_services "$1" "${2:-debug0.1}"
+log_info "Deploying services: ${services_to_deploy[*]} with tag: $tag"
+if [[ "$TIMING_MODE" == "true" ]]; then
+    log_info "Timing mode enabled - building service-specific images"
+fi
+
+# Deploy services
+deploy_multiple_services "${services_to_deploy[@]}" "$tag"
