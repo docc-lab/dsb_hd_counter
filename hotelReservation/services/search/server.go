@@ -3,9 +3,11 @@ package search
 import (
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
+	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/interceptor"
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
 	geo "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/geo/proto"
 	rate "github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/rate/proto"
@@ -62,6 +64,24 @@ func (s *Server) Run() error {
 
 	s.uuid = uuid.New().String()
 
+	// Configure timing interceptor (can be controlled via environment variables)
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	statsFile := os.Getenv("STATS_FILE")
+	if statsFile == "" {
+		statsFile = "timing_stats_search.json"
+	}
+
+	timingConfig := interceptor.TimingConfig{
+		EnableTiming: enableTiming,
+		ServiceName:  name,
+		StatsFile:    statsFile,
+	}
+
+	serverOpts := interceptor.ServerOptions{
+		TimingConfig: timingConfig,
+		Tracer:       s.Tracer,
+	}
+
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Timeout: 120 * time.Second,
@@ -69,9 +89,13 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		serverOpts.GetServerInterceptor(), // This includes both tracing and timing
+	}
+
+	if enableTiming {
+		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
+	} else {
+		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
