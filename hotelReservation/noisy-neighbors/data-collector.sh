@@ -50,6 +50,7 @@ create_exp_directory() {
     mkdir -p "$exp_dir"/{raw,processed,logs,metadata,timing}
     mkdir -p "$exp_dir/raw"/{perf,latency,system,stress}
     mkdir -p "$exp_dir/timing"/{data,tmp}
+    mkdir -p "$exp_dir/raw/perf"/{logs,external}
     
     echo "$exp_dir"
 }
@@ -288,6 +289,96 @@ retrieve_timing_data() {
         fi
     else
         log "$exp_dir" "WARNING: Timing stats file not found in pod $pod_name"
+        return 1
+    fi
+}
+
+# Retrieve perf data from service pod logs
+retrieve_perf_data_from_logs() {
+    local service="$1"
+    local exp_dir="$2"
+    local iteration="$3"
+    
+    log "$exp_dir" "Retrieving perf data from logs for $service service"
+    
+    # Get pod name
+    local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod_name" ]]; then
+        log "$exp_dir" "WARNING: No pod found for service $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "Found pod: $pod_name"
+    
+    # Extract perf data from logs (look for lines with perf_data_type: request_perf)
+    local perf_log_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.txt"
+    
+    log "$exp_dir" "Extracting perf data from $pod_name logs"
+    kubectl logs "$pod_name" | grep -E "perf_data_type.*request_perf|Perf counters" > "$perf_log_file" 2>/dev/null || true
+    
+    if [[ -s "$perf_log_file" ]]; then
+        log "$exp_dir" "Successfully extracted perf data: $perf_log_file"
+        
+        # Also create a JSON-formatted summary for easier processing
+        local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
+        
+        # Extract perf events from log lines and create JSON
+        {
+            echo "["
+            local first=true
+            while IFS= read -r line; do
+                if [[ "$line" =~ \"service\":\"([^\"]+)\".*\"method\":\"([^\"]+)\" ]]; then
+                    if [[ "$first" == "false" ]]; then
+                        echo ","
+                    fi
+                    first=false
+                    echo "  {"
+                    echo "    \"service\": \"${BASH_REMATCH[1]}\","
+                    echo "    \"method\": \"${BASH_REMATCH[2]}\","
+                    
+                    # Extract perf event values (look for event names and values)
+                    local events_json=""
+                    if [[ "$line" =~ \"cycles\":([0-9]+) ]]; then
+                        events_json="${events_json}    \"cycles\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"instructions\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"instructions\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"l1_misses\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"l1_misses\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"cache_references\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"cache_references\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"cache_misses\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"cache_misses\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"context_switches\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"context_switches\": ${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ \"page_faults\":([0-9]+) ]]; then
+                        [[ -n "$events_json" ]] && events_json="${events_json},"
+                        events_json="${events_json}    \"page_faults\": ${BASH_REMATCH[1]}"
+                    fi
+                    
+                    echo "    \"events\": {"
+                    echo "$events_json"
+                    echo "    }"
+                    echo -n "  }"
+                fi
+            done < "$perf_log_file"
+            echo ""
+            echo "]"
+        } > "$perf_json_file" 2>/dev/null || true
+        
+        return 0
+    else
+        log "$exp_dir" "WARNING: No perf data found in logs for $service"
         return 1
     fi
 }
@@ -1382,6 +1473,8 @@ cleanup_victim_services() {
 }
 
 # Start performance monitoring for all victim services
+# UPDATED: External perf monitoring via SSH is now commented out
+# Using per-request perf instrumentation via application logs instead
 start_monitoring() {
     local services="$1"
     local duration="$2"
@@ -1389,26 +1482,34 @@ start_monitoring() {
     local exp_dir="$4"
     local iteration="$5"
     
-    log "$exp_dir" "Starting performance monitoring for services: $services"
+    log "$exp_dir" "Per-request perf instrumentation enabled - data will be collected from application logs"
+    log "$exp_dir" "External SSH-based perf monitoring is disabled"
     
-    local monitor_pids=()
+    # OLD CODE (commented out - external SSH-based monitoring):
+    # log "$exp_dir" "Starting performance monitoring for services: $services"
+    # 
+    # local monitor_pids=()
+    # 
+    # for service in $services; do
+    #     log "$exp_dir" "Starting monitor for $service with counter set: $counter_set"
+    #     
+    #     # Start monitoring in background and redirect output to external subdirectory
+    #     mkdir -p "$exp_dir/raw/perf/external"
+    #     "$MONITOR_SCRIPT" "$service" default "$duration" "$counter_set" \
+    #         > "$exp_dir/raw/perf/external/${service}_iter${iteration}.txt" 2>&1 &
+    #     
+    #     local pid=$!
+    #     monitor_pids+=($pid)
+    #     echo "$pid:$service" >> "$exp_dir/raw/perf/monitor_pids_iter${iteration}.txt"
+    #     
+    #     log "$exp_dir" "Monitor started for $service (PID: $pid)"
+    #     sleep 2  # Stagger starts slightly
+    # done
+    # 
+    # echo "${monitor_pids[@]}"
     
-    for service in $services; do
-        log "$exp_dir" "Starting monitor for $service with counter set: $counter_set"
-        
-        # Start monitoring in background and redirect output
-        "$MONITOR_SCRIPT" "$service" default "$duration" "$counter_set" \
-            > "$exp_dir/raw/perf/${service}_iter${iteration}.txt" 2>&1 &
-        
-        local pid=$!
-        monitor_pids+=($pid)
-        echo "$pid:$service" >> "$exp_dir/raw/perf/monitor_pids_iter${iteration}.txt"
-        
-        log "$exp_dir" "Monitor started for $service (PID: $pid)"
-        sleep 2  # Stagger starts slightly
-    done
-    
-    echo "${monitor_pids[@]}"
+    # NEW: Return empty array since we're using per-request instrumentation
+    echo ""
 }
 
 # Start wrk2 workload generation and collect e2e latency metrics
@@ -1567,13 +1668,14 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Wait before starting performance monitoring
-    log "$exp_dir" "Waiting 10s before starting performance monitoring..."
+    # Wait before starting workload
+    log "$exp_dir" "Waiting 10s before starting workload..."
     sleep 10
     
-    # Start monitoring (runs for original experiment duration)
-    log "$exp_dir" "Starting performance monitoring (duration: ${EXPERIMENT_DURATION}s)"
-    local monitor_pids=($(start_monitoring "$VICTIM_SERVICES" "$EXPERIMENT_DURATION" "$PERF_COUNTER_SET" "$exp_dir" "$iteration"))
+    # Per-request perf instrumentation is automatically enabled in services
+    # No external monitoring needed - data collected from application logs
+    log "$exp_dir" "Per-request perf instrumentation active (PERF_EVENTS: ${PERF_EVENTS:-basic})"
+    local monitor_pids=()
     
     # Collect metrics during stress
     sleep 30  # Let stress ramp up
@@ -1598,8 +1700,16 @@ run_iteration() {
         fi
     done
     
-    # Wait for all monitoring to complete
-    wait_for_processes "${monitor_pids[@]}"
+    # Retrieve perf data from logs for all victim services
+    log "$exp_dir" "Retrieving perf data from application logs"
+    for service in $VICTIM_SERVICES; do
+        retrieve_perf_data_from_logs "$service" "$exp_dir" "$iteration"
+    done
+    
+    # Wait for all monitoring to complete (if any external monitoring was started)
+    if [[ ${#monitor_pids[@]} -gt 0 ]]; then
+        wait_for_processes "${monitor_pids[@]}"
+    fi
     
     # Wait for wrk2 to complete if it was started
     if [[ -n "$wrk2_pid" ]]; then
@@ -1705,16 +1815,17 @@ aggregate_data() {
         } > "$exp_dir/processed/latency_summary.txt"
     fi
     
-    # Aggregate performance data
-    if ls "$exp_dir/raw/perf/"*_iter*.txt 1> /dev/null 2>&1; then
+    # Aggregate performance data (external perf monitoring)
+    if ls "$exp_dir/raw/perf/external/"*_iter*.txt 1> /dev/null 2>&1 || ls "$exp_dir/raw/perf/"*_iter*.txt 1> /dev/null 2>&1; then
         {
-            echo "=== AGGREGATED PERFORMANCE METRICS ==="
+            echo "=== AGGREGATED PERFORMANCE METRICS (External Monitoring) ==="
             echo "Generated: $(date -Iseconds)"
             echo ""
             for i in $(seq 1 $total_iterations); do
                 echo "=== ITERATION $i ==="
-                for file in "$exp_dir/raw/perf/"*_iter${i}.txt; do
-                    if [[ -f "$file" ]]; then
+                # External perf monitoring (from service-monitor.sh)
+                for file in "$exp_dir/raw/perf/external/"*_iter${i}.txt "$exp_dir/raw/perf/"*_iter${i}.txt; do
+                    if [[ -f "$file" && ! "$file" =~ /logs/ ]]; then
                         echo "--- $(basename "$file") ---"
                         cat "$file"
                         echo ""
@@ -1722,6 +1833,25 @@ aggregate_data() {
                 done
             done
         } > "$exp_dir/processed/performance_summary.txt"
+    fi
+    
+    # Aggregate perf data from application logs (per-request perf counters)
+    if ls "$exp_dir/raw/perf/logs/"*_perf_iter*.json 1> /dev/null 2>&1; then
+        {
+            echo "=== AGGREGATED PER-REQUEST PERFORMANCE METRICS (From Application Logs) ==="
+            echo "Generated: $(date -Iseconds)"
+            echo ""
+            for i in $(seq 1 $total_iterations); do
+                echo "=== ITERATION $i ==="
+                for file in "$exp_dir/raw/perf/logs/"*_perf_iter${i}.json; do
+                    if [[ -f "$file" ]]; then
+                        echo "--- $(basename "$file") ---"
+                        cat "$file"
+                        echo ""
+                    fi
+                done
+            done
+        } > "$exp_dir/processed/per_request_perf_summary.txt"
     fi
     
     # Aggregate timing data if available

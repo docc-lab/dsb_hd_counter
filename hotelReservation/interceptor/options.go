@@ -12,17 +12,23 @@ type ServerOptions struct {
 	Tracer       opentracing.Tracer
 }
 
-// GetServerInterceptor returns a combined server interceptor with tracing and timing
+// GetServerInterceptor returns a combined server interceptor with tracing and timing (with optional perf)
 func (opts ServerOptions) GetServerInterceptor() grpc.ServerOption {
+	interceptors := []grpc.UnaryServerInterceptor{
+		otgrpc.OpenTracingServerInterceptor(opts.Tracer),
+	}
+
+	// Add timing interceptor if enabled (includes perf if configured)
+	if opts.TimingConfig.EnableTiming {
+		interceptors = append(interceptors, TimingServerInterceptor(opts.TimingConfig))
+	}
+
 	return grpc.UnaryInterceptor(
-		ChainUnaryServerInterceptors(
-			otgrpc.OpenTracingServerInterceptor(opts.Tracer),
-			TimingServerInterceptor(opts.TimingConfig),
-		),
+		ChainUnaryServerInterceptors(interceptors...),
 	)
 }
 
-// GetTimingServerInterceptor returns only the timing interceptor
+// GetTimingServerInterceptor returns only the timing interceptor (with optional perf)
 func (opts ServerOptions) GetTimingServerInterceptor() grpc.ServerOption {
 	return grpc.UnaryInterceptor(TimingServerInterceptor(opts.TimingConfig))
 }

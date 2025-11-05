@@ -9,27 +9,39 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 )
 
+/*
+#cgo CFLAGS: -I../services/perf
+#cgo LDFLAGS: -L../services/perf -lperf_api
+#include "../services/perf/perf_api.h"
+*/
+import "C"
+
 // TimingConfig holds configuration for timing interceptor
 type TimingConfig struct {
 	EnableTiming bool
+	EnablePerf   bool     // Enable perf counter instrumentation
+	PerfEvents   string   // Perf events to monitor (e.g., "basic", "interference", or custom list)
 	ServiceName  string
 	StatsFile    string // File to write aggregated statistics (optional)
 }
 
 // TimingData represents a single timing measurement
 type TimingData struct {
-	ServiceName    string        `json:"service_name"`
-	Method         string        `json:"method"`
-	ArrivalTime    time.Time     `json:"arrival_time"`
-	ProcessingTime time.Duration `json:"processing_time_ns"` // Time spent in actual processing (excluding blocking calls)
-	TotalTime      time.Duration `json:"total_time_ns"`      // Total time including blocking calls
-	BlockingTime   time.Duration `json:"blocking_time_ns"`   // Time spent in blocking calls
-	Timestamp      time.Time     `json:"timestamp"`
+	ServiceName        string                   `json:"service_name"`
+	Method             string                   `json:"method"`
+	ArrivalTime        time.Time                `json:"arrival_time"`
+	ProcessingTime     time.Duration            `json:"processing_time_ns"` // Time spent in actual processing (excluding blocking calls)
+	TotalTime          time.Duration            `json:"total_time_ns"`      // Total time including blocking calls
+	BlockingTime       time.Duration            `json:"blocking_time_ns"`   // Time spent in blocking calls
+	Timestamp          time.Time                `json:"timestamp"`
+	PerfTotal          map[string]int64         `json:"perf_total,omitempty"`          // Perf counters for total execution (including blocking)
+	PerfExecution      map[string]int64         `json:"perf_execution,omitempty"`      // Perf counters for service execution only (excluding blocking)
 }
 
 // TimingStats holds statistics for a service
@@ -94,6 +106,32 @@ type timingContext struct {
 	pauseStartTimeNs  int64  // atomic - nanoseconds when blocking started (0 if not blocking)
 	totalPausedTimeNs int64  // atomic - accumulated paused time in nanoseconds
 	totalCallCount    int32  // atomic - total number of downstream calls made
+	
+	// Perf counter tracking (stored as uintptr for atomic operations)
+	perfHandles           uintptr // *C.struct_perf_handles
+	perfStartValues       uintptr // *C.struct_perf_values (at request start)
+	perfAccumExecution    uintptr // *C.struct_perf_values (accumulated execution time counters)
+	perfEnabled           int32   // atomic - 1 if perf is enabled, 0 otherwise
+}
+
+// Helper function to convert C perf_values to Go map
+func cPerfValuesToMap(cValues *C.struct_perf_values) map[string]int64 {
+	result := make(map[string]int64)
+	if cValues == nil {
+		return result
+	}
+	
+	numEvents := int(cValues.num_events)
+	for i := 0; i < numEvents && i < C.MAX_PERF_EVENTS; i++ {
+		eventName := C.GoString(&cValues.event_names[i][0])
+		if eventName == "" {
+			continue
+		}
+		value := int64(cValues.values[i])
+		result[eventName] = value
+	}
+	
+	return result
 }
 
 // TimingServerInterceptor creates a server-side unary interceptor with local timing functionality
@@ -102,6 +140,31 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		// Return a no-op interceptor if timing is disabled
 		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 			return handler(ctx, req)
+		}
+	}
+
+	// Initialize perf events if enabled
+	if config.EnablePerf {
+		perfEvents := config.PerfEvents
+		if perfEvents == "" {
+			perfEvents = os.Getenv("PERF_EVENTS")
+			if perfEvents == "" {
+				perfEvents = "basic" // Default
+			}
+		}
+		
+		cConfig := C.CString(perfEvents)
+		defer C.free(unsafe.Pointer(cConfig))
+		
+		result := C.perf_init(cConfig)
+		if result != 0 {
+			log.Error().Str("perf_events", perfEvents).Msg("Failed to initialize perf events, perf disabled")
+			config.EnablePerf = false
+		} else {
+			log.Info().
+				Str("service", config.ServiceName).
+				Str("perf_events", perfEvents).
+				Msg("Perf instrumentation ENABLED")
 		}
 	}
 
@@ -126,6 +189,28 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 			pauseStartTimeNs:  0,
 			totalPausedTimeNs: 0,
 			totalCallCount:    0,
+			perfEnabled:       0,
+		}
+		
+		// Start perf counters if enabled
+		if config.EnablePerf {
+			cHandles := C.perf_start()
+			if cHandles.leader_fd >= 0 {
+				// Store handles and initial values
+				handlesCopy := cHandles
+				timingCtx.perfHandles = uintptr(unsafe.Pointer(&handlesCopy))
+				
+				// Read initial values
+				cStartValues := C.perf_read(&handlesCopy)
+				startValuesCopy := cStartValues
+				timingCtx.perfStartValues = uintptr(unsafe.Pointer(&startValuesCopy))
+				
+				// Initialize accumulated execution counters to start values
+				accumCopy := cStartValues
+				timingCtx.perfAccumExecution = uintptr(unsafe.Pointer(&accumCopy))
+				
+				atomic.StoreInt32(&timingCtx.perfEnabled, 1)
+			}
 		}
 		
 		// Store timing data and mutable context for client interceptor to access
@@ -154,13 +239,34 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		
 		processingTime := totalTime - pausedTime
 
+		// Calculate perf metrics if enabled
+		if config.EnablePerf && atomic.LoadInt32(&timingCtx.perfEnabled) == 1 {
+			cHandles := (*C.struct_perf_handles)(unsafe.Pointer(timingCtx.perfHandles))
+			if cHandles != nil && cHandles.leader_fd >= 0 {
+				// Stop counters and get final values
+				cEndValues := C.perf_stop(cHandles)
+				
+				cStartValues := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfStartValues))
+				cAccumExec := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfAccumExecution))
+				
+				// Calculate total delta: end - start
+				cTotalDelta := C.perf_delta(cStartValues, &cEndValues)
+				timingData.PerfTotal = cPerfValuesToMap(&cTotalDelta)
+				
+				// Calculate execution delta: accumulated + (end - lastPause)
+				// This gives us total execution time excluding all blocking periods
+				cExecutionDelta := C.perf_delta(cAccumExec, &cEndValues)
+				timingData.PerfExecution = cPerfValuesToMap(&cExecutionDelta)
+			}
+		}
+
 		// Update timing data
 		timingData.TotalTime = totalTime
 		timingData.ProcessingTime = processingTime
 		timingData.BlockingTime = pausedTime
 
 		// Log detailed timing information for this request
-		log.Info().
+		logEvent := log.Info().
 			Str("method", info.FullMethod).
 			Str("service", config.ServiceName).
 			Int32("downstream_calls", blockingCount).
@@ -170,8 +276,17 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 			Dur("blocking_time", pausedTime).
 			Float64("processing_time_ms", float64(processingTime.Nanoseconds())/1000000).
 			Float64("total_time_ms", float64(totalTime.Nanoseconds())/1000000).
-			Float64("blocking_time_ms", float64(pausedTime.Nanoseconds())/1000000).
-			Msg("gRPC call completed")
+			Float64("blocking_time_ms", float64(pausedTime.Nanoseconds())/1000000)
+		
+		// Add perf data if available
+		if config.EnablePerf && (len(timingData.PerfTotal) > 0 || len(timingData.PerfExecution) > 0) {
+			logEvent = logEvent.
+				Interface("perf_total", timingData.PerfTotal).
+				Interface("perf_execution", timingData.PerfExecution).
+				Str("perf_data_type", "request_timing_perf")
+		}
+		
+		logEvent.Msg("gRPC call completed")
 
 		// Add timing data to in-memory aggregator
 		aggregator.AddTimingData(*timingData)
@@ -212,6 +327,26 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 			pauseStartNs := time.Now().UnixNano()
 			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
 			
+			// Pause perf counters and accumulate execution time
+			if atomic.LoadInt32(&timingCtx.perfEnabled) == 1 {
+				cHandles := (*C.struct_perf_handles)(unsafe.Pointer(timingCtx.perfHandles))
+				if cHandles != nil && cHandles.leader_fd >= 0 {
+					// Pause and get current values
+					cPausedValues := C.perf_pause(cHandles)
+					
+					// Calculate delta from last accumulation point
+					cLastAccum := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfAccumExecution))
+					if cLastAccum != nil {
+						// Add delta to accumulated execution counters
+						cDelta := C.perf_delta(cLastAccum, &cPausedValues)
+						
+						// Update accumulated execution values
+						accumCopy := cDelta
+						timingCtx.perfAccumExecution = uintptr(unsafe.Pointer(&accumCopy))
+					}
+				}
+			}
+			
 			log.Info().
 				Str("outgoing_method", method).
 				Str("parent_service", timingData.ServiceName).
@@ -250,6 +385,15 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 				atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
 				
 				totalPausedNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
+				
+				// Resume perf counters - continue counting execution time
+				if atomic.LoadInt32(&timingCtx.perfEnabled) == 1 {
+					cHandles := (*C.struct_perf_handles)(unsafe.Pointer(timingCtx.perfHandles))
+					if cHandles != nil && cHandles.leader_fd >= 0 {
+						// Resume counting (doesn't reset, just continues)
+						C.perf_resume(cHandles)
+					}
+				}
 				
 				log.Info().
 					Str("outgoing_method", method).
