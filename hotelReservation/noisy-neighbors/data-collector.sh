@@ -434,13 +434,18 @@ validate_config() {
     source "$config_file"
     
     # Check required variables
-    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "PERF_COUNTER_SET" "NOISY_NEIGHBOR_TYPE" "EXPERIMENT_DURATION")
+    # Note: PERF_COUNTER_SET kept for backward compatibility but now optional (external monitoring disabled)
+    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "NOISY_NEIGHBOR_TYPE" "EXPERIMENT_DURATION")
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var}" ]]; then
             echo "ERROR: Required variable $var not set in config file"
             exit 1
         fi
     done
+    
+    # Optional variables with defaults
+    PERF_COUNTER_SET="${PERF_COUNTER_SET:-interference}"  # For backward compatibility (not used)
+    PERF_EVENTS="${PERF_EVENTS:-basic}"  # For per-request perf instrumentation
     
     # Check if scripts exist
     for script in "$STRESS_SCRIPT" "$MONITOR_SCRIPT" "$TAINT_SCRIPT"; do
@@ -1739,6 +1744,7 @@ generate_metadata() {
         "target_node": "$TARGET_NODE",
         "victim_services": "$VICTIM_SERVICES",
         "perf_counter_set": "$PERF_COUNTER_SET",
+        "perf_events": "${PERF_EVENTS:-basic}",
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
             "args": "${NOISY_NEIGHBOR_ARGS:-}",
@@ -2048,18 +2054,28 @@ main() {
         echo "Timing data will be collected and aggregated automatically."
         echo ""
         echo "Example config file:"
-        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact with Timing'"
+        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact with Timing and Perf'"
         echo "TARGET_NODE='node-1'"
         echo "VICTIM_SERVICES='frontend search user'"
-        echo "PERF_COUNTER_SET='interference'"
+        echo ""
+        echo "# Per-request perf instrumentation (NEW - for timing+perf interceptor):"
+        echo "PERF_EVENTS='interference'  # Options: basic, cpu, memory, interference, bandwidth, scheduling"
+        echo "#PERF_EVENTS='basic'        # Or custom: 'cycles,instructions,cache_misses'"
+        echo "#PERF_EVENTS=''             # Empty or omit to disable per-request perf"
+        echo ""
+        echo "# External perf monitoring (OLD - now disabled, kept for backward compatibility):"
+        echo "PERF_COUNTER_SET='interference'  # No longer used (external SSH monitoring disabled)"
+        echo ""
         echo "NOISY_NEIGHBOR_TYPE='cpu'"
         echo "NOISY_NEIGHBOR_ARGS='4 300s'"
         echo "EXPERIMENT_DURATION=300"
         echo "ITERATIONS=5"
         echo "ITERATION_DELAY=120"
+        echo ""
         echo "# Jaeger tracing configuration:"
         echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
         echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
+        echo ""
         echo "# wrk2 configuration:"
         echo "WRK2_TARGET_SERVICE='frontend'"
         echo "WRK2_TARGET_IP='192.168.202.238'"
