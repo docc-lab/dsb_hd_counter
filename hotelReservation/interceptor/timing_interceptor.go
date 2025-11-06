@@ -18,6 +18,7 @@ import (
 /*
 #cgo CFLAGS: -I../services/perf
 #cgo LDFLAGS: -L../services/perf -lperf_api
+#include <stdlib.h>
 #include "../services/perf/perf_api.h"
 */
 import "C"
