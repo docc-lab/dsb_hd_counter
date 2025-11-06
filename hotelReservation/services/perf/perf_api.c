@@ -193,7 +193,8 @@ struct perf_handles perf_start() {
         if (handles.leader_fd == -1) {
             return handles;
         }
-        strncpy(handles.event_names[0], event_names[0], 63);
+        strncpy(handles.event_names[0], event_names[0], sizeof(handles.event_names[0]) - 1);
+        handles.event_names[0][sizeof(handles.event_names[0]) - 1] = '\0';
         handles.event_fds[0] = handles.leader_fd;
         handles.num_events = 1;
     }
