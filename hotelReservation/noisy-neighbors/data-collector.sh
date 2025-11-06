@@ -334,14 +334,18 @@ retrieve_perf_data_from_logs() {
                     local total_time="${line#*total_time_ms=}"; total_time="${total_time%% *}"
                     local block_time="${line#*blocking_time_ms=}"; block_time="${block_time%% *}"
                     
-                    # Extract perf_total and perf_execution (keep as JSON strings in CSV)
+                    # Extract perf_total and perf_execution (handle both null and {} and {...})
                     local perf_total="{}"
-                    if [[ "$line" =~ perf_total=(\{[^}]+\}) ]]; then
+                    if [[ "$line" =~ perf_total=null ]]; then
+                        perf_total="null"
+                    elif [[ "$line" =~ perf_total=(\{[^}]*\}) ]]; then
                         perf_total="${BASH_REMATCH[1]}"
                     fi
                     
                     local perf_exec="{}"
-                    if [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
+                    if [[ "$line" =~ perf_execution=null ]]; then
+                        perf_exec="null"
+                    elif [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
                         perf_exec="${BASH_REMATCH[1]}"
                     fi
                     

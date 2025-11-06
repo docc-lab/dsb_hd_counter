@@ -211,6 +211,11 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 				timingCtx.perfAccumExecution = uintptr(unsafe.Pointer(&accumCopy))
 				
 				atomic.StoreInt32(&timingCtx.perfEnabled, 1)
+			} else {
+				// Perf failed to start - log warning and initialize empty maps
+				log.Warn().Str("service", config.ServiceName).Msg("perf_start failed (leader_fd < 0) - perf data will be empty")
+				timingData.PerfTotal = make(map[string]int64)
+				timingData.PerfExecution = make(map[string]int64)
 			}
 		}
 		
@@ -241,23 +246,29 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		processingTime := totalTime - pausedTime
 
 		// Calculate perf metrics if enabled
-		if config.EnablePerf && atomic.LoadInt32(&timingCtx.perfEnabled) == 1 {
-			cHandles := (*C.struct_perf_handles)(unsafe.Pointer(timingCtx.perfHandles))
-			if cHandles != nil && cHandles.leader_fd >= 0 {
-				// Stop counters and get final values
-				cEndValues := C.perf_stop(cHandles)
-				
-				cStartValues := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfStartValues))
-				cAccumExec := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfAccumExecution))
-				
-				// Calculate total delta: end - start
-				cTotalDelta := C.perf_delta(cStartValues, &cEndValues)
-				timingData.PerfTotal = cPerfValuesToMap(&cTotalDelta)
-				
-				// Calculate execution delta: accumulated + (end - lastPause)
-				// This gives us total execution time excluding all blocking periods
-				cExecutionDelta := C.perf_delta(cAccumExec, &cEndValues)
-				timingData.PerfExecution = cPerfValuesToMap(&cExecutionDelta)
+		if config.EnablePerf {
+			if atomic.LoadInt32(&timingCtx.perfEnabled) == 1 {
+				cHandles := (*C.struct_perf_handles)(unsafe.Pointer(timingCtx.perfHandles))
+				if cHandles != nil && cHandles.leader_fd >= 0 {
+					// Stop counters and get final values
+					cEndValues := C.perf_stop(cHandles)
+					
+					cStartValues := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfStartValues))
+					cAccumExec := (*C.struct_perf_values)(unsafe.Pointer(timingCtx.perfAccumExecution))
+					
+					// Calculate total delta: end - start
+					cTotalDelta := C.perf_delta(cStartValues, &cEndValues)
+					timingData.PerfTotal = cPerfValuesToMap(&cTotalDelta)
+					
+					// Calculate execution delta: accumulated + (end - lastPause)
+					// This gives us total execution time excluding all blocking periods
+					cExecutionDelta := C.perf_delta(cAccumExec, &cEndValues)
+					timingData.PerfExecution = cPerfValuesToMap(&cExecutionDelta)
+				}
+			} else {
+				// Perf was enabled but failed to start - use empty maps
+				timingData.PerfTotal = make(map[string]int64)
+				timingData.PerfExecution = make(map[string]int64)
 			}
 		}
 
