@@ -4,13 +4,14 @@
 REGISTRY="docclabgroup"
 IMAGE_NAME="hotelreservation"
 TIMING_MODE=false
+PERF_EVENTS=""  # Empty means perf disabled, set to enable (e.g., "basic", "interference")
 
 # List of services that have kubernetes deployment files
 VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
 # Function to show usage
 show_usage() {
-    echo "Usage: $0 [--mode-timer] [--registry=REGISTRY] [--image-prefix=PREFIX] <service1 [service2 ...]|all> [tag]"
+    echo "Usage: $0 [--mode-timer [--perf-events=SET]] [--registry=REGISTRY] [--image-prefix=PREFIX] <service1 [service2 ...]|all> [tag]"
     echo ""
     echo "This script follows the working approach from kubernetes/scripts/:"
     echo "  • Builds a single 'hotelreservation' image (not per-service images)"
@@ -18,7 +19,9 @@ show_usage() {
     echo "  • Applies updated deployments to Kubernetes"
     echo ""
     echo "Options:"
-    echo "  --mode-timer           Enable timing mode (generates timing-enabled Dockerfile)"
+    echo "  --mode-timer           Enable timing interceptor mode (generates timing-enabled Dockerfile)"
+    echo "  --perf-events=SET      Enable perf counters with event set (basic|cpu|memory|interference|bandwidth|scheduling)"
+    echo "                         Only works with --mode-timer. Omit to disable perf (timing only)."
     echo "  --registry=REGISTRY    Set Docker registry (default: docclabgroup)"
     echo "  --image-prefix=PREFIX  Set image name prefix (default: hotelreservation)"
     echo ""
@@ -28,11 +31,13 @@ show_usage() {
     echo "  tag        Docker image tag (default: debug0.1)"
     echo ""
     echo "Examples:"
-    echo "  $0 frontend debug0.2                                    # Deploy only frontend"
-    echo "  $0 frontend geo profile debug0.1                        # Deploy multiple specific services"
+    echo "  $0 frontend debug0.2                                    # Deploy only frontend (no timing)"
+    echo "  $0 frontend geo profile debug0.1                        # Deploy multiple services (no timing)"
     echo "  $0 all debug0.1                                         # Deploy all valid services"
-    echo "  $0 --mode-timer user v1-withtimer                       # Deploy user with timing"
-    echo "  $0 --mode-timer --registry=royno7 user v1-withtimer     # Deploy user with timing to royno7"
+    echo "  $0 --mode-timer user v1-timing                          # Deploy user with timing (no perf)"
+    echo "  $0 --mode-timer --perf-events=basic user v1-perf        # Deploy with timing+perf (basic events)"
+    echo "  $0 --mode-timer --perf-events=interference search user v1-interference  # Multiple services with perf"
+    echo "  $0 --mode-timer --registry=royno7 user v1-custom        # Custom registry"
     echo "  $0 all                                                  # Deploy all (default tag)"
     echo ""
     echo "Valid services: ${VALID_SERVICES[*]}"
@@ -99,10 +104,12 @@ COPY config.json config.json
 WORKDIR /workspace
 
 # Build perf_api static library for cgo users
-RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs services/perf/libperf_api.a services/perf/perf_api.o
+RUN gcc -std=c11 -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs services/perf/libperf_api.a services/perf/perf_api.o
 
-# Build the ${service} service with timing interceptor (CGO enabled for perf counters when needed)
+# Build the ${service} service with timing+perf interceptor (CGO enabled for perf counters)
 ENV CGO_ENABLED=1
+ENV CGO_LDFLAGS="-L/workspace/services/perf -lperf_api"
+ENV CGO_CFLAGS="-I/workspace/services/perf"
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 
 # Runtime stage - use Debian for glibc compatibility with CGO binaries
@@ -119,8 +126,11 @@ COPY --from=builder /workspace/config.json /config.json
 # Ensure binary is executable
 RUN chmod +x /usr/local/bin/${service}
 
-# Environment variables for timing control
+# Environment variables for timing and perf control
+# Perf is enabled if PERF_EVENTS is set, disabled if empty
 ENV ENABLE_TIMING=true
+ENV ENABLE_PERF=${PERF_EVENTS:+true}
+ENV PERF_EVENTS=${PERF_EVENTS}
 ENV STATS_FILE=timing_stats_${service}.json
 
 EXPOSE 8081
@@ -169,9 +179,13 @@ build_and_push_docker() {
         log_info "Building Docker image: ${image_full_name}"
         log_info "Platform: ${PLATFORM}"
         
-        if [[ "$TIMING_MODE" == "true" ]]; then
-            # Generate timing-enabled Dockerfile for specific service
-            log_info "Generating timing-enabled Dockerfile for $service"
+    if [[ "$TIMING_MODE" == "true" ]]; then
+        # Generate timing-enabled Dockerfile for specific service
+        if [[ -n "$PERF_EVENTS" ]]; then
+            log_info "Generating timing+perf-enabled Dockerfile for $service (PERF_EVENTS=$PERF_EVENTS)"
+        else
+            log_info "Generating timing-enabled Dockerfile for $service (perf disabled)"
+        fi
             local dockerfile_path=$(generate_timing_dockerfile "$service")
             log_info "Using Dockerfile: ${dockerfile_path}"
             
@@ -356,7 +370,11 @@ deploy_multiple_services() {
     
     echo "=========================================="
     if [[ "$TIMING_MODE" == "true" ]]; then
-        echo "Deploying Timing-Enabled Hotel Reservation Services"
+        if [[ -n "$PERF_EVENTS" ]]; then
+            echo "Deploying Timing+Perf-Enabled Hotel Reservation Services"
+        else
+            echo "Deploying Timing-Enabled Hotel Reservation Services"
+        fi
     else
         echo "Deploying Hotel Reservation Services"
     fi
@@ -364,6 +382,11 @@ deploy_multiple_services() {
     echo "Tag: $tag"
     if [[ "$TIMING_MODE" == "true" ]]; then
         echo "Mode: Timing-enabled (service-specific images)"
+        if [[ -n "$PERF_EVENTS" ]]; then
+            echo "Perf: ENABLED (events: $PERF_EVENTS)"
+        else
+            echo "Perf: DISABLED (timing only)"
+        fi
     else
         echo "Image: ${REGISTRY}/${IMAGE_NAME}:${tag}"
     fi
@@ -470,6 +493,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --mode-timer)
             TIMING_MODE=true
+            shift
+            ;;
+        --perf-events=*)
+            PERF_EVENTS="${1#*=}"
             shift
             ;;
         --registry=*)
