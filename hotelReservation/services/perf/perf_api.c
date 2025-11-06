@@ -189,11 +189,8 @@ struct perf_handles perf_start() {
         return handles;
     }
 
-    int cpu = sched_getcpu();
-    if (cpu < 0) {
-        fprintf(stderr, "perf_start: sched_getcpu() failed: %s\n", strerror(errno));
-        return handles;
-    }
+    // Use cpu=-1 to monitor on any CPU (more permissive)
+    int cpu = -1;
 
     // First event is the leader
     if (num_configured_events > 0) {
