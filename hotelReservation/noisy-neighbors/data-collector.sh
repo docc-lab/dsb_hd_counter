@@ -314,7 +314,7 @@ retrieve_perf_data_from_logs() {
     local perf_log_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.txt"
     
     log "$exp_dir" "Extracting perf data from $pod_name logs"
-    kubectl logs "$pod_name" | grep -E "perf_data_type.*request_perf|Perf counters" > "$perf_log_file" 2>/dev/null || true
+    kubectl logs "$pod_name" | grep -E "perf_data_type.*request_timing_perf|perf_data_type.*request_perf|Perf counters" > "$perf_log_file" 2>/dev/null || true
     
     if [[ -s "$perf_log_file" ]]; then
         log "$exp_dir" "Successfully extracted perf data: $perf_log_file"
