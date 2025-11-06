@@ -13,7 +13,6 @@
 #include <sched.h>
 
 _Thread_local static char result_buffer[2048];
-_Thread_local static char error_buffer[256];
 _Thread_local static int initialized_events = 0;
 _Thread_local static struct perf_event_attr event_attrs[MAX_PERF_EVENTS];
 _Thread_local static char event_names[MAX_PERF_EVENTS][64];
@@ -165,8 +164,8 @@ int perf_init(const char* config) {
         }
 
         if (parse_event_config(token, &event_attrs[num_configured_events]) == 0) {
-            strncpy(event_names[num_configured_events], token, 63);
-            event_names[num_configured_events][63] = '\0';
+            strncpy(event_names[num_configured_events], token, sizeof(event_names[num_configured_events]) - 1);
+            event_names[num_configured_events][sizeof(event_names[num_configured_events]) - 1] = '\0';
             num_configured_events++;
         }
         token = strtok(NULL, ",");
@@ -212,7 +211,8 @@ struct perf_handles perf_start() {
             return handles;
         }
         handles.event_fds[handles.num_events] = fd;
-        strncpy(handles.event_names[handles.num_events], event_names[i], 63);
+        strncpy(handles.event_names[handles.num_events], event_names[i], sizeof(handles.event_names[handles.num_events]) - 1);
+        handles.event_names[handles.num_events][sizeof(handles.event_names[handles.num_events]) - 1] = '\0';
         handles.num_events++;
     }
 
@@ -242,8 +242,8 @@ struct perf_values perf_read(struct perf_handles* handles) {
         if (bytes_read != sizeof(long long)) {
             values.values[i] = -1;
         }
-        strncpy(values.event_names[i], handles->event_names[i], 63);
-        values.event_names[i][63] = '\0';
+        strncpy(values.event_names[i], handles->event_names[i], sizeof(values.event_names[i]) - 1);
+        values.event_names[i][sizeof(values.event_names[i]) - 1] = '\0';
     }
 
     return values;
@@ -288,8 +288,8 @@ struct perf_values perf_stop(struct perf_handles* handles) {
         if (bytes_read != sizeof(long long)) {
             values.values[i] = -1;
         }
-        strncpy(values.event_names[i], handles->event_names[i], 63);
-        values.event_names[i][63] = '\0';
+        strncpy(values.event_names[i], handles->event_names[i], sizeof(values.event_names[i]) - 1);
+        values.event_names[i][sizeof(values.event_names[i]) - 1] = '\0';
     }
 
     // Close file descriptors
@@ -339,8 +339,8 @@ struct perf_values perf_delta(struct perf_values* start, struct perf_values* end
         } else {
             delta.values[i] = -1;
         }
-        strncpy(delta.event_names[i], start->event_names[i], 63);
-        delta.event_names[i][63] = '\0';
+        strncpy(delta.event_names[i], start->event_names[i], sizeof(delta.event_names[i]) - 1);
+        delta.event_names[i][sizeof(delta.event_names[i]) - 1] = '\0';
     }
 
     return delta;
