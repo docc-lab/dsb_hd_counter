@@ -12,12 +12,15 @@
 #include <errno.h>
 #include <sched.h>
 
+// Thread-local buffers for results
 _Thread_local static char result_buffer[2048];
-_Thread_local static int initialized_events = 0;
-_Thread_local static struct perf_event_attr event_attrs[MAX_PERF_EVENTS];
-_Thread_local static char event_names[MAX_PERF_EVENTS][64];
-_Thread_local static int num_configured_events = 0;
-_Thread_local static char global_config[256] = "";
+
+// Global (shared across threads) - configuration is set once at init
+static int initialized_events = 0;
+static struct perf_event_attr event_attrs[MAX_PERF_EVENTS];
+static char event_names[MAX_PERF_EVENTS][64];
+static int num_configured_events = 0;
+static char global_config[256] = "";
 
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
