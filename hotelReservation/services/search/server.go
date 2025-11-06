@@ -22,18 +22,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-/*
-#cgo CFLAGS: -I../perf
-#cgo LDFLAGS: -L../perf -lperf_api
-#include "../perf/perf_api.h"
-*/
-import "C"
-
-type PerfHandles struct {
-    LeaderFD       int
-    InstructionsFD int
-    L1MissesFD     int
-}
+// Removed CGO imports and PerfHandles - now using integrated timing+perf interceptor
 
 const name = "srv-search"
 
@@ -63,8 +52,14 @@ func (s *Server) Run() error {
 
 	s.uuid = uuid.New().String()
 
-	// Configure timing interceptor (can be controlled via environment variables)
+	// Configure timing + perf interceptor (can be controlled via environment variables)
 	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	enablePerf := os.Getenv("ENABLE_PERF") == "true"
+	perfEvents := os.Getenv("PERF_EVENTS")
+	if perfEvents == "" {
+		perfEvents = "basic" // Default to basic set
+	}
+
 	statsFile := os.Getenv("STATS_FILE")
 	if statsFile == "" {
 		statsFile = "timing_stats_search.json"
@@ -72,6 +67,8 @@ func (s *Server) Run() error {
 
 	timingConfig := interceptor.TimingConfig{
 		EnableTiming: enableTiming,
+		EnablePerf:   enablePerf,
+		PerfEvents:   perfEvents,
 		ServiceName:  name,
 		StatsFile:    statsFile,
 	}
@@ -88,13 +85,19 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		serverOpts.GetServerInterceptor(), // This includes both tracing and timing
+		serverOpts.GetServerInterceptor(), // This includes tracing, timing, and perf
 	}
 
 	if enableTiming {
 		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
 	} else {
 		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
+	}
+
+	if enablePerf {
+		log.Info().Str("service", name).Str("perf_events", perfEvents).Msg("Perf interceptor ENABLED")
+	} else {
+		log.Info().Str("service", name).Msg("Perf interceptor DISABLED")
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -184,10 +187,6 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
-	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
-	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
 	log.Trace().Msgf("nearby lon = %f", req.Lon)
@@ -225,11 +224,6 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		log.Trace().Msgf("get RatePlan HotelId = %s, Code = %s", ratePlan.HotelId, ratePlan.Code)
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
-		
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
-	}
- 
+
 	return res, nil
 }
