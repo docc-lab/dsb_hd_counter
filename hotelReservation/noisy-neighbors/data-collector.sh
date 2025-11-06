@@ -317,58 +317,62 @@ retrieve_perf_data_from_logs() {
     kubectl logs "$pod_name" | grep -E "perf_data_type.*request_timing_perf|perf_data_type.*request_perf|Perf counters" > "$perf_log_file" 2>/dev/null || true
     
     if [[ -s "$perf_log_file" ]]; then
-        log "$exp_dir" "Successfully extracted perf data: $perf_log_file"
+        log "$exp_dir" "Successfully extracted perf data: $perf_log_file ($(wc -l < "$perf_log_file") lines)"
         
         # Also create a JSON-formatted summary for easier processing
         local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
         
         # Extract perf events from log lines and create JSON
+        # Zerolog format: key=value pairs, not JSON
         {
             echo "["
             local first=true
             while IFS= read -r line; do
-                if [[ "$line" =~ \"service\":\"([^\"]+)\".*\"method\":\"([^\"]+)\" ]]; then
+                # Extract service and method from zerolog format (service=srv-search method=/search.Search/Nearby)
+                if [[ "$line" =~ service=([^[:space:]]+) ]]; then
+                    local svc="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ method=([^[:space:]]+) ]]; then
+                    local meth="${BASH_REMATCH[1]}"
+                fi
+                
+                # Look for perf_total or perf_execution fields
+                if [[ "$line" =~ perf_total=\{([^}]+)\} ]]; then
                     if [[ "$first" == "false" ]]; then
                         echo ","
                     fi
                     first=false
+                    
+                    local perf_total_str="${BASH_REMATCH[1]}"
+                    
+                    # Extract perf_execution if present
+                    local perf_exec_str=""
+                    if [[ "$line" =~ perf_execution=\{([^}]+)\} ]]; then
+                        perf_exec_str="${BASH_REMATCH[1]}"
+                    fi
+                    
+                    # Extract timing data
+                    local proc_time="0"
+                    local total_time="0"
+                    local block_time="0"
+                    if [[ "$line" =~ processing_time_ms=([0-9.]+) ]]; then
+                        proc_time="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ total_time_ms=([0-9.]+) ]]; then
+                        total_time="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$line" =~ blocking_time_ms=([0-9.]+) ]]; then
+                        block_time="${BASH_REMATCH[1]}"
+                    fi
+                    
                     echo "  {"
-                    echo "    \"service\": \"${BASH_REMATCH[1]}\","
-                    echo "    \"method\": \"${BASH_REMATCH[2]}\","
-                    
-                    # Extract perf event values (look for event names and values)
-                    local events_json=""
-                    if [[ "$line" =~ \"cycles\":([0-9]+) ]]; then
-                        events_json="${events_json}    \"cycles\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"instructions\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"instructions\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"l1_misses\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"l1_misses\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"cache_references\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"cache_references\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"cache_misses\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"cache_misses\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"context_switches\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"context_switches\": ${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ \"page_faults\":([0-9]+) ]]; then
-                        [[ -n "$events_json" ]] && events_json="${events_json},"
-                        events_json="${events_json}    \"page_faults\": ${BASH_REMATCH[1]}"
-                    fi
-                    
-                    echo "    \"events\": {"
-                    echo "$events_json"
-                    echo "    }"
+                    echo "    \"service\": \"${svc}\","
+                    echo "    \"method\": \"${meth}\","
+                    echo "    \"processing_time_ms\": ${proc_time},"
+                    echo "    \"total_time_ms\": ${total_time},"
+                    echo "    \"blocking_time_ms\": ${block_time},"
+                    echo "    \"perf_total\": {${perf_total_str}},"
+                    echo "    \"perf_execution\": {${perf_exec_str}}"
                     echo -n "  }"
                 fi
             done < "$perf_log_file"
