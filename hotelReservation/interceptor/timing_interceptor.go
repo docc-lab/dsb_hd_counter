@@ -279,8 +279,8 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 			Float64("total_time_ms", float64(totalTime.Nanoseconds())/1000000).
 			Float64("blocking_time_ms", float64(pausedTime.Nanoseconds())/1000000)
 		
-		// Add perf data if available
-		if config.EnablePerf && (len(timingData.PerfTotal) > 0 || len(timingData.PerfExecution) > 0) {
+		// Add perf data if perf is enabled (even if values are -1 or empty)
+		if config.EnablePerf {
 			logEvent = logEvent.
 				Interface("perf_total", timingData.PerfTotal).
 				Interface("perf_execution", timingData.PerfExecution).

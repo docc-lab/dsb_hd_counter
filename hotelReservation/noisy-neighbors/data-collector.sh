@@ -322,64 +322,36 @@ retrieve_perf_data_from_logs() {
         # Also create a JSON-formatted summary for easier processing
         local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
         
-        # Parse zerolog format logs into JSON using python
-        # Zerolog format: key=value pairs separated by spaces
-        python3 - "$perf_log_file" > "$perf_json_file" 2>/dev/null << 'PYTHON_SCRIPT'
-import re
-import json
-import sys
-
-log_file = sys.argv[1]
-entries = []
-
-with open(log_file, 'r') as f:
-    for line in f:
-        if 'perf_data_type' not in line:
-            continue
+        # Create simple CSV summary for easier analysis
+        local perf_csv_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.csv"
+        {
+            echo "service,method,processing_time_ms,total_time_ms,blocking_time_ms,perf_total,perf_execution"
+            while IFS= read -r line; do
+                if [[ "$line" =~ perf_data_type ]]; then
+                    local svc="${line#*service=}"; svc="${svc%% *}"
+                    local meth="${line#*method=}"; meth="${meth%% *}"
+                    local proc_time="${line#*processing_time_ms=}"; proc_time="${proc_time%% *}"
+                    local total_time="${line#*total_time_ms=}"; total_time="${total_time%% *}"
+                    local block_time="${line#*blocking_time_ms=}"; block_time="${block_time%% *}"
+                    
+                    # Extract perf_total and perf_execution (keep as JSON strings in CSV)
+                    local perf_total="{}"
+                    if [[ "$line" =~ perf_total=(\{[^}]+\}) ]]; then
+                        perf_total="${BASH_REMATCH[1]}"
+                    fi
+                    
+                    local perf_exec="{}"
+                    if [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
+                        perf_exec="${BASH_REMATCH[1]}"
+                    fi
+                    
+                    echo "${svc},${meth},${proc_time},${total_time},${block_time},\"${perf_total}\",\"${perf_exec}\""
+                fi
+            done < "$perf_log_file"
+        } > "$perf_csv_file"
         
-        entry = {}
-        
-        # Extract fields
-        m = re.search(r'service=(\S+)', line)
-        if m: entry['service'] = m.group(1)
-        
-        m = re.search(r'method=(\S+)', line)
-        if m: entry['method'] = m.group(1)
-        
-        m = re.search(r'processing_time_ms=([\d.]+)', line)
-        if m: entry['processing_time_ms'] = float(m.group(1))
-        
-        m = re.search(r'total_time_ms=([\d.]+)', line)
-        if m: entry['total_time_ms'] = float(m.group(1))
-        
-        m = re.search(r'blocking_time_ms=([\d.]+)', line)
-        if m: entry['blocking_time_ms'] = float(m.group(1))
-        
-        # Extract perf_total JSON object
-        m = re.search(r'perf_total=(\{[^}]+\})', line)
-        if m:
-            try:
-                entry['perf_total'] = json.loads(m.group(1))
-            except:
-                entry['perf_total'] = {}
-        
-        # Extract perf_execution JSON object
-        m = re.search(r'perf_execution=(\{[^}]*\})', line)
-        if m:
-            try:
-                entry['perf_execution'] = json.loads(m.group(1))
-            except:
-                entry['perf_execution'] = {}
-        else:
-            entry['perf_execution'] = {}
-        
-        if 'service' in entry and 'perf_total' in entry:
-            entries.append(entry)
-
-print(json.dumps(entries, indent=2))
-PYTHON_SCRIPT
-        
-        log "$exp_dir" "Created JSON summary: $perf_json_file"
+        log "$exp_dir" "Perf data available in: $perf_log_file ($(wc -l < "$perf_log_file") lines)"
+        log "$exp_dir" "CSV summary created: $perf_csv_file"
         
         return 0
     else
