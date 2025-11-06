@@ -322,42 +322,108 @@ retrieve_perf_data_from_logs() {
         # Also create a JSON-formatted summary for easier processing
         local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
         
-        # Parse zerolog format logs into JSON  
-        # Use awk for more reliable parsing
-        awk '
-        BEGIN {
-            print "["
-            first = 1
+        # Parse zerolog format logs into JSON using python (more reliable)
+        # Zerolog format: key=value pairs separated by spaces
+        python3 << 'PYTHON_SCRIPT' > "$perf_json_file" 2>/dev/null || \
+        {
+            # Fallback to simpler bash parsing if python fails
+            echo "["
+            local first=true
+            while IFS= read -r line; do
+                if [[ "$line" =~ perf_data_type ]]; then
+                    # Extract using parameter expansion - simpler and more reliable
+                    local svc="${line#*service=}"; svc="${svc%% *}"
+                    local meth="${line#*method=}"; meth="${meth%% *}"
+                    local proc_time="${line#*processing_time_ms=}"; proc_time="${proc_time%% *}"
+                    local total_time="${line#*total_time_ms=}"; total_time="${total_time%% *}"
+                    local block_time="${line#*blocking_time_ms=}"; block_time="${block_time%% *}"
+                    
+                    # Extract perf_total - between perf_total={ and } (including the braces)
+                    if [[ "$line" =~ perf_total=(\{[^}]+\}) ]]; then
+                        local perf_total="${BASH_REMATCH[1]}"
+                    else
+                        local perf_total="{}"
+                    fi
+                    
+                    # Extract perf_execution
+                    if [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
+                        local perf_exec="${BASH_REMATCH[1]}"
+                    else
+                        local perf_exec="{}"
+                    fi
+                    
+                    # Output if we have valid data
+                    if [[ -n "$svc" && "$perf_total" != "{}" ]]; then
+                        [[ "$first" == "false" ]] && echo ","
+                        first=false
+                        echo "  {"
+                        echo "    \"service\": \"${svc}\","
+                        echo "    \"method\": \"${meth}\","
+                        echo "    \"processing_time_ms\": ${proc_time:-0},"
+                        echo "    \"total_time_ms\": ${total_time:-0},"
+                        echo "    \"blocking_time_ms\": ${block_time:-0},"
+                        echo "    \"perf_total\": ${perf_total},"
+                        echo "    \"perf_execution\": ${perf_exec}"
+                        echo -n "  }"
+                    fi
+                fi
+            done < "$perf_log_file"
+            echo ""
+            echo "]"
         }
-        /perf_data_type/ {
-            # Extract fields
-            match($0, /service=([^[:space:]]+)/, arr); svc = arr[1]
-            match($0, /method=([^[:space:]]+)/, arr); meth = arr[1]
-            match($0, /processing_time_ms=([0-9.]+)/, arr); proc_time = arr[1]
-            match($0, /total_time_ms=([0-9.]+)/, arr); total_time = arr[1]
-            match($0, /blocking_time_ms=([0-9.]+)/, arr); block_time = arr[1]
-            match($0, /perf_total=(\{[^}]*\})/, arr); perf_total = arr[1]
-            match($0, /perf_execution=(\{[^}]*\})/, arr); perf_exec = arr[1]
-            
-            if (perf_total != "") {
-                if (first == 0) print ","
-                first = 0
-                printf "  {\n"
-                printf "    \"service\": \"%s\",\n", svc
-                printf "    \"method\": \"%s\",\n", meth
-                printf "    \"processing_time_ms\": %s,\n", proc_time
-                printf "    \"total_time_ms\": %s,\n", total_time
-                printf "    \"blocking_time_ms\": %s,\n", block_time
-                printf "    \"perf_total\": %s,\n", perf_total
-                printf "    \"perf_execution\": %s\n", (perf_exec != "" ? perf_exec : "{}")
-                printf "  }"
-            }
-        }
-        END {
-            print ""
-            print "]"
-        }
-        ' "$perf_log_file" > "$perf_json_file" 2>/dev/null || true
+import re
+import json
+import sys
+
+log_file = "${perf_log_file}"
+entries = []
+
+with open(log_file, 'r') as f:
+    for line in f:
+        if 'perf_data_type' not in line:
+            continue
+        
+        entry = {}
+        
+        # Extract fields
+        m = re.search(r'service=(\S+)', line)
+        if m: entry['service'] = m.group(1)
+        
+        m = re.search(r'method=(\S+)', line)
+        if m: entry['method'] = m.group(1)
+        
+        m = re.search(r'processing_time_ms=([\d.]+)', line)
+        if m: entry['processing_time_ms'] = float(m.group(1))
+        
+        m = re.search(r'total_time_ms=([\d.]+)', line)
+        if m: entry['total_time_ms'] = float(m.group(1))
+        
+        m = re.search(r'blocking_time_ms=([\d.]+)', line)
+        if m: entry['blocking_time_ms'] = float(m.group(1))
+        
+        # Extract perf_total JSON object
+        m = re.search(r'perf_total=(\{[^}]+\})', line)
+        if m:
+            try:
+                entry['perf_total'] = json.loads(m.group(1))
+            except:
+                entry['perf_total'] = {}
+        
+        # Extract perf_execution JSON object
+        m = re.search(r'perf_execution=(\{[^}]*\})', line)
+        if m:
+            try:
+                entry['perf_execution'] = json.loads(m.group(1))
+            except:
+                entry['perf_execution'] = {}
+        else:
+            entry['perf_execution'] = {}
+        
+        if 'service' in entry and 'perf_total' in entry:
+            entries.append(entry)
+
+print(json.dumps(entries, indent=2))
+PYTHON_SCRIPT
         
         log "$exp_dir" "Created JSON summary: $perf_json_file"
         
@@ -1947,6 +2013,18 @@ run_experiment() {
     
     # Deploy victim services
     deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
+    
+    # Configure perf_event_paranoid on target node for perf counter access
+    log "$exp_dir" "Configuring perf_event_paranoid on target node: $TARGET_NODE"
+    if ssh "$TARGET_NODE" "sudo sysctl -w kernel.perf_event_paranoid=-1" 2>/dev/null; then
+        log "$exp_dir" "Successfully set perf_event_paranoid=-1 on $TARGET_NODE"
+        # Verify
+        local paranoid_value=$(ssh "$TARGET_NODE" "cat /proc/sys/kernel/perf_event_paranoid" 2>/dev/null || echo "unknown")
+        log "$exp_dir" "Verified perf_event_paranoid=$paranoid_value on $TARGET_NODE"
+    else
+        log "$exp_dir" "WARNING: Failed to set perf_event_paranoid on $TARGET_NODE (perf counters may not work)"
+        log "$exp_dir" "  You may need to manually run: ssh $TARGET_NODE 'sudo sysctl -w kernel.perf_event_paranoid=-1'"
+    fi
     
     # Wait for services to stabilize after deployment
     log "$exp_dir" "Waiting for services to stabilize after deployment..."
