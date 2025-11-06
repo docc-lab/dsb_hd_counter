@@ -322,76 +322,42 @@ retrieve_perf_data_from_logs() {
         # Also create a JSON-formatted summary for easier processing
         local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
         
-        # Parse zerolog format logs into JSON
-        # Zerolog format example: service=srv-search method=/path perf_total={"key":value} perf_execution={}
-        {
-            echo "["
-            local first=true
-            while IFS= read -r line; do
-                # Check if line contains perf_data_type field
-                if [[ "$line" =~ perf_data_type ]]; then
-                    # Extract fields using pure bash regex (not grep -P which may not be available)
-                    local svc="unknown"
-                    local meth="unknown"
-                    local proc_time="0"
-                    local total_time="0"
-                    local block_time="0"
-                    local perf_total_str=""
-                    local perf_exec_str="{}"
-                    
-                    # Extract service
-                    if [[ "$line" =~ service=([^[:space:]]+) ]]; then
-                        svc="${BASH_REMATCH[1]}"
-                    fi
-                    
-                    # Extract method
-                    if [[ "$line" =~ method=([^[:space:]]+) ]]; then
-                        meth="${BASH_REMATCH[1]}"
-                    fi
-                    
-                    # Extract timing values
-                    if [[ "$line" =~ processing_time_ms=([0-9.]+) ]]; then
-                        proc_time="${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ total_time_ms=([0-9.]+) ]]; then
-                        total_time="${BASH_REMATCH[1]}"
-                    fi
-                    if [[ "$line" =~ blocking_time_ms=([0-9.]+) ]]; then
-                        block_time="${BASH_REMATCH[1]}"
-                    fi
-                    
-                    # Extract perf_total
-                    if [[ "$line" =~ perf_total=(\{[^}]*\}) ]]; then
-                        perf_total_str="${BASH_REMATCH[1]}"
-                    fi
-                    
-                    # Extract perf_execution
-                    if [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
-                        perf_exec_str="${BASH_REMATCH[1]}"
-                    fi
-                    
-                    # Only output if we have perf data
-                    if [[ -n "$perf_total_str" ]]; then
-                        if [[ "$first" == "false" ]]; then
-                            echo ","
-                        fi
-                        first=false
-                        
-                        echo "  {"
-                        echo "    \"service\": \"${svc}\","
-                        echo "    \"method\": \"${meth}\","
-                        echo "    \"processing_time_ms\": ${proc_time},"
-                        echo "    \"total_time_ms\": ${total_time},"
-                        echo "    \"blocking_time_ms\": ${block_time},"
-                        echo "    \"perf_total\": ${perf_total_str},"
-                        echo "    \"perf_execution\": ${perf_exec_str}"
-                        echo -n "  }"
-                    fi
-                fi
-            done < "$perf_log_file"
-            echo ""
-            echo "]"
-        } > "$perf_json_file" 2>/dev/null || true
+        # Parse zerolog format logs into JSON  
+        # Use awk for more reliable parsing
+        awk '
+        BEGIN {
+            print "["
+            first = 1
+        }
+        /perf_data_type/ {
+            # Extract fields
+            match($0, /service=([^[:space:]]+)/, arr); svc = arr[1]
+            match($0, /method=([^[:space:]]+)/, arr); meth = arr[1]
+            match($0, /processing_time_ms=([0-9.]+)/, arr); proc_time = arr[1]
+            match($0, /total_time_ms=([0-9.]+)/, arr); total_time = arr[1]
+            match($0, /blocking_time_ms=([0-9.]+)/, arr); block_time = arr[1]
+            match($0, /perf_total=(\{[^}]*\})/, arr); perf_total = arr[1]
+            match($0, /perf_execution=(\{[^}]*\})/, arr); perf_exec = arr[1]
+            
+            if (perf_total != "") {
+                if (first == 0) print ","
+                first = 0
+                printf "  {\n"
+                printf "    \"service\": \"%s\",\n", svc
+                printf "    \"method\": \"%s\",\n", meth
+                printf "    \"processing_time_ms\": %s,\n", proc_time
+                printf "    \"total_time_ms\": %s,\n", total_time
+                printf "    \"blocking_time_ms\": %s,\n", block_time
+                printf "    \"perf_total\": %s,\n", perf_total
+                printf "    \"perf_execution\": %s\n", (perf_exec != "" ? perf_exec : "{}")
+                printf "  }"
+            }
+        }
+        END {
+            print ""
+            print "]"
+        }
+        ' "$perf_log_file" > "$perf_json_file" 2>/dev/null || true
         
         log "$exp_dir" "Created JSON summary: $perf_json_file"
         
