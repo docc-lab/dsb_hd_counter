@@ -322,60 +322,14 @@ retrieve_perf_data_from_logs() {
         # Also create a JSON-formatted summary for easier processing
         local perf_json_file="$exp_dir/raw/perf/logs/${service}_perf_iter${iteration}.json"
         
-        # Parse zerolog format logs into JSON using python (more reliable)
+        # Parse zerolog format logs into JSON using python
         # Zerolog format: key=value pairs separated by spaces
-        python3 << 'PYTHON_SCRIPT' > "$perf_json_file" 2>/dev/null || \
-        {
-            # Fallback to simpler bash parsing if python fails
-            echo "["
-            local first=true
-            while IFS= read -r line; do
-                if [[ "$line" =~ perf_data_type ]]; then
-                    # Extract using parameter expansion - simpler and more reliable
-                    local svc="${line#*service=}"; svc="${svc%% *}"
-                    local meth="${line#*method=}"; meth="${meth%% *}"
-                    local proc_time="${line#*processing_time_ms=}"; proc_time="${proc_time%% *}"
-                    local total_time="${line#*total_time_ms=}"; total_time="${total_time%% *}"
-                    local block_time="${line#*blocking_time_ms=}"; block_time="${block_time%% *}"
-                    
-                    # Extract perf_total - between perf_total={ and } (including the braces)
-                    if [[ "$line" =~ perf_total=(\{[^}]+\}) ]]; then
-                        local perf_total="${BASH_REMATCH[1]}"
-                    else
-                        local perf_total="{}"
-                    fi
-                    
-                    # Extract perf_execution
-                    if [[ "$line" =~ perf_execution=(\{[^}]*\}) ]]; then
-                        local perf_exec="${BASH_REMATCH[1]}"
-                    else
-                        local perf_exec="{}"
-                    fi
-                    
-                    # Output if we have valid data
-                    if [[ -n "$svc" && "$perf_total" != "{}" ]]; then
-                        [[ "$first" == "false" ]] && echo ","
-                        first=false
-                        echo "  {"
-                        echo "    \"service\": \"${svc}\","
-                        echo "    \"method\": \"${meth}\","
-                        echo "    \"processing_time_ms\": ${proc_time:-0},"
-                        echo "    \"total_time_ms\": ${total_time:-0},"
-                        echo "    \"blocking_time_ms\": ${block_time:-0},"
-                        echo "    \"perf_total\": ${perf_total},"
-                        echo "    \"perf_execution\": ${perf_exec}"
-                        echo -n "  }"
-                    fi
-                fi
-            done < "$perf_log_file"
-            echo ""
-            echo "]"
-        }
+        python3 - "$perf_log_file" > "$perf_json_file" 2>/dev/null << 'PYTHON_SCRIPT'
 import re
 import json
 import sys
 
-log_file = "${perf_log_file}"
+log_file = sys.argv[1]
 entries = []
 
 with open(log_file, 'r') as f:
