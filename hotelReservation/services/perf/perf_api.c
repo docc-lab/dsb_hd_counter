@@ -181,15 +181,24 @@ struct perf_handles perf_start() {
     handles.num_events = 0;
 
     if (!initialized_events || num_configured_events == 0) {
+        fprintf(stderr, "perf_start: not initialized (initialized=%d, num_events=%d)\n", 
+                initialized_events, num_configured_events);
         return handles;
     }
 
     int cpu = sched_getcpu();
+    if (cpu < 0) {
+        fprintf(stderr, "perf_start: sched_getcpu() failed: %s\n", strerror(errno));
+        return handles;
+    }
 
     // First event is the leader
     if (num_configured_events > 0) {
         handles.leader_fd = perf_event_open(&event_attrs[0], 0, cpu, -1, PERF_FLAG_FD_CLOEXEC);
         if (handles.leader_fd == -1) {
+            // Log detailed error to stderr for debugging
+            fprintf(stderr, "perf_event_open failed for event '%s' on cpu %d: %s (errno=%d)\n", 
+                    event_names[0], cpu, strerror(errno), errno);
             return handles;
         }
         snprintf(handles.event_names[0], sizeof(handles.event_names[0]), "%s", event_names[0]);
