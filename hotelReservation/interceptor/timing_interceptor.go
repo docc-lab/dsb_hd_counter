@@ -16,9 +16,12 @@ import (
 
 // TimingConfig holds configuration for timing interceptor
 type TimingConfig struct {
-	EnableTiming bool
-	ServiceName  string
-	StatsFile    string // File to write aggregated statistics (optional)
+	EnableTiming       bool
+	ServiceName        string
+	StatsFile          string        // File to write aggregated statistics (optional - legacy mode)
+	EnableWindowed     bool          // Enable windowed batching mode
+	WindowInterval     time.Duration // Window interval for batching (e.g., 100ms)
+	WindowStatsChannel chan *WindowTimingStats // Channel to send window stats
 }
 
 // TimingData represents a single timing measurement
@@ -55,6 +58,22 @@ type DurationStats struct {
 	Count  int           `json:"count"`
 }
 
+// WindowTimingStats captures timing data for requests in one window interval
+type WindowTimingStats struct {
+	RequestCount   int                 `json:"request_count"`
+	ProcessingTime WindowDurationStats `json:"processing_time"`
+	TotalTime      WindowDurationStats `json:"total_time"`
+	BlockingTime   WindowDurationStats `json:"blocking_time"`
+}
+
+// WindowDurationStats provides stats for durations within one window
+type WindowDurationStats struct {
+	MinNs  int64 `json:"min_ns"`
+	MaxNs  int64 `json:"max_ns"`
+	MeanNs int64 `json:"mean_ns"`
+	Count  int   `json:"count"`
+}
+
 // LocalTimingAggregator handles in-memory timing data aggregation with periodic stats output
 type LocalTimingAggregator struct {
 	serviceName   string
@@ -63,16 +82,181 @@ type LocalTimingAggregator struct {
 	mu            sync.RWMutex
 	lastStatsTime time.Time
 	statsInterval time.Duration
+	
+	// Windowed mode fields
+	enableWindowed    bool
+	windowInterval    time.Duration
+	windowStatsChannel chan *WindowTimingStats
+	windowData        []TimingData
+	windowTicker      *time.Ticker
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 }
 
-// NewLocalTimingAggregator creates a new local aggregator instance
+// NewLocalTimingAggregator creates a new local aggregator instance (legacy mode)
 func NewLocalTimingAggregator(serviceName, statsFile string) *LocalTimingAggregator {
 	return &LocalTimingAggregator{
-		serviceName:   serviceName,
-		statsFile:     statsFile,
-		data:          make([]TimingData, 0),
-		lastStatsTime: time.Now(),
-		statsInterval: 30 * time.Second, // Write stats every 30 seconds
+		serviceName:    serviceName,
+		statsFile:      statsFile,
+		data:           make([]TimingData, 0),
+		lastStatsTime:  time.Now(),
+		statsInterval:  30 * time.Second, // Write stats every 30 seconds
+		enableWindowed: false,
+	}
+}
+
+// NewWindowedTimingAggregator creates a new aggregator for windowed sampling mode
+func NewWindowedTimingAggregator(config TimingConfig) *LocalTimingAggregator {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	agg := &LocalTimingAggregator{
+		serviceName:        config.ServiceName,
+		statsFile:          config.StatsFile,
+		data:               make([]TimingData, 0),
+		lastStatsTime:      time.Now(),
+		statsInterval:      config.WindowInterval,
+		enableWindowed:     config.EnableWindowed,
+		windowInterval:     config.WindowInterval,
+		windowStatsChannel: config.WindowStatsChannel,
+		windowData:         make([]TimingData, 0),
+		ctx:                ctx,
+		cancel:             cancel,
+	}
+	
+	// Start windowed flushing loop
+	if agg.enableWindowed && agg.windowStatsChannel != nil {
+		agg.wg.Add(1)
+		go agg.windowedFlushLoop()
+		
+		log.Info().
+			Str("service", config.ServiceName).
+			Dur("window_interval", config.WindowInterval).
+			Msg("Started windowed timing aggregator")
+	}
+	
+	return agg
+}
+
+// Stop stops the windowed aggregator
+func (lta *LocalTimingAggregator) Stop() {
+	if lta.enableWindowed && lta.cancel != nil {
+		lta.cancel()
+		lta.wg.Wait()
+		log.Info().Str("service", lta.serviceName).Msg("Stopped windowed timing aggregator")
+	}
+}
+
+// windowedFlushLoop periodically flushes window stats
+func (lta *LocalTimingAggregator) windowedFlushLoop() {
+	defer lta.wg.Done()
+	
+	lta.windowTicker = time.NewTicker(lta.windowInterval)
+	defer lta.windowTicker.Stop()
+	
+	for {
+		select {
+		case <-lta.windowTicker.C:
+			lta.flushWindow()
+			
+		case <-lta.ctx.Done():
+			lta.flushWindow() // Final flush
+			return
+		}
+	}
+}
+
+// flushWindow flushes current window data and sends aggregated stats
+// This is called periodically by windowedFlushLoop goroutine (single writer)
+// LOCK: Briefly locks to atomically copy and clear buffer
+func (lta *LocalTimingAggregator) flushWindow() {
+	lta.mu.Lock()   // ACQUIRE LOCK - need exclusive access to buffer
+	
+	// Get snapshot of ALL requests completed during this window
+	// This includes timing data from potentially hundreds of concurrent requests
+	windowData := make([]TimingData, len(lta.windowData))
+	copy(windowData, lta.windowData)
+	
+	// Clear window data buffer for next window
+	lta.windowData = make([]TimingData, 0)
+	
+	lta.mu.Unlock()  // RELEASE LOCK - minimize lock hold time
+	
+	// AGGREGATE: Calculate window statistics OUTSIDE the lock
+	// This processes all requests completed in the last WINDOW_INTERVAL
+	stats := lta.calculateWindowStats(windowData)
+	
+	// Send aggregated stats to windowed sampler (non-blocking)
+	if lta.windowStatsChannel != nil {
+		select {
+		case lta.windowStatsChannel <- stats:
+			// Sent successfully - sampler will combine with perf counters
+			log.Debug().
+				Str("service", lta.serviceName).
+				Int("request_count", stats.RequestCount).
+				Int64("mean_processing_ns", stats.ProcessingTime.MeanNs).
+				Msg("Flushed window stats")
+		default:
+			// Channel full - drop this window's stats to avoid blocking
+			log.Warn().
+				Str("service", lta.serviceName).
+				Int("request_count", stats.RequestCount).
+				Msg("Window stats channel full, dropping window stats")
+		}
+	}
+}
+
+// calculateWindowStats calculates statistics for one window
+func (lta *LocalTimingAggregator) calculateWindowStats(data []TimingData) *WindowTimingStats {
+	if len(data) == 0 {
+		return &WindowTimingStats{RequestCount: 0}
+	}
+	
+	processingTimes := make([]time.Duration, len(data))
+	totalTimes := make([]time.Duration, len(data))
+	blockingTimes := make([]time.Duration, len(data))
+	
+	for i, td := range data {
+		processingTimes[i] = td.ProcessingTime
+		totalTimes[i] = td.TotalTime
+		blockingTimes[i] = td.BlockingTime
+	}
+	
+	return &WindowTimingStats{
+		RequestCount:   len(data),
+		ProcessingTime: calculateWindowDurationStats(processingTimes),
+		TotalTime:      calculateWindowDurationStats(totalTimes),
+		BlockingTime:   calculateWindowDurationStats(blockingTimes),
+	}
+}
+
+// calculateWindowDurationStats calculates statistics for a slice of durations
+func calculateWindowDurationStats(durations []time.Duration) WindowDurationStats {
+	if len(durations) == 0 {
+		return WindowDurationStats{}
+	}
+	
+	var sum time.Duration
+	min := durations[0]
+	max := durations[0]
+	
+	for _, d := range durations {
+		sum += d
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+	}
+	
+	mean := sum / time.Duration(len(durations))
+	
+	return WindowDurationStats{
+		MinNs:  min.Nanoseconds(),
+		MaxNs:  max.Nanoseconds(),
+		MeanNs: mean.Nanoseconds(),
+		Count:  len(durations),
 	}
 }
 
@@ -96,7 +280,7 @@ type timingContext struct {
 	totalCallCount    int32  // atomic - total number of downstream calls made
 }
 
-// TimingServerInterceptor creates a server-side unary interceptor with local timing functionality
+// TimingServerInterceptor creates a server-side unary interceptor with local timing functionality (legacy mode)
 func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 	if !config.EnableTiming {
 		// Return a no-op interceptor if timing is disabled
@@ -105,16 +289,29 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		}
 	}
 
-	// Initialize local aggregator
-	aggregator := NewLocalTimingAggregator(config.ServiceName, config.StatsFile)
+	// Initialize local aggregator (legacy mode)
+	var aggregator *LocalTimingAggregator
+	if config.EnableWindowed {
+		// Windowed mode - use provided channel
+		aggregator = NewWindowedTimingAggregator(config)
+	} else {
+		// Legacy mode - create simple aggregator
+		aggregator = NewLocalTimingAggregator(config.ServiceName, config.StatsFile)
+	}
 
+	return TimingServerInterceptorWithAggregator(aggregator, config.ServiceName)
+}
+
+// TimingServerInterceptorWithAggregator creates interceptor using a provided aggregator
+// This allows sharing the aggregator across all requests for proper windowed batching
+func TimingServerInterceptorWithAggregator(aggregator *LocalTimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		// Record timestamp when new gRPC call arrives
+		// START TIMER: Record timestamp when new gRPC call arrives
 		arrivalTime := time.Now()
 		
 		// Initialize timing data in context
 		timingData := &TimingData{
-			ServiceName: config.ServiceName,
+			ServiceName: serviceName,
 			Method:      info.FullMethod,
 			ArrivalTime: arrivalTime,
 			Timestamp:   arrivalTime,
@@ -132,15 +329,16 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		ctx = context.WithValue(ctx, timingDataKey, timingData)
 		ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
 
-		log.Info().
+		log.Debug().
 			Str("method", info.FullMethod).
-			Str("service", config.ServiceName).
+			Str("service", serviceName).
 			Time("arrival_time", arrivalTime).
-			Float64("blocking_time_ms", 0.0). // Add field for log collection filter
-			Msg("gRPC call arrived")
+			Msg("gRPC request started")
 
-		// Call the actual handler
+		// Call the actual handler (may call client interceptor which pauses/resumes timer)
 		resp, err := handler(ctx, req)
+		
+		// STOP TIMER: Response is about to be sent back
 		processingEnd := time.Now()
 
 		// Calculate timing metrics
@@ -150,34 +348,33 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 		pausedTimeNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
 		pausedTime := time.Duration(pausedTimeNs)
 		blockingCount := atomic.LoadInt32(&timingCtx.totalCallCount)
-		activeCount := atomic.LoadInt32(&timingCtx.activeCallCount)
 		
 		processingTime := totalTime - pausedTime
 
-		// Update timing data
+		// Update timing data with final values
 		timingData.TotalTime = totalTime
 		timingData.ProcessingTime = processingTime
 		timingData.BlockingTime = pausedTime
 
 		// Log detailed timing information for this request
-		log.Info().
+		log.Debug().
 			Str("method", info.FullMethod).
-			Str("service", config.ServiceName).
+			Str("service", serviceName).
 			Int32("downstream_calls", blockingCount).
-			Int32("active_calls_at_end", activeCount).
 			Dur("total_time", totalTime).
 			Dur("processing_time", processingTime).
 			Dur("blocking_time", pausedTime).
 			Float64("processing_time_ms", float64(processingTime.Nanoseconds())/1000000).
 			Float64("total_time_ms", float64(totalTime.Nanoseconds())/1000000).
 			Float64("blocking_time_ms", float64(pausedTime.Nanoseconds())/1000000).
-			Msg("gRPC call completed")
+			Msg("gRPC request completed")
 
-		// Add timing data to in-memory aggregator
+		// ADD TO WINDOW BUFFER: Add completed timing data to aggregator
+		// This goes into the window data buffer and will be aggregated with other concurrent requests
 		aggregator.AddTimingData(*timingData)
 
-		// Periodically write stats to file (non-blocking)
-		if config.StatsFile != "" {
+		// Legacy mode: periodically write stats to file (non-blocking)
+		if !aggregator.enableWindowed && aggregator.statsFile != "" {
 			go aggregator.MaybeWriteStats()
 		}
 
@@ -186,11 +383,12 @@ func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
 }
 
 // TimingClientInterceptor creates a client-side unary interceptor that pauses timing during blocking calls
-// Uses lock-free atomic operations with a stack-based approach:
+// Uses LOCK-FREE atomic operations with a stack-based approach:
 // - Push (increment counter) when making a call
 // - Pop (decrement counter) when receiving response
 // - Empty stack (counter=0) means service is processing (not blocked)
 // - Non-empty stack (counter>0) means service is blocked
+// NO LOCKS: All operations use atomic instructions for thread-safety
 func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		// Check if we have timing context (meaning timing is enabled)
@@ -202,47 +400,45 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}
 
-		// PUSH onto call stack (lock-free atomic increment)
+		// PAUSE TIMER: Push onto call stack (LOCK-FREE atomic increment)
 		// If this is the first call (0→1), we transition to blocking state
 		oldCount := atomic.AddInt32(&timingCtx.activeCallCount, 1) - 1
 		currentCount := oldCount + 1
 		
 		if oldCount == 0 {
-			// Stack was empty, now has 1 item - START blocking period
+			// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
 			pauseStartNs := time.Now().UnixNano()
 			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
 			
-			log.Info().
+			log.Debug().
 				Str("outgoing_method", method).
 				Str("parent_service", timingData.ServiceName).
 				Str("parent_method", timingData.Method).
 				Int32("stack_depth", currentCount).
-				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
-				Msg("Starting downstream call - PAUSING parent timer (stack 0→1)")
+				Msg("PAUSE TIMER - Starting downstream call (stack 0→1)")
 		} else {
-			log.Info().
+			log.Debug().
 				Str("outgoing_method", method).
 				Str("parent_service", timingData.ServiceName).
 				Str("parent_method", timingData.Method).
 				Int32("stack_depth", currentCount).
-				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
-				Msg("Starting downstream call - already blocked (stack depth increased)")
+				Msg("Nested downstream call - already paused (stack depth increased)")
 		}
 		
-		// Increment total call counter
+		// Increment total call counter (LOCK-FREE atomic)
 		atomic.AddInt32(&timingCtx.totalCallCount, 1)
 		
-		// Make the actual call (this is the blocking part)
+		// Make the actual downstream call (THIS IS THE BLOCKING PART)
 		callStart := time.Now()
 		err := invoker(ctx, method, req, reply, cc, opts...)
 		callDuration := time.Since(callStart)
 		
-		// POP from call stack (lock-free atomic decrement)
-		// If this was the last call (1→0), we transition to processing state
+		// RESUME TIMER: Pop from call stack (LOCK-FREE atomic decrement)
+		// If this was the last call (1→0), we transition back to processing state
 		newCount := atomic.AddInt32(&timingCtx.activeCallCount, -1)
 		
 		if newCount == 0 {
-			// Stack is now empty - END blocking period and accumulate time
+			// Stack is now empty - END blocking period and accumulate time (RESUME TIMER)
 			pauseStartNs := atomic.LoadInt64(&timingCtx.pauseStartTimeNs)
 			if pauseStartNs > 0 {
 				blockingDurationNs := time.Now().UnixNano() - pauseStartNs
@@ -251,30 +447,28 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 				
 				totalPausedNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
 				
-				log.Info().
+				log.Debug().
 					Str("outgoing_method", method).
 					Str("parent_service", timingData.ServiceName).
 					Str("parent_method", timingData.Method).
 					Int32("stack_depth", newCount).
 					Dur("this_call_duration", callDuration).
-					Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
 					Float64("blocking_period_ms", float64(blockingDurationNs)/1000000).
 					Float64("total_paused_ms", float64(totalPausedNs)/1000000).
-					Float64("blocking_time_ms", float64(totalPausedNs)/1000000). // Add field for log collection filter
-					Msg("Downstream call completed - RESUMING parent timer (stack 1→0)")
+					Msg("RESUME TIMER - Downstream call completed (stack 1→0)")
 			}
 		} else {
-			log.Info().
+			log.Debug().
 				Str("outgoing_method", method).
 				Str("parent_service", timingData.ServiceName).
 				Str("parent_method", timingData.Method).
 				Int32("stack_depth", newCount).
 				Dur("this_call_duration", callDuration).
-				Float64("this_call_duration_ms", float64(callDuration.Nanoseconds())/1000000).
-				Float64("blocking_time_ms", 0.0). // Add field for log collection filter
-				Msg("Downstream call completed - still blocked (stack depth decreased)")
+				Msg("Nested downstream call completed - still paused (stack depth decreased)")
 		}
 		
+		// Return back to service handler
+		// Server interceptor will STOP TIMER when response is sent
 		return err
 	}
 }
@@ -310,16 +504,27 @@ func ChainUnaryClientInterceptors(interceptors ...grpc.UnaryClientInterceptor) g
 }
 
 // AddTimingData adds timing data to the in-memory aggregator
+// This is called by MANY concurrent gRPC requests, so it needs to be thread-safe
+// LOCK: Uses sync.RWMutex to protect concurrent writes to the buffer
 func (lta *LocalTimingAggregator) AddTimingData(data TimingData) {
-	lta.mu.Lock()
+	lta.mu.Lock()   // ACQUIRE LOCK - protects buffer from concurrent writes
 	defer lta.mu.Unlock()
 	
+	// Add to overall data for legacy stats
 	lta.data = append(lta.data, data)
 	
 	// Keep only last 10000 entries to prevent memory issues
 	if len(lta.data) > 10000 {
 		lta.data = lta.data[len(lta.data)-10000:]
 	}
+	
+	// WINDOW BUFFER: Add to window data if windowed mode is enabled
+	// This buffer accumulates all requests completed during the current window
+	// Will be flushed and aggregated every WINDOW_INTERVAL (e.g., 100ms)
+	if lta.enableWindowed {
+		lta.windowData = append(lta.windowData, data)
+	}
+	// RELEASE LOCK - lock held for minimal time (just array append)
 }
 
 // MaybeWriteStats writes statistics to file if enough time has passed
