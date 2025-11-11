@@ -358,18 +358,46 @@ retrieve_windowed_run_data() {
     local run_file="/data/run_data_${service}_iter${iteration}.json"
     if kubectl exec "$pod_name" -- test -f "$run_file" 2>/dev/null; then
         log "$exp_dir" "  Retrieving run data: $run_file"
-        kubectl exec "$pod_name" -- cat "$run_file" > "$output_dir/run_data_iter${iteration}.json" 2>/dev/null
+        kubectl exec "$pod_name" -- cat "$run_file" > "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null
         
-        if [[ -s "$output_dir/run_data_iter${iteration}.json" ]]; then
-            # Extract sample count from file using jq if available, otherwise grep
-            local sample_count="unknown"
+        if [[ -s "$output_dir/run_data_iter${iteration}_raw.json" ]]; then
+            # Filter to keep only samples with non-zero timing data
             if command -v jq >/dev/null 2>&1; then
-                sample_count=$(jq -r '.sample_count // "unknown"' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
+                log "$exp_dir" "  Filtering samples with timing data using jq"
+                
+                jq '{
+                    service_name,
+                    iteration_id,
+                    run_start,
+                    run_end,
+                    run_duration_ms,
+                    window_interval_ms,
+                    perf_events,
+                    samples: [.samples[] | select(
+                        .timing_window.processing_time.count > 0 or 
+                        .timing_window.total_time.count > 0 or 
+                        .timing_window.blocking_time.count > 0
+                    )],
+                    sample_count: ([.samples[] | select(
+                        .timing_window.processing_time.count > 0 or 
+                        .timing_window.total_time.count > 0 or 
+                        .timing_window.blocking_time.count > 0
+                    )] | length),
+                    aggregates: .aggregates
+                }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                
+                local total_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
+                local filtered_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
+                
+                log "$exp_dir" "  Filtered: $filtered_samples/$total_samples samples contain timing data"
             else
-                sample_count=$(grep -o '"sample_count":[^,}]*' "$output_dir/run_data_iter${iteration}.json" | cut -d':' -f2 | tr -d ' ' || echo "unknown")
+                # No jq available, just copy raw file
+                log "$exp_dir" "  WARNING: jq not available, skipping filter (keeping all samples)"
+                cp "$output_dir/run_data_iter${iteration}_raw.json" "$output_dir/run_data_iter${iteration}.json"
+                filtered_samples=$(grep -o '"sample_count":[^,}]*' "$output_dir/run_data_iter${iteration}.json" | cut -d':' -f2 | tr -d ' ' || echo "unknown")
             fi
             
-            log "$exp_dir" "  Successfully retrieved run data with $sample_count samples"
+            log "$exp_dir" "  Successfully retrieved and filtered run data with $filtered_samples samples"
             
             # Also get logs with timing and perf information
             local log_file="$output_dir/service_logs_iter${iteration}.txt"
@@ -2159,7 +2187,7 @@ main() {
     # Optional: sync to remote server (if 4th argument provided)
     if [[ -n "$4" ]]; then
         log "$exp_dir" "Syncing data to remote server..."
-        rsync -av "./$exp_dir" "$4"@homework.eecs.tufts.edu:/r/tcal/work/contention/ || \
+        rsync -av "./$exp_dir" "$4"@linux.eecs.tufts.edu:/r/docclab_traces/contention_exp_data/"$exp_dir" || \
             log "$exp_dir" "WARNING: Failed to sync data to remote server"
     fi
     

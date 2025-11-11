@@ -168,8 +168,8 @@ func (s *Server) initRateClient(name string) error {
 }
 
 func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
-	// Check if timing is enabled to decide which interceptor to use
-	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+	// Check if timing is enabled (either basic timing or windowed sampling)
+	enableTiming := os.Getenv("ENABLE_TIMING") == "true" || os.Getenv("ENABLE_WINDOWED_SAMPLING") == "true"
 	
 	if s.KnativeDns != "" {
 		if enableTiming {

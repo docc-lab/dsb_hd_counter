@@ -295,7 +295,10 @@ func (ws *windowedSampler) readPerfCounters() (map[string]uint64, map[string]uin
 	)
 	
 	if result != 0 {
-		log.Error().Msg("Failed to read perf counters")
+		log.Error().
+			Int("result_code", int(result)).
+			Str("service", ws.config.ServiceName).
+			Msg("Failed to read perf counters via CGO")
 		return counters, deltas
 	}
 	
