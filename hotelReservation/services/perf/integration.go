@@ -11,7 +11,7 @@ import (
 	"time"
 	
 	"github.com/rs/zerolog/log"
-	"myapp/interceptor"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/interceptor"
 )
 
 // ParseWindowedSamplingConfig parses configuration from environment variables
