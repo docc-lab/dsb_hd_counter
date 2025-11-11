@@ -100,6 +100,8 @@ type windowedSampler struct {
 	cancel         context.CancelFunc
 	mu             sync.Mutex
 	wg             sync.WaitGroup
+	sampleFile     *os.File // For streaming samples to file
+	streamMode     bool     // If true, append each sample immediately
 }
 
 // NewWindowedSampler creates a new windowed sampler instance
@@ -118,6 +120,9 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 	if ws.timingChan == nil {
 		ws.timingChan = make(chan *interceptor.WindowTimingStats, 100)
 	}
+	
+	// Enable stream mode for long-running sampling (>1 hour)
+	ws.streamMode = config.RunDuration > time.Hour
 	
 	// Create context with timeout
 	ws.ctx, ws.cancel = context.WithTimeout(ctx, config.RunDuration)
@@ -146,13 +151,60 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 		Dur("window_interval", config.WindowInterval).
 		Strs("perf_events", config.PerfEvents).
 		Int("expected_samples", int(config.RunDuration/config.WindowInterval)).
+		Bool("stream_mode", ws.streamMode).
 		Msg("Started windowed sampling")
 	
 	// Start sampling loop
 	ws.wg.Add(1)
 	go ws.samplingLoop()
 	
+	// Start periodic file flush for stream mode
+	if ws.streamMode {
+		ws.wg.Add(1)
+		go ws.periodicFlushLoop()
+	}
+	
 	return nil
+}
+
+// periodicFlushLoop writes samples to disk periodically in stream mode
+func (ws *windowedSampler) periodicFlushLoop() {
+	defer ws.wg.Done()
+	
+	flushTicker := time.NewTicker(30 * time.Second) // Flush every 30s
+	defer flushTicker.Stop()
+	
+	for {
+		select {
+		case <-flushTicker.C:
+			ws.mu.Lock()
+			if len(ws.samples) > 0 {
+				runData := &RunData{
+					ServiceName:    ws.config.ServiceName,
+					IterationID:    ws.config.IterationID,
+					RunStart:       ws.runStartTime,
+					RunEnd:         time.Now(),
+					RunDurationMs:  time.Since(ws.runStartTime).Milliseconds(),
+					WindowInterval: ws.config.WindowInterval.Milliseconds(),
+					SampleCount:    len(ws.samples),
+					PerfEvents:     ws.config.PerfEvents,
+					Samples:        ws.samples,
+					Aggregates:     ws.calculateAggregates(),
+				}
+				if err := ws.writeRunData(runData); err != nil {
+					log.Error().Err(err).Msg("Periodic flush failed")
+				} else {
+					log.Info().
+						Int("samples_written", len(ws.samples)).
+						Msg("Periodic flush: wrote samples to file")
+				}
+			}
+			ws.mu.Unlock()
+			
+		case <-ws.ctx.Done():
+			return
+		}
+	}
 }
 
 // samplingLoop runs the periodic sampling

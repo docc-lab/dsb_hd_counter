@@ -72,14 +72,26 @@ func main() {
 			Int("iteration", iterationID).
 			Msg("Starting search service with windowed sampling")
 
-		// Setup continuous windowed sampling (runs indefinitely)
-		// Note: sampling continues for entire pod lifetime, data-collector extracts relevant time windows
+		// Setup continuous windowed sampling (runs for 24h, writes periodically)
 		sampler, timingAgg, _, err := perf.SetupContinuousSampling("search", iterationID)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to setup continuous sampling")
 		}
-		defer timingAgg.Stop()
-		defer sampler.Stop()
+		
+		// Cleanup handlers (will run when pod terminates)
+		defer func() {
+			log.Info().Msg("Pod terminating, stopping sampler")
+			runData, err := sampler.StopRun()
+			if err != nil {
+				log.Error().Err(err).Msg("Error stopping sampler")
+			} else if runData != nil {
+				log.Info().
+					Int("sample_count", runData.SampleCount).
+					Int("total_requests", runData.Aggregates.TotalRequests).
+					Msg("Sampling stopped on termination")
+			}
+			timingAgg.Stop()
+		}()
 		
 		srv := &search.Server{
 			Tracer:           tracer,
