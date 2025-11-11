@@ -24,6 +24,8 @@ import (
 type WindowedSampler interface {
 	StartRun(ctx context.Context, config RunConfig) error
 	StopRun() (*RunData, error)
+	Start(ctx context.Context) error // For continuous mode
+	Stop() error                      // For continuous mode
 	GetCurrentSample() *Sample
 }
 
@@ -264,6 +266,27 @@ func (ws *windowedSampler) GetCurrentSample() *Sample {
 		return nil
 	}
 	return &ws.samples[len(ws.samples)-1]
+}
+
+// Start is an alias for StartRun (for continuous mode compatibility)
+func (ws *windowedSampler) Start(ctx context.Context) error {
+	// For continuous mode, use a very long duration
+	config := RunConfig{
+		ServiceName:        "search",
+		IterationID:        1,
+		RunDuration:        24 * time.Hour,
+		WindowInterval:     100 * time.Millisecond,
+		PerfEvents:         []string{"cycles", "instructions", "cache-misses"},
+		OutputDir:          "/data",
+		TimingStatsChannel: ws.timingChan,
+	}
+	return ws.StartRun(ctx, config)
+}
+
+// Stop is an alias for StopRun (for continuous mode compatibility)
+func (ws *windowedSampler) Stop() error {
+	_, err := ws.StopRun()
+	return err
 }
 
 // StopRun stops sampling and returns aggregated run data

@@ -73,17 +73,14 @@ func main() {
 			Int("iteration", iterationID).
 			Msg("Starting search service with windowed sampling")
 
-		// Setup windowed sampling (perf counters + timing aggregator)
-		sampler, timingAgg, _, err := perf.SetupWindowedSampling("search", iterationID)
+		// Setup continuous windowed sampling (runs indefinitely)
+		// Note: sampling continues for entire pod lifetime, data-collector extracts relevant time windows
+		sampler, timingAgg, _, err := perf.SetupContinuousSampling("search", iterationID)
 		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to setup windowed sampling")
+			log.Fatal().Err(err).Msg("Failed to setup continuous sampling")
 		}
-		
-		// Parse experiment duration
-		experimentDuration, _ := strconv.Atoi(os.Getenv("EXPERIMENT_DURATION"))
-		if experimentDuration == 0 {
-			experimentDuration = 30 // default 30 seconds
-		}
+		defer timingAgg.Stop()
+		defer sampler.Stop()
 		
 		srv := &search.Server{
 			Tracer:           tracer,
@@ -95,35 +92,7 @@ func main() {
 			TimingAggregator: timingAgg,
 		}
 
-		log.Info().
-			Dur("experiment_duration", time.Duration(experimentDuration)*time.Second).
-			Msg("Starting server with windowed sampling...")
-		
-		// Start shutdown timer - stops sampling after experiment duration
-		go func() {
-			shutdownDelay := time.Duration(experimentDuration+5) * time.Second // Add 5s buffer
-			log.Info().Dur("shutdown_in", shutdownDelay).Msg("Will stop sampling after experiment completes")
-			time.Sleep(shutdownDelay)
-			
-			log.Info().Msg("Experiment duration elapsed, stopping windowed sampler")
-			
-			// Stop windowed sampler and write data
-			runData, err := sampler.StopRun()
-			if err != nil {
-				log.Error().Err(err).Msg("Error stopping sampler")
-			} else if runData != nil {
-				log.Info().
-					Int("sample_count", runData.SampleCount).
-					Int("total_requests", runData.Aggregates.TotalRequests).
-					Str("output_file", fmt.Sprintf("/data/run_data_search_iter%d.json", iterationID)).
-					Msg("Windowed sampling completed and data written")
-			}
-			
-			// Stop timing aggregator
-			timingAgg.Stop()
-			
-			log.Info().Msg("Sampling stopped, server continues running for data retrieval")
-		}()
+		log.Info().Msg("Starting server with continuous windowed sampling...")
 		
 		// Start server (blocks until shutdown)
 		if err := srv.Run(); err != nil {

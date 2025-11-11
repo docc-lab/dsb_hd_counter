@@ -112,3 +112,70 @@ func SetupWindowedSampling(serviceName string, iterationID int) (WindowedSampler
 	return sampler, timingAgg, timingStatsChannel, nil
 }
 
+// SetupContinuousSampling initializes continuous windowed sampling (runs indefinitely until pod termination)
+// Samples are appended to file continuously, data-collector extracts relevant time windows later
+func SetupContinuousSampling(serviceName string, iterationID int) (WindowedSampler, interceptor.TimingAggregator, chan *interceptor.WindowTimingStats, error) {
+	// Parse window interval
+	windowIntervalMs, _ := strconv.Atoi(os.Getenv("WINDOW_INTERVAL_MS"))
+	if windowIntervalMs == 0 {
+		windowIntervalMs = 100
+	}
+	
+	// Parse perf events
+	perfEventsStr := os.Getenv("PERF_EVENTS")
+	if perfEventsStr == "" {
+		perfEventsStr = "cycles,instructions,cache-misses"
+	}
+	perfEvents := strings.Split(perfEventsStr, ",")
+	for i := range perfEvents {
+		perfEvents[i] = strings.TrimSpace(perfEvents[i])
+	}
+	
+	// Output directory
+	outputDir := os.Getenv("OUTPUT_DIR")
+	if outputDir == "" {
+		outputDir = "/data"
+	}
+	
+	// Create timing stats channel
+	timingStatsChannel := make(chan *interceptor.WindowTimingStats, 100)
+	
+	// Create config for very long run (24 hours - effectively continuous)
+	config := &RunConfig{
+		ServiceName:        serviceName,
+		IterationID:        iterationID,
+		RunDuration:        24 * time.Hour, // Continuous until pod stops
+		WindowInterval:     time.Duration(windowIntervalMs) * time.Millisecond,
+		PerfEvents:         perfEvents,
+		OutputDir:          outputDir,
+		TimingStatsChannel: timingStatsChannel,
+	}
+	
+	// Create timing aggregator
+	timingConfig := interceptor.TimingConfig{
+		EnableTiming:       true,
+		ServiceName:        serviceName,
+		EnableWindowed:     true,
+		WindowInterval:     config.WindowInterval,
+		WindowStatsChannel: timingStatsChannel,
+	}
+	timingAgg := interceptor.NewRingBufferTimingAggregator(timingConfig)
+	
+	// Create and start sampler
+	sampler := NewWindowedSampler()
+	ctx := context.Background()
+	if err := sampler.StartRun(ctx, *config); err != nil {
+		return nil, nil, nil, err
+	}
+	
+	log.Info().
+		Str("service", serviceName).
+		Int("iteration", iterationID).
+		Dur("window_interval", config.WindowInterval).
+		Strs("perf_events", config.PerfEvents).
+		Str("mode", "continuous_24h").
+		Msg("Continuous windowed sampling initialized")
+	
+	return sampler, timingAgg, timingStatsChannel, nil
+}
+
