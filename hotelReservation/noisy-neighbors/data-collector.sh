@@ -12,19 +12,19 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
 TIMING_REGISTRY="royno7"
-TIMING_IMAGE_PREFIX="service-withtimer"
-TIMING_TAG="v1-withtimer"
+WINDOWED_IMAGE_SUFFIX="windowed"
+WINDOWED_TAG="v1-windowed"
 
-# Valid services for timing integration and their timing-enabled images
+# Valid services for windowed sampling and their images
 declare -A TIMING_IMAGES=(
-    ["user"]="${TIMING_REGISTRY}/user-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["frontend"]="${TIMING_REGISTRY}/frontend-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["search"]="${TIMING_REGISTRY}/search-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["profile"]="${TIMING_REGISTRY}/profile-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["rate"]="${TIMING_REGISTRY}/rate-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["recommendation"]="${TIMING_REGISTRY}/recommendation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["reservation"]="${TIMING_REGISTRY}/reservation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["geo"]="${TIMING_REGISTRY}/geo-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
+    ["user"]="${TIMING_REGISTRY}/user-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["frontend"]="${TIMING_REGISTRY}/frontend-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["search"]="${TIMING_REGISTRY}/search-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["profile"]="${TIMING_REGISTRY}/profile-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["rate"]="${TIMING_REGISTRY}/rate-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["recommendation"]="${TIMING_REGISTRY}/recommendation-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["reservation"]="${TIMING_REGISTRY}/reservation-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
+    ["geo"]="${TIMING_REGISTRY}/geo-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
 )
 
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -164,8 +164,9 @@ store_original_config() {
 update_deployment_for_timing() {
     local service="$1"
     local exp_dir="$2"
+    local iteration="${3:-1}"  # Optional: iteration number (default 1)
     
-    log "$exp_dir" "Updating deployment for $service with windowed sampling configuration"
+    log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
     # Check if timing image is available for this service
     if [[ -z "${TIMING_IMAGES[$service]}" ]]; then
@@ -195,6 +196,12 @@ update_deployment_for_timing() {
         return 1
     fi
     
+    # Set iteration ID for this iteration
+    if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
+        log "$exp_dir" "ERROR: Failed to set ITERATION_ID for $service"
+        return 1
+    fi
+    
     # Set experiment duration (run duration)
     if ! kubectl set env "deployment/$service" "EXPERIMENT_DURATION=${EXPERIMENT_DURATION}"; then
         log "$exp_dir" "ERROR: Failed to set EXPERIMENT_DURATION for $service"
@@ -219,7 +226,7 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Set ring buffer configuration
+    # Set ring buffer configuration (optional tuning parameters)
     local buffer_size="${TIMING_BUFFER_SIZE:-2048}"
     if ! kubectl set env "deployment/$service" "TIMING_BUFFER_SIZE=${buffer_size}"; then
         log "$exp_dir" "ERROR: Failed to set TIMING_BUFFER_SIZE for $service"
@@ -232,11 +239,7 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Enable ring buffer (default: true)
-    if ! kubectl set env "deployment/$service" "USE_RING_BUFFER=${USE_RING_BUFFER:-true}"; then
-        log "$exp_dir" "ERROR: Failed to set USE_RING_BUFFER for $service"
-        return 1
-    fi
+    # Note: Ring buffer is now always used (no factory pattern)
     
     log "$exp_dir" "Successfully updated deployment configuration for $service"
     log "$exp_dir" "  Windowed Sampling: enabled"
@@ -350,6 +353,35 @@ retrieve_windowed_run_data() {
     fi
 }
 
+# Update iteration ID for all victim services and restart pods
+update_iteration_id() {
+    local exp_dir="$1"
+    local iteration="$2"
+    
+    source "${exp_dir}/metadata/experiment_config.txt" 2>/dev/null || return 0
+    
+    log "$exp_dir" "Updating ITERATION_ID to $iteration for victim services"
+    
+    for service in $VICTIM_SERVICES; do
+        if validate_timing_service "$service"; then
+            log "$exp_dir" "  Setting ITERATION_ID=$iteration for $service"
+            
+            if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
+                log "$exp_dir" "WARNING: Failed to set ITERATION_ID for $service"
+                continue
+            fi
+            
+            # Restart pods to pick up new iteration ID
+            log "$exp_dir" "  Restarting $service pods for new iteration"
+            kubectl rollout restart "deployment/$service" 2>/dev/null || true
+            kubectl rollout status "deployment/$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service restart"
+        fi
+    done
+    
+    log "$exp_dir" "Iteration ID updated, waiting 10s for services to stabilize"
+    sleep 10
+}
+
 # Cleanup windowed sampling resources
 cleanup_windowed_sampling_resources() {
     local exp_dir="$1"
@@ -374,13 +406,13 @@ cleanup_windowed_sampling_resources() {
                 # Remove windowed sampling environment variables
                 log "$exp_dir" "Removing windowed sampling environment variables for $service"
                 kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- 2>/dev/null || true
+                kubectl set env "deployment/$service" ITERATION_ID- 2>/dev/null || true
                 kubectl set env "deployment/$service" EXPERIMENT_DURATION- 2>/dev/null || true
                 kubectl set env "deployment/$service" WINDOW_INTERVAL_MS- 2>/dev/null || true
                 kubectl set env "deployment/$service" PERF_EVENTS- 2>/dev/null || true
                 kubectl set env "deployment/$service" OUTPUT_DIR- 2>/dev/null || true
                 kubectl set env "deployment/$service" TIMING_BUFFER_SIZE- 2>/dev/null || true
                 kubectl set env "deployment/$service" TIMING_FLUSH_THRESHOLD- 2>/dev/null || true
-                kubectl set env "deployment/$service" USE_RING_BUFFER- 2>/dev/null || true
                 
                 # Wait for rollout
                 kubectl rollout status deployment "$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service rollout"
@@ -1573,6 +1605,11 @@ run_iteration() {
     source "$config_file"
     
     log "$exp_dir" "Starting iteration $iteration"
+    
+    # Update iteration ID for all victim services (requires pod restart)
+    if [[ $iteration -gt 1 ]] || [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+        update_iteration_id "$exp_dir" "$iteration"
+    fi
     
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
