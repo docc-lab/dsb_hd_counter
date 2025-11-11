@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/interceptor"
 	"github.com/rs/zerolog/log"
 )
 
@@ -34,7 +35,7 @@ type RunConfig struct {
 	WindowInterval   time.Duration // Sampling interval (e.g., 100ms, 500ms, 1s)
 	PerfEvents       []string      // Events: ["cycles", "instructions", "cache-misses", ...]
 	OutputDir        string        // Where to write run data
-	TimingStatsChannel chan *TimingWindowStats // Channel to receive timing stats
+	TimingStatsChannel chan *interceptor.WindowTimingStats // Channel to receive timing stats
 }
 
 // Sample represents one snapshot at a window boundary
@@ -44,24 +45,11 @@ type Sample struct {
 	OffsetMs      int64                 `json:"offset_ms"`      // Milliseconds from run start
 	PerfCounters  map[string]uint64     `json:"perf_counters"`  // Cumulative values
 	PerfDeltas    map[string]uint64     `json:"perf_deltas"`    // Delta from previous sample
-	TimingWindow  *TimingWindowStats    `json:"timing_window"`  // Timing stats for this window
+	TimingWindow  *interceptor.WindowTimingStats `json:"timing_window"`  // Timing stats for this window
 }
 
-// TimingWindowStats captures timing data for requests in one window interval
-type TimingWindowStats struct {
-	RequestCount   int                 `json:"request_count"`
-	ProcessingTime WindowDurationStats `json:"processing_time"`
-	TotalTime      WindowDurationStats `json:"total_time"`
-	BlockingTime   WindowDurationStats `json:"blocking_time"`
-}
-
-// WindowDurationStats provides stats for durations within one window
-type WindowDurationStats struct {
-	MinNs  int64 `json:"min_ns"`
-	MaxNs  int64 `json:"max_ns"`
-	MeanNs int64 `json:"mean_ns"`
-	Count  int   `json:"count"`
-}
+// Note: WindowTimingStats and WindowDurationStats are defined in interceptor package
+// and imported above to avoid duplication
 
 // RunData contains all samples from one iteration/run
 type RunData struct {

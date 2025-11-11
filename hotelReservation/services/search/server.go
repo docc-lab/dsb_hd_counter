@@ -81,11 +81,8 @@ func (s *Server) Run() error {
 				EnableTiming: true,
 				ServiceName:  name,
 			}
-			serverOpts := interceptor.ServerOptions{
-				TimingConfig: timingConfig,
-				Tracer:       s.Tracer,
-			}
-			timingInterceptor = serverOpts.GetTimingServerInterceptor()
+			basicAggregator := interceptor.NewRingBufferTimingAggregator(timingConfig)
+			timingInterceptor = interceptor.TimingServerInterceptorWithAggregator(basicAggregator, name)
 			log.Info().Str("service", name).Msg("Timing interceptor ENABLED (basic mode, no perf counters)")
 		} else {
 			// No timing - use tracing only
