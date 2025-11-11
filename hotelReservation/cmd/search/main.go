@@ -78,16 +78,29 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to setup windowed sampling")
 		}
-		defer sampler.Stop()
+		
+		// Ensure cleanup on exit
+		defer func() {
+			log.Info().Msg("Stopping windowed sampler")
+			runData, err := sampler.StopRun()
+			if err != nil {
+				log.Error().Err(err).Msg("Error stopping sampler")
+			} else if runData != nil {
+				log.Info().
+					Int("sample_count", runData.SampleCount).
+					Int("total_requests", runData.Aggregates.TotalRequests).
+					Msg("Windowed sampling completed")
+			}
+		}()
 		defer timingAgg.Stop()
 
 		srv := &search.Server{
-			Tracer:         tracer,
-			Port:           servPort,
-			IpAddr:         servIP,
-			ConsulAddr:     *consulAddr,
-			KnativeDns:     knativeDNS,
-			Registry:       registry,
+			Tracer:           tracer,
+			Port:             servPort,
+			IpAddr:           servIP,
+			ConsulAddr:       *consulAddr,
+			KnativeDns:       knativeDNS,
+			Registry:         registry,
 			TimingAggregator: timingAgg,
 		}
 
