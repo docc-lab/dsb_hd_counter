@@ -1,7 +1,7 @@
 package perf
 
-// This file provides example integration code for services to use windowed sampling
-// Copy the relevant parts to your service's main.go
+// This file provides helper functions for services to integrate windowed sampling
+// Services can call SetupWindowedSampling() to initialize both perf counters and timing aggregator
 
 import (
 	"context"
@@ -82,7 +82,7 @@ func SetupWindowedSampling(serviceName string, iterationID int) (WindowedSampler
 	// Create windowed sampler
 	sampler := NewWindowedSampler()
 	
-	// Create timing aggregator (automatically uses ring buffer if enabled)
+	// Create timing aggregator using lock-free ring buffer
 	timingConfig := interceptor.TimingConfig{
 		EnableTiming:       true,
 		ServiceName:        serviceName,
@@ -91,8 +91,8 @@ func SetupWindowedSampling(serviceName string, iterationID int) (WindowedSampler
 		WindowStatsChannel: timingStatsChannel,
 	}
 	
-	// Use factory to create aggregator (ring buffer or mutex-based)
-	timingAgg := interceptor.CreateTimingAggregator(timingConfig)
+	// Create ring buffer aggregator for high-performance timing collection
+	timingAgg := interceptor.NewRingBufferTimingAggregator(timingConfig)
 	
 	// Start sampler
 	ctx := context.Background()
@@ -111,78 +111,4 @@ func SetupWindowedSampling(serviceName string, iterationID int) (WindowedSampler
 	
 	return sampler, timingAgg, timingStatsChannel, nil
 }
-
-// Example usage in service main.go:
-/*
-func main() {
-	serviceName := "frontend"
-	
-	// Check if windowed sampling is enabled
-	enableWindowed := os.Getenv("ENABLE_WINDOWED_SAMPLING")
-	if enableWindowed != "true" {
-		// Run service in legacy mode
-		startLegacyService()
-		return
-	}
-	
-	// Get iteration ID
-	iterationID, _ := strconv.Atoi(os.Getenv("ITERATION_ID"))
-	if iterationID == 0 {
-		iterationID = 1
-	}
-	
-	// Setup windowed sampling
-	sampler, timingAgg, _, err := perf.SetupWindowedSampling(serviceName, iterationID)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to setup windowed sampling")
-	}
-	
-	// Create gRPC server with timing interceptor
-	server := grpc.NewServer(
-		grpc.UnaryInterceptor(
-			interceptor.ChainUnaryServerInterceptors(
-				interceptor.TimingServerInterceptorWithAggregator(timingAgg),
-				// ... other interceptors ...
-			),
-		),
-		grpc.UnaryClientInterceptor(
-			interceptor.TimingClientInterceptor(),
-		),
-	)
-	
-	// Register services
-	// ...
-	
-	// Handle graceful shutdown
-	go func() {
-		// Wait for run duration or signal
-		runDuration, _ := strconv.Atoi(os.Getenv("EXPERIMENT_DURATION"))
-		if runDuration == 0 {
-			runDuration = 30
-		}
-		time.Sleep(time.Duration(runDuration) * time.Second)
-		
-		// Stop sampling
-		runData, err := sampler.StopRun()
-		if err != nil {
-			log.Error().Err(err).Msg("Error stopping sampler")
-		} else {
-			log.Info().
-				Int("sample_count", runData.SampleCount).
-				Int("total_requests", runData.Aggregates.TotalRequests).
-				Msg("Windowed sampling completed")
-		}
-		
-		// Stop timing aggregator
-		timingAgg.Stop()
-		
-		// Shutdown server
-		server.GracefulStop()
-	}()
-	
-	// Start serving
-	listener, _ := net.Listen("tcp", ":8080")
-	server.Serve(listener)
-}
-*/
 

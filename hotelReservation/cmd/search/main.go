@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/search"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tracing"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tune"
@@ -58,15 +59,52 @@ func main() {
 	}
 	log.Info().Msg("Consul agent initialized")
 
-	srv := &search.Server{
-		Tracer:     tracer,
-		Port:       servPort,
-		IpAddr:     servIP,
-		ConsulAddr: *consulAddr,
-		KnativeDns: knativeDNS,
-		Registry:   registry,
-	}
+	// Check if windowed sampling is enabled
+	enableWindowed := os.Getenv("ENABLE_WINDOWED_SAMPLING")
+	if enableWindowed == "true" {
+		// Use windowed sampling mode with perf counters
+		iterationID, _ := strconv.Atoi(os.Getenv("ITERATION_ID"))
+		if iterationID == 0 {
+			iterationID = 1
+		}
 
-	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+		log.Info().
+			Str("service", "search").
+			Int("iteration", iterationID).
+			Msg("Starting search service with windowed sampling")
+
+		// Setup windowed sampling (perf counters + timing aggregator)
+		sampler, timingAgg, _, err := perf.SetupWindowedSampling("search", iterationID)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to setup windowed sampling")
+		}
+		defer sampler.Stop()
+		defer timingAgg.Stop()
+
+		srv := &search.Server{
+			Tracer:         tracer,
+			Port:           servPort,
+			IpAddr:         servIP,
+			ConsulAddr:     *consulAddr,
+			KnativeDns:     knativeDNS,
+			Registry:       registry,
+			TimingAggregator: timingAgg,
+		}
+
+		log.Info().Msg("Starting server with windowed sampling...")
+		log.Fatal().Msg(srv.Run().Error())
+	} else {
+		// Standard mode without windowed sampling
+		srv := &search.Server{
+			Tracer:     tracer,
+			Port:       servPort,
+			IpAddr:     servIP,
+			ConsulAddr: *consulAddr,
+			KnativeDns: knativeDNS,
+			Registry:   registry,
+		}
+
+		log.Info().Msg("Starting server...")
+		log.Fatal().Msg(srv.Run().Error())
+	}
 }

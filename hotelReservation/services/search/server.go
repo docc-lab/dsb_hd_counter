@@ -14,6 +14,7 @@ import (
 	pb "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/search/proto"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tls"
 	"github.com/google/uuid"
+	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	_ "github.com/mbobakov/grpc-consul-resolver"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/rs/zerolog/log"
@@ -45,12 +46,13 @@ type Server struct {
 	rateClient rate.RateClient
 	uuid       string
 
-	Tracer     opentracing.Tracer
-	Port       int
-	IpAddr     string
-	ConsulAddr string
-	KnativeDns string
-	Registry   *registry.Client
+	Tracer           opentracing.Tracer
+	Port             int
+	IpAddr           string
+	ConsulAddr       string
+	KnativeDns       string
+	Registry         *registry.Client
+	TimingAggregator interceptor.TimingAggregator // Optional: for windowed sampling
 }
 
 // Run starts the server
@@ -63,24 +65,36 @@ func (s *Server) Run() error {
 
 	s.uuid = uuid.New().String()
 
-	// Configure timing interceptor (can be controlled via environment variables)
-	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
-	statsFile := os.Getenv("STATS_FILE")
-	if statsFile == "" {
-		statsFile = "timing_stats_search.json"
+	// Setup timing interceptor
+	var timingInterceptor grpc.UnaryServerInterceptor
+	
+	if s.TimingAggregator != nil {
+		// Windowed sampling mode - use provided aggregator
+		timingInterceptor = interceptor.TimingServerInterceptorWithAggregator(s.TimingAggregator, name)
+		log.Info().Str("service", name).Msg("Timing interceptor ENABLED (windowed sampling with perf counters)")
+	} else {
+		// Standard mode - check if timing is enabled
+		enableTiming := os.Getenv("ENABLE_TIMING") == "true"
+		if enableTiming {
+			// Create basic ring buffer aggregator for timing only
+			timingConfig := interceptor.TimingConfig{
+				EnableTiming: true,
+				ServiceName:  name,
+			}
+			serverOpts := interceptor.ServerOptions{
+				TimingConfig: timingConfig,
+				Tracer:       s.Tracer,
+			}
+			timingInterceptor = serverOpts.GetTimingServerInterceptor()
+			log.Info().Str("service", name).Msg("Timing interceptor ENABLED (basic mode, no perf counters)")
+		} else {
+			// No timing - use tracing only
+			timingInterceptor = nil
+			log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
+		}
 	}
 
-	timingConfig := interceptor.TimingConfig{
-		EnableTiming: enableTiming,
-		ServiceName:  name,
-		StatsFile:    statsFile,
-	}
-
-	serverOpts := interceptor.ServerOptions{
-		TimingConfig: timingConfig,
-		Tracer:       s.Tracer,
-	}
-
+	// Build server options
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Timeout: 120 * time.Second,
@@ -88,13 +102,20 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		serverOpts.GetServerInterceptor(), // This includes both tracing and timing
 	}
 
-	if enableTiming {
-		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
+	// Add interceptors (tracing + timing if enabled)
+	if timingInterceptor != nil {
+		opts = append(opts, grpc.UnaryInterceptor(
+			interceptor.ChainUnaryServerInterceptors(
+				otgrpc.OpenTracingServerInterceptor(s.Tracer),
+				timingInterceptor,
+			),
+		))
 	} else {
-		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
+		opts = append(opts, grpc.UnaryInterceptor(
+			otgrpc.OpenTracingServerInterceptor(s.Tracer),
+		))
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {

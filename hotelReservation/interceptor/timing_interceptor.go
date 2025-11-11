@@ -2,11 +2,6 @@ package interceptor
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"sort"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,7 +13,6 @@ import (
 type TimingConfig struct {
 	EnableTiming       bool
 	ServiceName        string
-	StatsFile          string        // File to write aggregated statistics (optional - legacy mode)
 	EnableWindowed     bool          // Enable windowed batching mode
 	WindowInterval     time.Duration // Window interval for batching (e.g., 100ms)
 	WindowStatsChannel chan *WindowTimingStats // Channel to send window stats
@@ -33,29 +27,6 @@ type TimingData struct {
 	TotalTime      time.Duration `json:"total_time_ns"`      // Total time including blocking calls
 	BlockingTime   time.Duration `json:"blocking_time_ns"`   // Time spent in blocking calls
 	Timestamp      time.Time     `json:"timestamp"`
-}
-
-// TimingStats holds statistics for a service
-type TimingStats struct {
-	ServiceName      string                    `json:"service_name"`
-	TotalRequests    int                       `json:"total_requests"`
-	ProcessingStats  DurationStats             `json:"processing_stats"`
-	TotalTimeStats   DurationStats             `json:"total_time_stats"`
-	BlockingStats    DurationStats             `json:"blocking_stats"`
-	MethodBreakdown  map[string]DurationStats  `json:"method_breakdown"`
-	Histogram        map[string]int            `json:"histogram_ms"` // Histogram in milliseconds
-	LastUpdated      time.Time                 `json:"last_updated"`
-}
-
-// DurationStats holds statistical data for durations
-type DurationStats struct {
-	Min    time.Duration `json:"min_ns"`
-	Max    time.Duration `json:"max_ns"`
-	Mean   time.Duration `json:"mean_ns"`
-	P50    time.Duration `json:"p50_ns"`
-	P95    time.Duration `json:"p95_ns"`
-	P99    time.Duration `json:"p99_ns"`
-	Count  int           `json:"count"`
 }
 
 // WindowTimingStats captures timing data for requests in one window interval
@@ -74,160 +45,10 @@ type WindowDurationStats struct {
 	Count  int   `json:"count"`
 }
 
-// LocalTimingAggregator handles in-memory timing data aggregation with periodic stats output
-type LocalTimingAggregator struct {
-	serviceName   string
-	statsFile     string
-	data          []TimingData
-	mu            sync.RWMutex
-	lastStatsTime time.Time
-	statsInterval time.Duration
-	
-	// Windowed mode fields
-	enableWindowed    bool
-	windowInterval    time.Duration
-	windowStatsChannel chan *WindowTimingStats
-	windowData        []TimingData
-	windowTicker      *time.Ticker
-	ctx               context.Context
-	cancel            context.CancelFunc
-	wg                sync.WaitGroup
-}
-
-// NewLocalTimingAggregator creates a new local aggregator instance (legacy mode)
-func NewLocalTimingAggregator(serviceName, statsFile string) *LocalTimingAggregator {
-	return &LocalTimingAggregator{
-		serviceName:    serviceName,
-		statsFile:      statsFile,
-		data:           make([]TimingData, 0),
-		lastStatsTime:  time.Now(),
-		statsInterval:  30 * time.Second, // Write stats every 30 seconds
-		enableWindowed: false,
-	}
-}
-
-// NewWindowedTimingAggregator creates a new aggregator for windowed sampling mode
-func NewWindowedTimingAggregator(config TimingConfig) *LocalTimingAggregator {
-	ctx, cancel := context.WithCancel(context.Background())
-	
-	agg := &LocalTimingAggregator{
-		serviceName:        config.ServiceName,
-		statsFile:          config.StatsFile,
-		data:               make([]TimingData, 0),
-		lastStatsTime:      time.Now(),
-		statsInterval:      config.WindowInterval,
-		enableWindowed:     config.EnableWindowed,
-		windowInterval:     config.WindowInterval,
-		windowStatsChannel: config.WindowStatsChannel,
-		windowData:         make([]TimingData, 0),
-		ctx:                ctx,
-		cancel:             cancel,
-	}
-	
-	// Start windowed flushing loop
-	if agg.enableWindowed && agg.windowStatsChannel != nil {
-		agg.wg.Add(1)
-		go agg.windowedFlushLoop()
-		
-		log.Info().
-			Str("service", config.ServiceName).
-			Dur("window_interval", config.WindowInterval).
-			Msg("Started windowed timing aggregator")
-	}
-	
-	return agg
-}
-
-// Stop stops the windowed aggregator
-func (lta *LocalTimingAggregator) Stop() {
-	if lta.enableWindowed && lta.cancel != nil {
-		lta.cancel()
-		lta.wg.Wait()
-		log.Info().Str("service", lta.serviceName).Msg("Stopped windowed timing aggregator")
-	}
-}
-
-// windowedFlushLoop periodically flushes window stats
-func (lta *LocalTimingAggregator) windowedFlushLoop() {
-	defer lta.wg.Done()
-	
-	lta.windowTicker = time.NewTicker(lta.windowInterval)
-	defer lta.windowTicker.Stop()
-	
-	for {
-		select {
-		case <-lta.windowTicker.C:
-			lta.flushWindow()
-			
-		case <-lta.ctx.Done():
-			lta.flushWindow() // Final flush
-			return
-		}
-	}
-}
-
-// flushWindow flushes current window data and sends aggregated stats
-// This is called periodically by windowedFlushLoop goroutine (single writer)
-// LOCK: Briefly locks to atomically copy and clear buffer
-func (lta *LocalTimingAggregator) flushWindow() {
-	lta.mu.Lock()   // ACQUIRE LOCK - need exclusive access to buffer
-	
-	// Get snapshot of ALL requests completed during this window
-	// This includes timing data from potentially hundreds of concurrent requests
-	windowData := make([]TimingData, len(lta.windowData))
-	copy(windowData, lta.windowData)
-	
-	// Clear window data buffer for next window
-	lta.windowData = make([]TimingData, 0)
-	
-	lta.mu.Unlock()  // RELEASE LOCK - minimize lock hold time
-	
-	// AGGREGATE: Calculate window statistics OUTSIDE the lock
-	// This processes all requests completed in the last WINDOW_INTERVAL
-	stats := lta.calculateWindowStats(windowData)
-	
-	// Send aggregated stats to windowed sampler (non-blocking)
-	if lta.windowStatsChannel != nil {
-		select {
-		case lta.windowStatsChannel <- stats:
-			// Sent successfully - sampler will combine with perf counters
-			log.Debug().
-				Str("service", lta.serviceName).
-				Int("request_count", stats.RequestCount).
-				Int64("mean_processing_ns", stats.ProcessingTime.MeanNs).
-				Msg("Flushed window stats")
-		default:
-			// Channel full - drop this window's stats to avoid blocking
-			log.Warn().
-				Str("service", lta.serviceName).
-				Int("request_count", stats.RequestCount).
-				Msg("Window stats channel full, dropping window stats")
-		}
-	}
-}
-
-// calculateWindowStats calculates statistics for one window
-func (lta *LocalTimingAggregator) calculateWindowStats(data []TimingData) *WindowTimingStats {
-	if len(data) == 0 {
-		return &WindowTimingStats{RequestCount: 0}
-	}
-	
-	processingTimes := make([]time.Duration, len(data))
-	totalTimes := make([]time.Duration, len(data))
-	blockingTimes := make([]time.Duration, len(data))
-	
-	for i, td := range data {
-		processingTimes[i] = td.ProcessingTime
-		totalTimes[i] = td.TotalTime
-		blockingTimes[i] = td.BlockingTime
-	}
-	
-	return &WindowTimingStats{
-		RequestCount:   len(data),
-		ProcessingTime: calculateWindowDurationStats(processingTimes),
-		TotalTime:      calculateWindowDurationStats(totalTimes),
-		BlockingTime:   calculateWindowDurationStats(blockingTimes),
-	}
+// TimingAggregator is the interface for timing data collection implementations
+type TimingAggregator interface {
+	AddTimingData(data TimingData)
+	Stop()
 }
 
 // calculateWindowDurationStats calculates statistics for a slice of durations
@@ -280,31 +101,9 @@ type timingContext struct {
 	totalCallCount    int32  // atomic - total number of downstream calls made
 }
 
-// TimingServerInterceptor creates a server-side unary interceptor with local timing functionality (legacy mode)
-func TimingServerInterceptor(config TimingConfig) grpc.UnaryServerInterceptor {
-	if !config.EnableTiming {
-		// Return a no-op interceptor if timing is disabled
-		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-			return handler(ctx, req)
-		}
-	}
-
-	// Initialize local aggregator (legacy mode)
-	var aggregator *LocalTimingAggregator
-	if config.EnableWindowed {
-		// Windowed mode - use provided channel
-		aggregator = NewWindowedTimingAggregator(config)
-	} else {
-		// Legacy mode - create simple aggregator
-		aggregator = NewLocalTimingAggregator(config.ServiceName, config.StatsFile)
-	}
-
-	return TimingServerInterceptorWithAggregator(aggregator, config.ServiceName)
-}
-
 // TimingServerInterceptorWithAggregator creates interceptor using a provided aggregator
 // This allows sharing the aggregator across all requests for proper windowed batching
-func TimingServerInterceptorWithAggregator(aggregator *LocalTimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
+func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		// START TIMER: Record timestamp when new gRPC call arrives
 		arrivalTime := time.Now()
@@ -372,11 +171,6 @@ func TimingServerInterceptorWithAggregator(aggregator *LocalTimingAggregator, se
 		// ADD TO WINDOW BUFFER: Add completed timing data to aggregator
 		// This goes into the window data buffer and will be aggregated with other concurrent requests
 		aggregator.AddTimingData(*timingData)
-
-		// Legacy mode: periodically write stats to file (non-blocking)
-		if !aggregator.enableWindowed && aggregator.statsFile != "" {
-			go aggregator.MaybeWriteStats()
-		}
 
 		return resp, err
 	}
@@ -503,230 +297,4 @@ func ChainUnaryClientInterceptors(interceptors ...grpc.UnaryClientInterceptor) g
 	}
 }
 
-// AddTimingData adds timing data to the in-memory aggregator
-// This is called by MANY concurrent gRPC requests, so it needs to be thread-safe
-// LOCK: Uses sync.RWMutex to protect concurrent writes to the buffer
-func (lta *LocalTimingAggregator) AddTimingData(data TimingData) {
-	lta.mu.Lock()   // ACQUIRE LOCK - protects buffer from concurrent writes
-	defer lta.mu.Unlock()
-	
-	// Add to overall data for legacy stats
-	lta.data = append(lta.data, data)
-	
-	// Keep only last 10000 entries to prevent memory issues
-	if len(lta.data) > 10000 {
-		lta.data = lta.data[len(lta.data)-10000:]
-	}
-	
-	// WINDOW BUFFER: Add to window data if windowed mode is enabled
-	// This buffer accumulates all requests completed during the current window
-	// Will be flushed and aggregated every WINDOW_INTERVAL (e.g., 100ms)
-	if lta.enableWindowed {
-		lta.windowData = append(lta.windowData, data)
-	}
-	// RELEASE LOCK - lock held for minimal time (just array append)
-}
-
-// MaybeWriteStats writes statistics to file if enough time has passed
-func (lta *LocalTimingAggregator) MaybeWriteStats() {
-	lta.mu.RLock()
-	shouldWrite := time.Since(lta.lastStatsTime) >= lta.statsInterval && len(lta.data) > 0
-	lta.mu.RUnlock()
-	
-	if !shouldWrite {
-		return
-	}
-	
-	lta.mu.Lock()
-	defer lta.mu.Unlock()
-	
-	// Double-check after acquiring write lock
-	if time.Since(lta.lastStatsTime) < lta.statsInterval {
-		return
-	}
-	
-	if len(lta.data) == 0 {
-		return
-	}
-	
-	// Calculate statistics
-	stats := lta.calculateStats(lta.data)
-	
-	// Write stats to file
-	if lta.statsFile != "" {
-		if err := lta.writeStatsToFile(stats); err != nil {
-			log.Error().Err(err).Msg("Failed to write stats to file")
-		}
-	}
-	
-	// Update last stats time
-	lta.lastStatsTime = time.Now()
-	
-	// Log summary statistics
-	log.Info().
-		Str("service", lta.serviceName).
-		Int("total_requests", stats.TotalRequests).
-		Dur("avg_processing_time", stats.ProcessingStats.Mean).
-		Dur("p95_processing_time", stats.ProcessingStats.P95).
-		Dur("avg_total_time", stats.TotalTimeStats.Mean).
-		Dur("p95_total_time", stats.TotalTimeStats.P95).
-		Msg("Timing statistics summary")
-}
-
-// writeStatsToFile writes statistics to the configured file
-func (lta *LocalTimingAggregator) writeStatsToFile(stats TimingStats) error {
-	file, err := os.Create(lta.statsFile)
-	if err != nil {
-		return fmt.Errorf("failed to create stats file %s: %v", lta.statsFile, err)
-	}
-	defer file.Close()
-	
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(stats); err != nil {
-		return fmt.Errorf("failed to write stats to file %s: %v", lta.statsFile, err)
-	}
-	
-	log.Info().
-		Str("service", lta.serviceName).
-		Str("filename", lta.statsFile).
-		Int("total_requests", stats.TotalRequests).
-		Msg("Timing statistics written to file")
-	
-	return nil
-}
-
-// calculateStats calculates statistics from timing data
-func (lta *LocalTimingAggregator) calculateStats(data []TimingData) TimingStats {
-	if len(data) == 0 {
-		return TimingStats{ServiceName: lta.serviceName}
-	}
-	
-	// Separate data by type
-	var processingTimes, totalTimes, blockingTimes []time.Duration
-	methodData := make(map[string][]time.Duration)
-	
-	for _, d := range data {
-		processingTimes = append(processingTimes, d.ProcessingTime)
-		totalTimes = append(totalTimes, d.TotalTime)
-		blockingTimes = append(blockingTimes, d.BlockingTime)
-		
-		if methodData[d.Method] == nil {
-			methodData[d.Method] = make([]time.Duration, 0)
-		}
-		methodData[d.Method] = append(methodData[d.Method], d.ProcessingTime)
-	}
-	
-	// Calculate statistics
-	stats := TimingStats{
-		ServiceName:     lta.serviceName,
-		TotalRequests:   len(data),
-		ProcessingStats: calculateDurationStats(processingTimes),
-		TotalTimeStats:  calculateDurationStats(totalTimes),
-		BlockingStats:   calculateDurationStats(blockingTimes),
-		MethodBreakdown: make(map[string]DurationStats),
-		Histogram:       createHistogram(processingTimes),
-		LastUpdated:     time.Now(),
-	}
-	
-	// Calculate per-method statistics
-	for method, times := range methodData {
-		stats.MethodBreakdown[method] = calculateDurationStats(times)
-	}
-	
-	return stats
-}
-
-// calculateDurationStats calculates statistical measures for a slice of durations
-func calculateDurationStats(durations []time.Duration) DurationStats {
-	if len(durations) == 0 {
-		return DurationStats{}
-	}
-	
-	// Sort for percentile calculations
-	sorted := make([]time.Duration, len(durations))
-	copy(sorted, durations)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
-	
-	// Calculate mean
-	var sum time.Duration
-	for _, d := range durations {
-		sum += d
-	}
-	mean := sum / time.Duration(len(durations))
-	
-	// Calculate percentiles
-	p50Index := len(sorted) * 50 / 100
-	p95Index := len(sorted) * 95 / 100
-	p99Index := len(sorted) * 99 / 100
-	
-	// Ensure indices are within bounds
-	if p50Index >= len(sorted) {
-		p50Index = len(sorted) - 1
-	}
-	if p95Index >= len(sorted) {
-		p95Index = len(sorted) - 1
-	}
-	if p99Index >= len(sorted) {
-		p99Index = len(sorted) - 1
-	}
-	
-	return DurationStats{
-		Min:   sorted[0],
-		Max:   sorted[len(sorted)-1],
-		Mean:  mean,
-		P50:   sorted[p50Index],
-		P95:   sorted[p95Index],
-		P99:   sorted[p99Index],
-		Count: len(durations),
-	}
-}
-
-// createHistogram creates a histogram of durations in milliseconds
-func createHistogram(durations []time.Duration) map[string]int {
-	histogram := make(map[string]int)
-	
-	// Define histogram buckets in milliseconds
-	buckets := []int{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000}
-	
-	for _, d := range durations {
-		ms := int(d.Nanoseconds() / 1000000) // Convert to milliseconds
-		
-		bucketFound := false
-		for _, bucket := range buckets {
-			if ms <= bucket {
-				key := fmt.Sprintf("≤%dms", bucket)
-				histogram[key]++
-				bucketFound = true
-				break
-			}
-		}
-		
-		if !bucketFound {
-			histogram[">10000ms"]++
-		}
-	}
-	
-	return histogram
-}
-
-// GetTimingStats returns current timing statistics for a service from stats file
-func GetTimingStats(statsFile string) (TimingStats, error) {
-	var stats TimingStats
-	
-	file, err := os.Open(statsFile)
-	if err != nil {
-		return stats, fmt.Errorf("failed to open stats file %s: %v", statsFile, err)
-	}
-	defer file.Close()
-	
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&stats); err != nil {
-		return stats, fmt.Errorf("failed to decode stats from %s: %v", statsFile, err)
-	}
-	
-	return stats, nil
-}
 

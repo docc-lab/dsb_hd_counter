@@ -13,17 +13,31 @@ type ServerOptions struct {
 }
 
 // GetServerInterceptor returns a combined server interceptor with tracing and timing
+// Note: For windowed timing, create aggregator separately and pass it to TimingServerInterceptorWithAggregator
 func (opts ServerOptions) GetServerInterceptor() grpc.ServerOption {
+	// Create ring buffer aggregator if timing is enabled
+	var aggregator TimingAggregator
+	if opts.TimingConfig.EnableTiming {
+		aggregator = NewRingBufferTimingAggregator(opts.TimingConfig)
+	}
+	
 	return grpc.UnaryInterceptor(
 		ChainUnaryServerInterceptors(
 			otgrpc.OpenTracingServerInterceptor(opts.Tracer),
-			TimingServerInterceptor(opts.TimingConfig),
+			TimingServerInterceptorWithAggregator(aggregator, opts.TimingConfig.ServiceName),
 		),
 	)
 }
 
 // GetTimingServerInterceptor returns only the timing interceptor
+// Note: For windowed timing, create aggregator separately and pass it to TimingServerInterceptorWithAggregator
 func (opts ServerOptions) GetTimingServerInterceptor() grpc.ServerOption {
-	return grpc.UnaryInterceptor(TimingServerInterceptor(opts.TimingConfig))
+	// Create ring buffer aggregator if timing is enabled
+	var aggregator TimingAggregator
+	if opts.TimingConfig.EnableTiming {
+		aggregator = NewRingBufferTimingAggregator(opts.TimingConfig)
+	}
+	
+	return grpc.UnaryInterceptor(TimingServerInterceptorWithAggregator(aggregator, opts.TimingConfig.ServiceName))
 }
 
