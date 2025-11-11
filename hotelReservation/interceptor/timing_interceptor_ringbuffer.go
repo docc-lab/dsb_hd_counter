@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"google.golang.org/grpc"
 )
 
 // RingBufferTimingAggregator uses lock-free ring buffer for high-throughput timing collection
