@@ -72,6 +72,40 @@ validate_service() {
     return 1
 }
 
+# Function to get container name for kubectl set image
+get_container_name_for_deployment() {
+    local service=$1
+    case $service in
+        "user")
+            echo "hotel-reserv-user"
+            ;;
+        "frontend")
+            echo "hotel-reserv-frontend"
+            ;;
+        "search")
+            echo "hotel-reserv-search"
+            ;;
+        "profile")
+            echo "hotel-reserv-profile"
+            ;;
+        "rate")
+            echo "hotel-reserv-rate"
+            ;;
+        "recommendation")
+            echo "hotel-reserv-recommendation"
+            ;;
+        "reservation")
+            echo "hotel-reserv-reservation"
+            ;;
+        "geo")
+            echo "hotel-reserv-geo"
+            ;;
+        *)
+            echo "hotel-reserv-$service"
+            ;;
+    esac
+}
+
 # Function to generate timing-enabled Dockerfile for a specific service
 generate_timing_dockerfile() {
     local service=$1
@@ -344,22 +378,16 @@ update_yaml_files() {
                 service_image_name="${REGISTRY}/${service}-withtimer:${tag}"
             fi
             
-            # Update the image line
-            if sed -i 's|image: deathstarbench/hotel-reservation:latest|image: '"${service_image_name}"'|g' "$deployment_file"; then
-                if sed -i 's|image: '"${REGISTRY}/${IMAGE_NAME}"':.*|image: '"${service_image_name}"'|g' "$deployment_file"; then
-                    # Also update any existing timing images
-                    if [[ "$TIMING_MODE" == "true" ]]; then
-                        sed -i 's|image: '"${REGISTRY}/${service}-withtimer"':.*|image: '"${service_image_name}"'|g' "$deployment_file"
-                    fi
-                    log_success "Updated $deployment_file with image: ${service_image_name}"
-                    updated_files+=("$deployment_file")
-                else
-                    log_error "Failed to update $deployment_file"
-                    # Restore backup
-                    mv "${deployment_file}.backup" "$deployment_file"
-                fi
+            # Update the image line using a comprehensive pattern that catches ANY existing image
+            # This single pattern matches: registry/anything:tag or anything:tag and replaces the entire line
+            sed -i '/^\s*image:/s|image:.*|image: '"${service_image_name}"'|g' "$deployment_file"
+            
+            # Verify the update worked
+            if grep -q "${service_image_name}" "$deployment_file"; then
+                log_success "Updated $deployment_file with image: ${service_image_name}"
+                updated_files+=("$deployment_file")
             else
-                log_error "Failed to update $deployment_file"
+                log_error "Failed to update $deployment_file - image line not found or update failed"
                 # Restore backup
                 mv "${deployment_file}.backup" "$deployment_file"
             fi
@@ -478,12 +506,21 @@ deploy_multiple_services() {
                 ;;
         esac
         
-        # Apply the deployment
+        # Apply the deployment YAML first (ensures deployment exists)
         log_info "Applying deployment for $service"
         if ! kubectl apply -f "$deployment_file"; then
             log_error "Failed to apply deployment for $service"
             failed_services+=("$service")
             continue
+        fi
+        
+        # Force update the image using kubectl set image (more reliable than YAML apply)
+        local container_name=$(get_container_name_for_deployment "$service")
+        local new_image=$(grep "image:" "$deployment_file" | grep -v "#" | awk '{print $2}' | head -1)
+        
+        if [[ -n "$new_image" ]]; then
+            log_info "Setting image directly: deployment/$service $container_name=$new_image"
+            kubectl set image "deployment/$service" "$container_name=$new_image"
         fi
         
         # Check rollout
