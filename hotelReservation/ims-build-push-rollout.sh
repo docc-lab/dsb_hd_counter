@@ -494,7 +494,7 @@ deploy_multiple_services() {
             continue
         fi
         
-        echo "✅ $service deployed successfully"
+        echo " $service deployed successfully"
     done
     
     echo ""
@@ -503,10 +503,10 @@ deploy_multiple_services() {
     echo "=========================================="
     
     if [ ${#failed_services[@]} -eq 0 ]; then
-        echo "🎉 All services deployed successfully!"
+        echo " All services deployed successfully!"
         return 0
     else
-        echo "⚠️  Some services failed to deploy:"
+        echo " Some services failed to deploy:"
         for failed_service in "${failed_services[@]}"; do
             echo "   - $failed_service"
         done

@@ -11,23 +11,51 @@ WRK2_DIR="${WRK2_DIR:-../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
-TIMING_REGISTRY="royno7"
+TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
 WINDOWED_IMAGE_SUFFIX="windowed"
-WINDOWED_TAG="v1-windowed"
 
-# Valid services for windowed sampling and their images
-declare -A TIMING_IMAGES=(
-    ["user"]="${TIMING_REGISTRY}/user-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["frontend"]="${TIMING_REGISTRY}/frontend-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["search"]="${TIMING_REGISTRY}/search-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["profile"]="${TIMING_REGISTRY}/profile-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["rate"]="${TIMING_REGISTRY}/rate-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["recommendation"]="${TIMING_REGISTRY}/recommendation-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["reservation"]="${TIMING_REGISTRY}/reservation-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-    ["geo"]="${TIMING_REGISTRY}/geo-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_TAG}"
-)
-
+# Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
+
+# Get current image for a service from deployment
+get_current_windowed_image() {
+    local service="$1"
+    
+    # Get current image from deployment
+    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    
+    if [[ -z "$current_image" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # If already using a windowed image, return it as-is
+    if [[ "$current_image" == *"-windowed:"* ]]; then
+        echo "$current_image"
+        return 0
+    fi
+    
+    # If not a windowed image, construct windowed version with same tag
+    # Extract registry, image name, and tag
+    # Format could be: registry/image:tag or just image:tag
+    if [[ "$current_image" =~ ^([^/]+)/([^:]+):(.+)$ ]]; then
+        # Has registry: registry/image:tag
+        local registry="${BASH_REMATCH[1]}"
+        local image="${BASH_REMATCH[2]}"
+        local tag="${BASH_REMATCH[3]}"
+        echo "${registry}/${service}-windowed:${tag}"
+    elif [[ "$current_image" =~ ^([^:]+):(.+)$ ]]; then
+        # No registry: image:tag
+        local tag="${BASH_REMATCH[2]}"
+        echo "${TIMING_REGISTRY}/${service}-windowed:${tag}"
+    else
+        # Fallback: use default registry and latest tag
+        echo "${TIMING_REGISTRY}/${service}-windowed:latest"
+    fi
+}
+
+# Timing images are determined dynamically based on current deployment
+declare -A TIMING_IMAGES
 
 # Path to timing image build script
 TIMING_BUILD_SCRIPT="../build-timing-images.sh"
@@ -112,9 +140,15 @@ ensure_timing_image_exists() {
     local service="$1"
     local exp_dir="$2"
     
-    local timing_image="${TIMING_IMAGES[$service]}"
+    # Get windowed image name dynamically from current deployment
+    local timing_image=$(get_current_windowed_image "$service")
     
-    log "$exp_dir" "Checking if timing image exists: $timing_image"
+    if [[ -z "$timing_image" ]]; then
+        log "$exp_dir" "ERROR: Could not determine windowed image for $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "Checking if windowed image exists: $timing_image"
     
     # Check if image exists in registry (try to pull)
     if docker pull "$timing_image" &>/dev/null; then
@@ -168,13 +202,15 @@ update_deployment_for_timing() {
     
     log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
-    # Check if timing image is available for this service
-    if [[ -z "${TIMING_IMAGES[$service]}" ]]; then
-        log "$exp_dir" "ERROR: No timing image defined for service $service"
+    # Get windowed image name dynamically from current deployment
+    local timing_image=$(get_current_windowed_image "$service")
+    
+    if [[ -z "$timing_image" ]]; then
+        log "$exp_dir" "ERROR: Could not determine windowed image for service $service"
         return 1
     fi
     
-    local timing_image="${TIMING_IMAGES[$service]}"
+    log "$exp_dir" "Will use windowed image: $timing_image"
     local container_name=$(get_container_name "$service")
     
     # Store original configuration for cleanup
