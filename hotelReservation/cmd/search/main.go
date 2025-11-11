@@ -99,10 +99,10 @@ func main() {
 			Dur("experiment_duration", time.Duration(experimentDuration)*time.Second).
 			Msg("Starting server with windowed sampling...")
 		
-		// Start shutdown timer - stops server after experiment duration
+		// Start shutdown timer - stops sampling after experiment duration
 		go func() {
 			shutdownDelay := time.Duration(experimentDuration+5) * time.Second // Add 5s buffer
-			log.Info().Dur("shutdown_in", shutdownDelay).Msg("Will shutdown server after experiment completes")
+			log.Info().Dur("shutdown_in", shutdownDelay).Msg("Will stop sampling after experiment completes")
 			time.Sleep(shutdownDelay)
 			
 			log.Info().Msg("Experiment duration elapsed, stopping windowed sampler")
@@ -122,8 +122,7 @@ func main() {
 			// Stop timing aggregator
 			timingAgg.Stop()
 			
-			log.Info().Msg("Exiting...")
-			os.Exit(0)
+			log.Info().Msg("Sampling stopped, server continues running for data retrieval")
 		}()
 		
 		// Start server (blocks until shutdown)
