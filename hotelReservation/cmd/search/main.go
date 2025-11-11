@@ -3,11 +3,11 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"os"
-	"time"
-
 	"strconv"
+	"time"
 
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
@@ -79,21 +79,12 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to setup windowed sampling")
 		}
 		
-		// Ensure cleanup on exit
-		defer func() {
-			log.Info().Msg("Stopping windowed sampler")
-			runData, err := sampler.StopRun()
-			if err != nil {
-				log.Error().Err(err).Msg("Error stopping sampler")
-			} else if runData != nil {
-				log.Info().
-					Int("sample_count", runData.SampleCount).
-					Int("total_requests", runData.Aggregates.TotalRequests).
-					Msg("Windowed sampling completed")
-			}
-		}()
-		defer timingAgg.Stop()
-
+		// Parse experiment duration
+		experimentDuration, _ := strconv.Atoi(os.Getenv("EXPERIMENT_DURATION"))
+		if experimentDuration == 0 {
+			experimentDuration = 30 // default 30 seconds
+		}
+		
 		srv := &search.Server{
 			Tracer:           tracer,
 			Port:             servPort,
@@ -104,8 +95,42 @@ func main() {
 			TimingAggregator: timingAgg,
 		}
 
-		log.Info().Msg("Starting server with windowed sampling...")
-		log.Fatal().Msg(srv.Run().Error())
+		log.Info().
+			Dur("experiment_duration", time.Duration(experimentDuration)*time.Second).
+			Msg("Starting server with windowed sampling...")
+		
+		// Start shutdown timer - stops server after experiment duration
+		go func() {
+			shutdownDelay := time.Duration(experimentDuration+5) * time.Second // Add 5s buffer
+			log.Info().Dur("shutdown_in", shutdownDelay).Msg("Will shutdown server after experiment completes")
+			time.Sleep(shutdownDelay)
+			
+			log.Info().Msg("Experiment duration elapsed, stopping windowed sampler")
+			
+			// Stop windowed sampler and write data
+			runData, err := sampler.StopRun()
+			if err != nil {
+				log.Error().Err(err).Msg("Error stopping sampler")
+			} else if runData != nil {
+				log.Info().
+					Int("sample_count", runData.SampleCount).
+					Int("total_requests", runData.Aggregates.TotalRequests).
+					Str("output_file", fmt.Sprintf("/data/run_data_search_iter%d.json", iterationID)).
+					Msg("Windowed sampling completed and data written")
+			}
+			
+			// Stop timing aggregator
+			timingAgg.Stop()
+			
+			log.Info().Msg("Exiting...")
+			os.Exit(0)
+		}()
+		
+		// Start server (blocks until shutdown)
+		if err := srv.Run(); err != nil {
+			log.Error().Err(err).Msg("Server failed")
+			os.Exit(1)
+		}
 	} else {
 		// Standard mode without windowed sampling
 		srv := &search.Server{
@@ -118,6 +143,9 @@ func main() {
 		}
 
 		log.Info().Msg("Starting server...")
-		log.Fatal().Msg(srv.Run().Error())
+		if err := srv.Run(); err != nil {
+			log.Error().Err(err).Msg("Server failed")
+			os.Exit(1)
+		}
 	}
 }
