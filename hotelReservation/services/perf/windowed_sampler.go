@@ -89,7 +89,7 @@ type DurationStats struct {
 type windowedSampler struct {
 	config         RunConfig
 	perfHandle     *C.perf_window_handle_t
-	timingChan     chan *TimingWindowStats
+	timingChan     chan *interceptor.WindowTimingStats
 	samples        []Sample
 	sampleCounter  atomic.Int32
 	runStartTime   time.Time
@@ -114,7 +114,7 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 	ws.timingChan = config.TimingStatsChannel
 	
 	if ws.timingChan == nil {
-		ws.timingChan = make(chan *TimingWindowStats, 100)
+		ws.timingChan = make(chan *interceptor.WindowTimingStats, 100)
 	}
 	
 	// Create context with timeout
@@ -186,13 +186,13 @@ func (ws *windowedSampler) takeSample() {
 	perfCounters, perfDeltas := ws.readPerfCounters()
 	
 	// Get timing stats for this window (non-blocking)
-	var timingStats *TimingWindowStats
+	var timingStats *interceptor.WindowTimingStats
 	select {
 	case timingStats = <-ws.timingChan:
 		// Got timing data
 	default:
 		// No timing data yet, use empty stats
-		timingStats = &TimingWindowStats{RequestCount: 0}
+		timingStats = &interceptor.WindowTimingStats{RequestCount: 0}
 	}
 	
 	sample := Sample{
