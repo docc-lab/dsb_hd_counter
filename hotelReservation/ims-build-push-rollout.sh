@@ -4,6 +4,7 @@
 REGISTRY="docclabgroup"
 IMAGE_NAME="hotelreservation"
 TIMING_MODE=false
+WINDOWED_MODE=false
 
 # List of services that have kubernetes deployment files
 VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -18,7 +19,8 @@ show_usage() {
     echo "  • Applies updated deployments to Kubernetes"
     echo ""
     echo "Options:"
-    echo "  --mode-timer           Enable timing mode (generates timing-enabled Dockerfile)"
+    echo "  --mode-timer           Enable basic timing mode (timing only, no perf counters)"
+    echo "  --mode-windowed        Enable windowed sampling mode (timing + perf counters)"
     echo "  --registry=REGISTRY    Set Docker registry (default: docclabgroup)"
     echo "  --image-prefix=PREFIX  Set image name prefix (default: hotelreservation)"
     echo ""
@@ -28,12 +30,13 @@ show_usage() {
     echo "  tag        Docker image tag (default: debug0.1)"
     echo ""
     echo "Examples:"
-    echo "  $0 frontend debug0.2                                    # Deploy only frontend"
-    echo "  $0 frontend geo profile debug0.1                        # Deploy multiple specific services"
-    echo "  $0 all debug0.1                                         # Deploy all valid services"
-    echo "  $0 --mode-timer user v1-withtimer                       # Deploy user with timing"
-    echo "  $0 --mode-timer --registry=royno7 user v1-withtimer     # Deploy user with timing to royno7"
-    echo "  $0 all                                                  # Deploy all (default tag)"
+    echo "  $0 frontend debug0.2                                     # Deploy only frontend"
+    echo "  $0 frontend geo profile debug0.1                         # Deploy multiple specific services"
+    echo "  $0 all debug0.1                                          # Deploy all valid services"
+    echo "  $0 --mode-timer search v1-timer                          # Deploy search with basic timing"
+    echo "  $0 --mode-windowed search v1-windowed                    # Deploy search with windowed sampling"
+    echo "  $0 --mode-windowed --registry=royno7 search v1-windowed  # Deploy to custom registry"
+    echo "  $0 all                                                   # Deploy all (default tag)"
     echo ""
     echo "Valid services: ${VALID_SERVICES[*]}"
     echo "Registry: ${REGISTRY}/${IMAGE_NAME}"
@@ -72,12 +75,26 @@ validate_service() {
 # Function to generate timing-enabled Dockerfile for a specific service
 generate_timing_dockerfile() {
     local service=$1
-    local dockerfile_path="$(pwd)/Dockerfile.${service}-timing"
+    local mode=$2  # "timer" or "windowed"
+    local dockerfile_path="$(pwd)/Dockerfile.${service}-${mode}"
+    
+    # Determine environment variables based on mode
+    local env_vars=""
+    if [[ "$mode" == "windowed" ]]; then
+        env_vars="ENV ENABLE_WINDOWED_SAMPLING=true
+ENV ITERATION_ID=1
+ENV EXPERIMENT_DURATION=30
+ENV WINDOW_INTERVAL_MS=100
+ENV PERF_EVENTS=\"cycles,instructions,cache-misses\"
+ENV OUTPUT_DIR=/data"
+    else
+        env_vars="ENV ENABLE_TIMING=true"
+    fi
     
     cat > "$dockerfile_path" << EOF
 FROM golang:1.21 as builder
 
-RUN apt-get update && apt-get install -y gcc make binutils
+RUN apt-get update && apt-get install -y gcc make binutils linux-perf
 
 WORKDIR /workspace
 
@@ -98,17 +115,25 @@ COPY config.json config.json
 
 WORKDIR /workspace
 
-# Build perf_api static library for cgo users
-RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && ar rcs services/perf/libperf_api.a services/perf/perf_api.o
+# Build perf_api static library for CGO
+RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && \\
+    ar rcs services/perf/libperf_api.a services/perf/perf_api.o
 
-# Build the ${service} service with timing interceptor (CGO enabled for perf counters when needed)
+# Build perf_api_windowed static library for windowed sampling
+RUN gcc -c services/perf/perf_api_windowed.c -o services/perf/perf_api_windowed.o && \\
+    ar rcs services/perf/libperf_api_windowed.a services/perf/perf_api_windowed.o
+
+# Build the ${service} service (CGO enabled for perf counters)
 ENV CGO_ENABLED=1
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 
 # Runtime stage - use Debian for glibc compatibility with CGO binaries
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates linux-perf && rm -rf /var/lib/apt/lists/*
+
+# Create data directory for output
+RUN mkdir -p /data && chmod 777 /data
 
 WORKDIR /
 
@@ -119,9 +144,8 @@ COPY --from=builder /workspace/config.json /config.json
 # Ensure binary is executable
 RUN chmod +x /usr/local/bin/${service}
 
-# Environment variables for timing control
-ENV ENABLE_TIMING=true
-ENV STATS_FILE=timing_stats_${service}.json
+# Environment variables for timing/sampling control
+${env_vars}
 
 EXPOSE 8081
 
@@ -138,8 +162,12 @@ build_and_push_docker() {
     local service=$2
     local image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
 
-    if [[ "$TIMING_MODE" == "true" ]]; then
-        # In timing mode, build service-specific image
+    if [[ "$WINDOWED_MODE" == "true" ]]; then
+        # In windowed sampling mode, build service-specific image
+        image_full_name="${REGISTRY}/${service}-windowed:${tag}"
+        log_info "Building windowed sampling Docker image for $service"
+    elif [[ "$TIMING_MODE" == "true" ]]; then
+        # In basic timing mode, build service-specific image
         image_full_name="${REGISTRY}/${service}-withtimer:${tag}"
         log_info "Building timing-enabled Docker image for $service"
     else
@@ -169,16 +197,15 @@ build_and_push_docker() {
         log_info "Building Docker image: ${image_full_name}"
         log_info "Platform: ${PLATFORM}"
         
-        if [[ "$TIMING_MODE" == "true" ]]; then
-            # Generate timing-enabled Dockerfile for specific service
-            log_info "Generating timing-enabled Dockerfile for $service"
-            local dockerfile_path=$(generate_timing_dockerfile "$service")
+        if [[ "$WINDOWED_MODE" == "true" ]]; then
+            # Generate windowed sampling Dockerfile for specific service
+            log_info "Generating windowed sampling Dockerfile for $service"
+            local dockerfile_path=$(generate_timing_dockerfile "$service" "windowed")
             log_info "Using Dockerfile: ${dockerfile_path}"
             
-            # Use regular docker build for timing mode
+            # Use regular docker build for windowed mode
             if ! sudo docker build --no-cache -t "${image_full_name}" -f "$dockerfile_path" .; then
                 log_error "Docker build failed for $service"
-                # Clean up temporary Dockerfile
                 rm -f "$dockerfile_path"
                 return 1
             fi
@@ -187,12 +214,32 @@ build_and_push_docker() {
             log_info "Pushing image: ${image_full_name}"
             if ! sudo docker push "${image_full_name}"; then
                 log_error "Docker push failed for $service"
-                # Clean up temporary Dockerfile
                 rm -f "$dockerfile_path"
                 return 1
             fi
             
-            # Clean up temporary Dockerfile
+            rm -f "$dockerfile_path"
+        elif [[ "$TIMING_MODE" == "true" ]]; then
+            # Generate basic timing Dockerfile for specific service
+            log_info "Generating timing-enabled Dockerfile for $service"
+            local dockerfile_path=$(generate_timing_dockerfile "$service" "timer")
+            log_info "Using Dockerfile: ${dockerfile_path}"
+            
+            # Use regular docker build for timing mode
+            if ! sudo docker build --no-cache -t "${image_full_name}" -f "$dockerfile_path" .; then
+                log_error "Docker build failed for $service"
+                rm -f "$dockerfile_path"
+                return 1
+            fi
+            
+            # Push the image separately
+            log_info "Pushing image: ${image_full_name}"
+            if ! sudo docker push "${image_full_name}"; then
+                log_error "Docker push failed for $service"
+                rm -f "$dockerfile_path"
+                return 1
+            fi
+            
             rm -f "$dockerfile_path"
         else
             # Use docker buildx for better platform support (normal mode)
@@ -261,7 +308,9 @@ update_yaml_files() {
         fi
     done
     
-    if [[ "$TIMING_MODE" == "true" ]]; then
+    if [[ "$WINDOWED_MODE" == "true" ]]; then
+        log_info "Updating YAML files for windowed sampling mode (service-specific images)"
+    elif [[ "$TIMING_MODE" == "true" ]]; then
         log_info "Updating YAML files for timing mode (service-specific images)"
     else
         log_info "Updating YAML files to use image: ${image_full_name}"
@@ -289,7 +338,9 @@ update_yaml_files() {
             
             # Determine the correct image name for this service
             local service_image_name="${image_full_name}"
-            if [[ "$TIMING_MODE" == "true" ]]; then
+            if [[ "$WINDOWED_MODE" == "true" ]]; then
+                service_image_name="${REGISTRY}/${service}-windowed:${tag}"
+            elif [[ "$TIMING_MODE" == "true" ]]; then
                 service_image_name="${REGISTRY}/${service}-withtimer:${tag}"
             fi
             
@@ -343,27 +394,31 @@ deploy_multiple_services() {
         fi
     done
     
-    # Check timing mode restrictions
-    if [[ "$TIMING_MODE" == "true" ]]; then
-        # In timing mode, check if "all" is specified
+    # Check timing/windowed mode restrictions
+    if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]]; then
+        # In timing/windowed mode, check if "all" is specified
         for service in "${services[@]}"; do
             if [[ "$service" == "all" ]]; then
-                log_error "Timing mode does not support 'all' services. Please specify individual services."
+                log_error "Timing/Windowed mode does not support 'all' services. Please specify individual services."
                 return 1
             fi
         done
     fi
     
     echo "=========================================="
-    if [[ "$TIMING_MODE" == "true" ]]; then
+    if [[ "$WINDOWED_MODE" == "true" ]]; then
+        echo "Deploying Windowed Sampling Hotel Reservation Services"
+    elif [[ "$TIMING_MODE" == "true" ]]; then
         echo "Deploying Timing-Enabled Hotel Reservation Services"
     else
         echo "Deploying Hotel Reservation Services"
     fi
     echo "Services: ${services[*]}"
     echo "Tag: $tag"
-    if [[ "$TIMING_MODE" == "true" ]]; then
-        echo "Mode: Timing-enabled (service-specific images)"
+    if [[ "$WINDOWED_MODE" == "true" ]]; then
+        echo "Mode: Windowed sampling (timing + perf counters)"
+    elif [[ "$TIMING_MODE" == "true" ]]; then
+        echo "Mode: Basic timing (service-specific images)"
     else
         echo "Image: ${REGISTRY}/${IMAGE_NAME}:${tag}"
     fi
@@ -371,18 +426,22 @@ deploy_multiple_services() {
     
     # Phase 1: Build and push image(s)
     log_info "Phase 1: Building and pushing Docker image(s)"
-    if [[ "$TIMING_MODE" == "true" ]]; then
-        # In timing mode, build each service individually
+    if [[ "$WINDOWED_MODE" == "true" ]] || [[ "$TIMING_MODE" == "true" ]]; then
+        # In timing/windowed mode, build each service individually
         for service in "${services[@]}"; do
             if ! build_and_push_docker "$tag" "$service"; then
-                log_error "Failed to build/push timing image for $service"
+                if [[ "$WINDOWED_MODE" == "true" ]]; then
+                    log_error "Failed to build/push windowed sampling image for $service"
+                else
+                    log_error "Failed to build/push timing image for $service"
+                fi
                 failed_services+=("$service")
                 continue
             fi
         done
         
         if [[ ${#failed_services[@]} -gt 0 ]]; then
-            log_error "Failed to build timing images for: ${failed_services[*]}"
+            log_error "Failed to build images for: ${failed_services[*]}"
             return 1
         fi
     else
@@ -472,6 +531,10 @@ while [[ $# -gt 0 ]]; do
             TIMING_MODE=true
             shift
             ;;
+        --mode-windowed)
+            WINDOWED_MODE=true
+            shift
+            ;;
         --registry=*)
             REGISTRY="${1#*=}"
             shift
@@ -523,19 +586,21 @@ if [[ ${#services_to_deploy[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Check timing mode restrictions
-if [[ "$TIMING_MODE" == "true" ]]; then
-    # In timing mode, check if "all" is specified
+# Check timing/windowed mode restrictions
+if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]]; then
+    # In timing/windowed mode, check if "all" is specified
     for service in "${services_to_deploy[@]}"; do
         if [[ "$service" == "all" ]]; then
-            log_error "Timing mode does not support 'all' services. Please specify individual services."
+            log_error "Timing/Windowed mode does not support 'all' services. Please specify individual services."
             exit 1
         fi
     done
 fi
 
 log_info "Deploying services: ${services_to_deploy[*]} with tag: $tag"
-if [[ "$TIMING_MODE" == "true" ]]; then
+if [[ "$WINDOWED_MODE" == "true" ]]; then
+    log_info "Windowed sampling mode enabled - building service-specific images with perf counters"
+elif [[ "$TIMING_MODE" == "true" ]]; then
     log_info "Timing mode enabled - building service-specific images"
 fi
 
