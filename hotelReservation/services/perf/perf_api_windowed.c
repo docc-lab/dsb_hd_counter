@@ -165,29 +165,32 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, const char* 
     pe.inherit = 1;  // Count events from child threads
     // Note: NOT using read_format flags to keep simple uint64 reads
     
-    // Open events for each CPU
-    for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
-        int group_fd = -1;  // Separate event group per CPU
-        int target_cpu = handle->cpus[cpu_idx];
+    // Simplified approach for Go multi-threaded programs:
+    // Use pid=-1 (all processes) + cpu=specific to count ALL activity on those CPUs
+    // This captures victim service + noisy neighbor + system on the pinned CPUs
+    int group_fd = -1;
+    
+    for (int event_idx = 0; event_idx < handle->event_count; event_idx++) {
+        const perf_event_config_t* config = find_event_config(handle->event_names[event_idx]);
+        if (!config) {
+            fprintf(stderr, "Unknown event: %s\n", handle->event_names[event_idx]);
+            perf_window_cleanup(handle);
+            return NULL;
+        }
         
-        for (int event_idx = 0; event_idx < handle->event_count; event_idx++) {
-            const perf_event_config_t* config = find_event_config(handle->event_names[event_idx]);
-            if (!config) {
-                fprintf(stderr, "Unknown event: %s\n", handle->event_names[event_idx]);
-                perf_window_cleanup(handle);
-                return NULL;
-            }
+        pe.type = config->type;
+        pe.config = config->config;
+        pe.disabled = (event_idx == 0) ? 1 : 0;
+        
+        // For multi-CPU: aggregate across all CPUs in the set
+        for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
+            int target_cpu = handle->cpus[cpu_idx];
+            int cpu_group_fd = (event_idx == 0) ? -1 : handle->event_fds[0][cpu_idx];
             
-            pe.type = config->type;
-            pe.config = config->config;
-            
-            // First event in group is the leader
-            pe.disabled = (event_idx == 0) ? 1 : 0;
-            
-            // Open event for this CPU
-            // pid=0: current process (all threads with inherit=1)
-            // cpu=target_cpu: specific CPU or -1 for all
-            int fd = perf_event_open(&pe, 0, target_cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
+            // pid=-1: count ALL processes/threads on this CPU
+            // cpu=target: specific CPU
+            // This counts total CPU activity (victim + contention)
+            int fd = perf_event_open(&pe, -1, target_cpu, cpu_group_fd, PERF_FLAG_FD_CLOEXEC);
             if (fd == -1) {
                 fprintf(stderr, "Failed to open perf event %s on CPU %d: %s\n", 
                         handle->event_names[event_idx], target_cpu, strerror(errno));
@@ -196,22 +199,19 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, const char* 
             }
             
             handle->event_fds[event_idx][cpu_idx] = fd;
-            
-            // First fd is the group leader for this CPU
-            if (event_idx == 0) {
-                group_fd = fd;
-            }
         }
-        
-        // Enable counters for this CPU group
+    }
+    
+    // Enable all counters (enable first CPU's group leader enables all)
+    for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
         if (ioctl(handle->event_fds[0][cpu_idx], PERF_EVENT_IOC_RESET, 0) == -1) {
             fprintf(stderr, "Warning: Failed to reset counters for CPU %d: %s\n", 
-                    target_cpu, strerror(errno));
+                    handle->cpus[cpu_idx], strerror(errno));
         }
         
         if (ioctl(handle->event_fds[0][cpu_idx], PERF_EVENT_IOC_ENABLE, 0) == -1) {
             fprintf(stderr, "Warning: Failed to enable counters for CPU %d: %s\n", 
-                    target_cpu, strerror(errno));
+                    handle->cpus[cpu_idx], strerror(errno));
         }
     }
     
@@ -219,10 +219,10 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, const char* 
     
     // Print initialization message
     if (handle->cpu_count == 1 && handle->cpus[0] == -1) {
-        fprintf(stderr, "Initialized windowed perf sampling with %d events on ALL CPUs\n", 
+        fprintf(stderr, "Initialized windowed perf sampling with %d events on ALL CPUs (pid=-1, system-wide)\n", 
                 handle->event_count);
     } else {
-        fprintf(stderr, "Initialized windowed perf sampling with %d events on %d CPUs: ", 
+        fprintf(stderr, "Initialized windowed perf sampling with %d events on %d CPUs (pid=-1, system-wide): ", 
                 handle->event_count, handle->cpu_count);
         for (int i = 0; i < handle->cpu_count; i++) {
             fprintf(stderr, "%d%s", handle->cpus[i], (i < handle->cpu_count-1) ? "," : "\n");
