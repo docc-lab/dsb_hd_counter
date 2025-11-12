@@ -119,6 +119,7 @@ generate_timing_dockerfile() {
 ENV ITERATION_ID=1
 ENV EXPERIMENT_DURATION=30
 ENV WINDOW_INTERVAL_MS=100
+ENV CPU_SET=0,1,2
 ENV PERF_EVENTS=\"cycles,instructions,cache-misses\"
 ENV OUTPUT_DIR=/data"
     else
@@ -183,8 +184,9 @@ ${env_vars}
 
 EXPOSE 8081
 
-# Use absolute path so K8s command overrides still work
-ENTRYPOINT ["/usr/local/bin/${service}"]
+# Use taskset to pin process to specific CPUs for accurate perf monitoring
+# CPU_SET env var can be overridden at runtime
+ENTRYPOINT ["sh", "-c", "if [ -n \"\$CPU_SET\" ]; then exec taskset -c \$CPU_SET /usr/local/bin/${service}; else exec /usr/local/bin/${service}; fi"]
 EOF
 
     echo "$dockerfile_path"

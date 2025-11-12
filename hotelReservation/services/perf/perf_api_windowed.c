@@ -97,7 +97,28 @@ static int parse_event_names(const char* event_names_str, char** event_names_out
     return count;
 }
 
-perf_window_handle_t* perf_window_init(const char* event_names_str, int cpu) {
+// Parse CPU set string "0,1,2" into array
+static int parse_cpu_set(const char* cpu_set_str, int* cpus_out, int max_cpus) {
+    if (!cpu_set_str || strcmp(cpu_set_str, "-1") == 0) {
+        // Monitor all CPUs - use -1 as single entry
+        cpus_out[0] = -1;
+        return 1;
+    }
+    
+    int count = 0;
+    char* str_copy = strdup(cpu_set_str);
+    char* token = strtok(str_copy, ",");
+    
+    while (token && count < max_cpus) {
+        cpus_out[count++] = atoi(token);
+        token = strtok(NULL, ",");
+    }
+    
+    free(str_copy);
+    return count;
+}
+
+perf_window_handle_t* perf_window_init(const char* event_names_str, const char* cpu_set) {
     perf_window_handle_t* handle = (perf_window_handle_t*)calloc(1, sizeof(perf_window_handle_t));
     if (!handle) {
         fprintf(stderr, "Failed to allocate handle\n");
@@ -106,19 +127,20 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, int cpu) {
     
     // Initialize all fds to -1
     for (int i = 0; i < MAX_EVENTS; i++) {
-        handle->event_fds[i] = -1;
+        for (int j = 0; j < MAX_CPUS; j++) {
+            handle->event_fds[i][j] = -1;
+        }
         handle->event_names[i] = NULL;
         handle->last_values[i] = 0;
     }
     
-    // Determine CPU
-    if (cpu < 0) {
-        cpu = sched_getcpu();
-        if (cpu < 0) {
-            cpu = -1; // Monitor all CPUs for this thread
-        }
+    // Parse CPU set
+    handle->cpu_count = parse_cpu_set(cpu_set, handle->cpus, MAX_CPUS);
+    if (handle->cpu_count == 0) {
+        fprintf(stderr, "Failed to parse CPU set: %s\n", cpu_set);
+        free(handle);
+        return NULL;
     }
-    handle->cpu = cpu;
     
     // Parse event names
     char* event_names[MAX_EVENTS];
@@ -134,68 +156,78 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, int cpu) {
         handle->event_names[i] = event_names[i];
     }
     
-    // Open perf events
+    // Open perf events for each CPU in the set
     struct perf_event_attr pe = {0};
     pe.size = sizeof(struct perf_event_attr);
     pe.disabled = 1;
     pe.exclude_kernel = 1;
     pe.exclude_hv = 1;
-    pe.inherit = 1;  // Count events from child threads/processes
+    pe.inherit = 1;  // Count events from child threads
+    pe.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
     
-    int group_fd = -1;
-    
-    for (int i = 0; i < handle->event_count; i++) {
-        const perf_event_config_t* config = find_event_config(handle->event_names[i]);
-        if (!config) {
-            fprintf(stderr, "Unknown event: %s\n", handle->event_names[i]);
-            perf_window_cleanup(handle);
-            return NULL;
+    // Open events for each CPU
+    for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
+        int group_fd = -1;  // Separate event group per CPU
+        int target_cpu = handle->cpus[cpu_idx];
+        
+        for (int event_idx = 0; event_idx < handle->event_count; event_idx++) {
+            const perf_event_config_t* config = find_event_config(handle->event_names[event_idx]);
+            if (!config) {
+                fprintf(stderr, "Unknown event: %s\n", handle->event_names[event_idx]);
+                perf_window_cleanup(handle);
+                return NULL;
+            }
+            
+            pe.type = config->type;
+            pe.config = config->config;
+            
+            // First event in group is the leader
+            pe.disabled = (event_idx == 0) ? 1 : 0;
+            
+            // Open event for this CPU
+            // pid=0: current process (all threads with inherit=1)
+            // cpu=target_cpu: specific CPU or -1 for all
+            int fd = perf_event_open(&pe, 0, target_cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
+            if (fd == -1) {
+                fprintf(stderr, "Failed to open perf event %s on CPU %d: %s\n", 
+                        handle->event_names[event_idx], target_cpu, strerror(errno));
+                perf_window_cleanup(handle);
+                return NULL;
+            }
+            
+            handle->event_fds[event_idx][cpu_idx] = fd;
+            
+            // First fd is the group leader for this CPU
+            if (event_idx == 0) {
+                group_fd = fd;
+            }
         }
         
-        pe.type = config->type;
-        pe.config = config->config;
-        
-        // First event is the group leader
-        if (i == 0) {
-            pe.disabled = 1;
-        } else {
-            pe.disabled = 0;
+        // Enable counters for this CPU group
+        if (ioctl(handle->event_fds[0][cpu_idx], PERF_EVENT_IOC_RESET, 0) == -1) {
+            fprintf(stderr, "Warning: Failed to reset counters for CPU %d: %s\n", 
+                    target_cpu, strerror(errno));
         }
         
-        // Open event (monitor current thread/process: pid=0)
-        int fd = perf_event_open(&pe, 0, handle->cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
-        if (fd == -1) {
-            fprintf(stderr, "Failed to open perf event %s: %s (type=%u, config=%llu)\n", 
-                    handle->event_names[i], strerror(errno), pe.type, pe.config);
-            perf_window_cleanup(handle);
-            return NULL;
+        if (ioctl(handle->event_fds[0][cpu_idx], PERF_EVENT_IOC_ENABLE, 0) == -1) {
+            fprintf(stderr, "Warning: Failed to enable counters for CPU %d: %s\n", 
+                    target_cpu, strerror(errno));
         }
-        
-        handle->event_fds[i] = fd;
-        
-        // First fd is the group leader
-        if (i == 0) {
-            group_fd = fd;
-        }
-    }
-    
-    // Enable all counters (group leader enables all)
-    if (ioctl(handle->event_fds[0], PERF_EVENT_IOC_RESET, 0) == -1) {
-        fprintf(stderr, "Failed to reset counters: %s\n", strerror(errno));
-        perf_window_cleanup(handle);
-        return NULL;
-    }
-    
-    if (ioctl(handle->event_fds[0], PERF_EVENT_IOC_ENABLE, 0) == -1) {
-        fprintf(stderr, "Failed to enable counters: %s\n", strerror(errno));
-        perf_window_cleanup(handle);
-        return NULL;
     }
     
     handle->initialized = 1;
     
-    fprintf(stderr, "Initialized windowed perf sampling with %d events on CPU %d\n", 
-            handle->event_count, handle->cpu);
+    // Print initialization message
+    if (handle->cpu_count == 1 && handle->cpus[0] == -1) {
+        fprintf(stderr, "Initialized windowed perf sampling with %d events on ALL CPUs\n", 
+                handle->event_count);
+    } else {
+        fprintf(stderr, "Initialized windowed perf sampling with %d events on %d CPUs: ", 
+                handle->event_count, handle->cpu_count);
+        for (int i = 0; i < handle->cpu_count; i++) {
+            fprintf(stderr, "%d%s", handle->cpus[i], (i < handle->cpu_count-1) ? "," : "\n");
+        }
+    }
     
     return handle;
 }
@@ -211,32 +243,63 @@ int perf_window_sample(perf_window_handle_t* handle,
         return -1;
     }
     
-    // Read all counters
-    for (int i = 0; i < handle->event_count; i++) {
-        uint64_t value = 0;
-        ssize_t bytes_read = read(handle->event_fds[i], &value, sizeof(value));
+    // Aggregate counters across all CPUs
+    for (int event_idx = 0; event_idx < handle->event_count; event_idx++) {
+        uint64_t total_value = 0;
+        int read_errors = 0;
         
-        if (bytes_read != sizeof(value)) {
-            fprintf(stderr, "Failed to read counter %s: %s\n", 
-                    handle->event_names[i], strerror(errno));
+        // Read counter from each CPU and aggregate
+        for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
+            uint64_t value = 0;
+            int fd = handle->event_fds[event_idx][cpu_idx];
+            
+            if (fd < 0) {
+                continue; // Skip invalid FD
+            }
+            
+            // Read counter value (with proper error handling)
+            ssize_t bytes_read = read(fd, &value, sizeof(value));
+            
+            if (bytes_read < 0) {
+                fprintf(stderr, "Warning: read() failed for event %s on CPU %d (fd=%d): %s\n", 
+                        handle->event_names[event_idx], handle->cpus[cpu_idx], fd, strerror(errno));
+                read_errors++;
+                continue;
+            }
+            
+            if (bytes_read != sizeof(value)) {
+                fprintf(stderr, "Warning: partial read for event %s on CPU %d: got %zd bytes, expected %zu\n",
+                        handle->event_names[event_idx], handle->cpus[cpu_idx], bytes_read, sizeof(value));
+                read_errors++;
+                continue;
+            }
+            
+            // Accumulate value from this CPU
+            total_value += value;
+        }
+        
+        // If all CPUs failed to read, return error
+        if (read_errors == handle->cpu_count) {
+            fprintf(stderr, "Error: All CPUs failed to read event %s\n", handle->event_names[event_idx]);
             return -1;
         }
         
-        values_out[i] = value;
+        // Store aggregated value
+        values_out[event_idx] = total_value;
         
         // Calculate delta if requested
         if (deltas_out) {
-            if (handle->last_values[i] == 0) {
+            if (handle->last_values[event_idx] == 0) {
                 // First sample, delta is same as value
-                deltas_out[i] = value;
+                deltas_out[event_idx] = total_value;
             } else {
-                // Delta is difference from last sample
-                deltas_out[i] = value - handle->last_values[i];
+                // Delta is difference from last aggregated sample
+                deltas_out[event_idx] = total_value - handle->last_values[event_idx];
             }
         }
         
-        // Update last value
-        handle->last_values[i] = value;
+        // Update last aggregated value
+        handle->last_values[event_idx] = total_value;
     }
     
     return 0;
@@ -247,13 +310,17 @@ int perf_window_reset(perf_window_handle_t* handle) {
         return -1;
     }
     
-    // Reset all counters
-    if (ioctl(handle->event_fds[0], PERF_EVENT_IOC_RESET, 0) == -1) {
-        fprintf(stderr, "Failed to reset counters: %s\n", strerror(errno));
-        return -1;
+    // Reset all counters for all CPUs
+    for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
+        if (handle->event_fds[0][cpu_idx] >= 0) {
+            if (ioctl(handle->event_fds[0][cpu_idx], PERF_EVENT_IOC_RESET, 0) == -1) {
+                fprintf(stderr, "Warning: Failed to reset counters for CPU %d: %s\n", 
+                        handle->cpus[cpu_idx], strerror(errno));
+            }
+        }
     }
     
-    // Reset last values
+    // Reset last aggregated values
     for (int i = 0; i < handle->event_count; i++) {
         handle->last_values[i] = 0;
     }
@@ -271,13 +338,15 @@ const char* perf_window_get_event_name(perf_window_handle_t* handle, int index) 
 void perf_window_cleanup(perf_window_handle_t* handle) {
     if (!handle) return;
     
-    // Close all file descriptors
-    for (int i = 0; i < handle->event_count; i++) {
-        if (handle->event_fds[i] >= 0) {
-            close(handle->event_fds[i]);
+    // Close all file descriptors (all events, all CPUs)
+    for (int event_idx = 0; event_idx < MAX_EVENTS; event_idx++) {
+        for (int cpu_idx = 0; cpu_idx < MAX_CPUS; cpu_idx++) {
+            if (handle->event_fds[event_idx][cpu_idx] >= 0) {
+                close(handle->event_fds[event_idx][cpu_idx]);
+            }
         }
-        if (handle->event_names[i]) {
-            free(handle->event_names[i]);
+        if (handle->event_names[event_idx]) {
+            free(handle->event_names[event_idx]);
         }
     }
     

@@ -138,10 +138,18 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 	cEventNames := C.CString(eventNamesStr)
 	defer C.free(unsafe.Pointer(cEventNames))
 	
-	// Initialize perf counters
-	ws.perfHandle = C.perf_window_init(cEventNames, -1) // -1 = current CPU
+	// Get CPU set from environment (e.g., "0,1,2")
+	cpuSet := os.Getenv("CPU_SET")
+	if cpuSet == "" {
+		cpuSet = "-1" // Default: all CPUs
+	}
+	cCpuSet := C.CString(cpuSet)
+	defer C.free(unsafe.Pointer(cCpuSet))
+	
+	// Initialize perf counters with CPU set
+	ws.perfHandle = C.perf_window_init(cEventNames, cCpuSet)
 	if ws.perfHandle == nil {
-		return fmt.Errorf("failed to initialize perf counters for events: %s", eventNamesStr)
+		return fmt.Errorf("failed to initialize perf counters for events: %s on CPUs: %s", eventNamesStr, cpuSet)
 	}
 	
 	log.Info().

@@ -14,6 +14,10 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
 WINDOWED_IMAGE_SUFFIX="windowed"
 
+# CPU allocation configuration
+CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
+STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
+
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
@@ -262,6 +266,33 @@ update_deployment_for_timing() {
         return 1
     fi
     
+    # Assign CPU set for this service (for taskset and perf monitoring)
+    # Calculate CPU range based on service index
+    local service_index=0
+    for idx in "${!VALID_TIMING_SERVICES[@]}"; do
+        if [[ "${VALID_TIMING_SERVICES[$idx]}" == "$service" ]]; then
+            service_index=$idx
+            break
+        fi
+    done
+    
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
+    local cpu_set=""
+    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
+        if [ -z "$cpu_set" ]; then
+            cpu_set="$cpu"
+        else
+            cpu_set="$cpu_set,$cpu"
+        fi
+    done
+    
+    log "$exp_dir" "  Assigning CPU set for $service: $cpu_set"
+    if ! kubectl set env "deployment/$service" "CPU_SET=${cpu_set}"; then
+        log "$exp_dir" "ERROR: Failed to set CPU_SET for $service"
+        return 1
+    fi
+    
     # Set ring buffer configuration (optional tuning parameters)
     local buffer_size="${TIMING_BUFFER_SIZE:-2048}"
     if ! kubectl set env "deployment/$service" "TIMING_BUFFER_SIZE=${buffer_size}"; then
@@ -275,10 +306,9 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Note: Ring buffer is now always used (no factory pattern)
-    
     log "$exp_dir" "Successfully updated deployment configuration for $service"
     log "$exp_dir" "  Windowed Sampling: enabled"
+    log "$exp_dir" "  CPU Set: $cpu_set (taskset pinning + perf monitoring)"
     log "$exp_dir" "  Run Duration: ${EXPERIMENT_DURATION}s"
     log "$exp_dir" "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
     log "$exp_dir" "  Perf Events: ${PERF_EVENTS}"
@@ -473,6 +503,7 @@ cleanup_windowed_sampling_resources() {
                 kubectl set env "deployment/$service" ITERATION_ID- 2>/dev/null || true
                 kubectl set env "deployment/$service" EXPERIMENT_DURATION- 2>/dev/null || true
                 kubectl set env "deployment/$service" WINDOW_INTERVAL_MS- 2>/dev/null || true
+                kubectl set env "deployment/$service" CPU_SET- 2>/dev/null || true
                 kubectl set env "deployment/$service" PERF_EVENTS- 2>/dev/null || true
                 kubectl set env "deployment/$service" OUTPUT_DIR- 2>/dev/null || true
                 kubectl set env "deployment/$service" TIMING_BUFFER_SIZE- 2>/dev/null || true

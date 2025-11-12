@@ -4,15 +4,17 @@
 #include <stdint.h>
 
 #define MAX_EVENTS 16
+#define MAX_CPUS 16
 
 // Handle for windowed sampling session
 typedef struct perf_window_handle {
-    int event_fds[MAX_EVENTS];        // File descriptors for all monitored events
-    int event_count;                   // Number of active events
-    int cpu;                           // CPU pinned to (-1 for any)
-    uint64_t last_values[MAX_EVENTS];  // Previous values for delta calculation
-    char* event_names[MAX_EVENTS];     // Event name strings (for debugging)
-    int initialized;                   // 1 if successfully initialized
+    int event_fds[MAX_EVENTS][MAX_CPUS]; // File descriptors [event][cpu]
+    int event_count;                      // Number of active events
+    int cpu_count;                        // Number of CPUs being monitored
+    int cpus[MAX_CPUS];                   // CPU IDs being monitored
+    uint64_t last_values[MAX_EVENTS];     // Previous aggregated values for delta calculation
+    char* event_names[MAX_EVENTS];        // Event name strings (for debugging)
+    int initialized;                      // 1 if successfully initialized
 } perf_window_handle_t;
 
 // Event name to perf event config mapping
@@ -24,9 +26,9 @@ typedef struct perf_event_config {
 
 // Initialize windowed sampling for continuous monitoring
 // event_names: comma-separated string like "cycles,instructions,cache-misses"
-// cpu: CPU to monitor (-1 for current CPU, 0 for any CPU)
+// cpu_set: comma-separated CPU IDs like "0,1,2" (NULL or "-1" for all CPUs)
 // Returns handle on success, NULL on error
-perf_window_handle_t* perf_window_init(const char* event_names_str, int cpu);
+perf_window_handle_t* perf_window_init(const char* event_names_str, const char* cpu_set);
 
 // Take a sample (non-destructive read, counters keep running)
 // handle: window handle from perf_window_init
