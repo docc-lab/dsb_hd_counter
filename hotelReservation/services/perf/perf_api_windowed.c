@@ -163,6 +163,7 @@ perf_window_handle_t* perf_window_init(const char* event_names_str, const char* 
     pe.exclude_kernel = 1;
     pe.exclude_hv = 1;
     pe.inherit = 1;  // Count events from child threads
+    // Note: NOT using read_format flags to keep simple uint64 reads
     
     // Open events for each CPU
     for (int cpu_idx = 0; cpu_idx < handle->cpu_count; cpu_idx++) {
