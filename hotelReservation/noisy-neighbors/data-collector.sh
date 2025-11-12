@@ -11,30 +11,61 @@ WRK2_DIR="${WRK2_DIR:-../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
-TIMING_REGISTRY="royno7"
-TIMING_IMAGE_PREFIX="service-withtimer"
-TIMING_TAG="v1-withtimer"
+TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
+WINDOWED_IMAGE_SUFFIX="windowed"
 
-# Valid services for timing integration and their timing-enabled images
-declare -A TIMING_IMAGES=(
-    ["user"]="${TIMING_REGISTRY}/user-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["frontend"]="${TIMING_REGISTRY}/frontend-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["search"]="${TIMING_REGISTRY}/search-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["profile"]="${TIMING_REGISTRY}/profile-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["rate"]="${TIMING_REGISTRY}/rate-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["recommendation"]="${TIMING_REGISTRY}/recommendation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["reservation"]="${TIMING_REGISTRY}/reservation-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-    ["geo"]="${TIMING_REGISTRY}/geo-${TIMING_IMAGE_PREFIX}:${TIMING_TAG}"
-)
+# CPU allocation configuration
+CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
+STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
 
+# Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
+
+# Get current image for a service from deployment
+get_current_windowed_image() {
+    local service="$1"
+    
+    # Get current image from deployment
+    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    
+    if [[ -z "$current_image" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # If already using a windowed image, return it as-is
+    if [[ "$current_image" == *"-windowed:"* ]]; then
+        echo "$current_image"
+        return 0
+    fi
+    
+    # If not a windowed image, construct windowed version with same tag
+    # Extract registry, image name, and tag
+    # Format could be: registry/image:tag or just image:tag
+    if [[ "$current_image" =~ ^([^/]+)/([^:]+):(.+)$ ]]; then
+        # Has registry: registry/image:tag
+        local registry="${BASH_REMATCH[1]}"
+        local image="${BASH_REMATCH[2]}"
+        local tag="${BASH_REMATCH[3]}"
+        echo "${registry}/${service}-windowed:${tag}"
+    elif [[ "$current_image" =~ ^([^:]+):(.+)$ ]]; then
+        # No registry: image:tag
+        local tag="${BASH_REMATCH[2]}"
+        echo "${TIMING_REGISTRY}/${service}-windowed:${tag}"
+    else
+        # Fallback: use default registry and latest tag
+        echo "${TIMING_REGISTRY}/${service}-windowed:latest"
+    fi
+}
+
+# Timing images are determined dynamically based on current deployment
+declare -A TIMING_IMAGES
 
 # Path to timing image build script
 TIMING_BUILD_SCRIPT="../build-timing-images.sh"
 
 # existing script paths
 STRESS_SCRIPT="$SCRIPTS_DIR/stress-ng/stress-ng-helpers.sh"
-MONITOR_SCRIPT="$SCRIPTS_DIR/perf/service-monitor.sh"
 TAINT_SCRIPT="$SCRIPTS_DIR/node-taint.sh"
 
 # Generate unique experiment ID
@@ -47,9 +78,9 @@ create_exp_directory() {
     local exp_id="$1"
     local exp_dir="$DATA_DIR/$exp_id"
     
-    mkdir -p "$exp_dir"/{raw,processed,logs,metadata,timing}
-    mkdir -p "$exp_dir/raw"/{perf,latency,system,stress}
-    mkdir -p "$exp_dir/timing"/{data,tmp}
+    mkdir -p "$exp_dir"/{raw,processed,logs,metadata}
+    mkdir -p "$exp_dir/raw"/{windowed,latency,system,stress}
+    mkdir -p "$exp_dir/processed"/{aggregated}
     
     echo "$exp_dir"
 }
@@ -113,9 +144,15 @@ ensure_timing_image_exists() {
     local service="$1"
     local exp_dir="$2"
     
-    local timing_image="${TIMING_IMAGES[$service]}"
+    # Get windowed image name dynamically from current deployment
+    local timing_image=$(get_current_windowed_image "$service")
     
-    log "$exp_dir" "Checking if timing image exists: $timing_image"
+    if [[ -z "$timing_image" ]]; then
+        log "$exp_dir" "ERROR: Could not determine windowed image for $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "Checking if windowed image exists: $timing_image"
     
     # Check if image exists in registry (try to pull)
     if docker pull "$timing_image" &>/dev/null; then
@@ -156,25 +193,28 @@ store_original_config() {
     local current_env=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
     
     # Store in file for cleanup
-    echo "$service:$current_image:$current_env" >> "$exp_dir/timing/original_configs.txt"
+    echo "$service:$current_image:$current_env" >> "$exp_dir/metadata/original_configs.txt"
     
     log "$exp_dir" "Stored original config - Image: $current_image"
 }
 
-# Update deployment to use timing-enabled image and environment
+# Update deployment to use timing-enabled image and environment (with windowed sampling)
 update_deployment_for_timing() {
     local service="$1"
     local exp_dir="$2"
+    local iteration="${3:-1}"  # Optional: iteration number (default 1)
     
-    log "$exp_dir" "Updating deployment for $service with timing configuration"
+    log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
-    # Check if timing image is available for this service
-    if [[ -z "${TIMING_IMAGES[$service]}" ]]; then
-        log "$exp_dir" "ERROR: No timing image defined for service $service"
+    # Get windowed image name dynamically from current deployment
+    local timing_image=$(get_current_windowed_image "$service")
+    
+    if [[ -z "$timing_image" ]]; then
+        log "$exp_dir" "ERROR: Could not determine windowed image for service $service"
         return 1
     fi
     
-    local timing_image="${TIMING_IMAGES[$service]}"
+    log "$exp_dir" "Will use windowed image: $timing_image"
     local container_name=$(get_container_name "$service")
     
     # Store original configuration for cleanup
@@ -187,19 +227,93 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Set environment variables
-    log "$exp_dir" "Setting environment variables for $service"
-    if ! kubectl set env "deployment/$service" ENABLE_TIMING=true; then
-        log "$exp_dir" "ERROR: Failed to set ENABLE_TIMING for $service"
+    # Set windowed sampling environment variables
+    log "$exp_dir" "Setting windowed sampling environment variables for $service"
+    
+    # Enable windowed sampling
+    if ! kubectl set env "deployment/$service" "ENABLE_WINDOWED_SAMPLING=${ENABLE_WINDOWED_SAMPLING:-true}"; then
+        log "$exp_dir" "ERROR: Failed to set ENABLE_WINDOWED_SAMPLING for $service"
         return 1
     fi
     
-    if ! kubectl set env "deployment/$service" "STATS_FILE=timing_stats_${service}.json"; then
-        log "$exp_dir" "ERROR: Failed to set STATS_FILE for $service"
+    # Set iteration ID for this iteration
+    if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
+        log "$exp_dir" "ERROR: Failed to set ITERATION_ID for $service"
+        return 1
+    fi
+    
+    # Set experiment duration (run duration)
+    if ! kubectl set env "deployment/$service" "EXPERIMENT_DURATION=${EXPERIMENT_DURATION}"; then
+        log "$exp_dir" "ERROR: Failed to set EXPERIMENT_DURATION for $service"
+        return 1
+    fi
+    
+    # Set window interval (sampling interval)
+    if ! kubectl set env "deployment/$service" "WINDOW_INTERVAL_MS=${WINDOW_INTERVAL_MS:-100}"; then
+        log "$exp_dir" "ERROR: Failed to set WINDOW_INTERVAL_MS for $service"
+        return 1
+    fi
+    
+    # Set perf events
+    if ! kubectl set env "deployment/$service" "PERF_EVENTS=${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}"; then
+        log "$exp_dir" "ERROR: Failed to set PERF_EVENTS for $service"
+        return 1
+    fi
+    
+    # Set output directory
+    if ! kubectl set env "deployment/$service" "OUTPUT_DIR=/data"; then
+        log "$exp_dir" "ERROR: Failed to set OUTPUT_DIR for $service"
+        return 1
+    fi
+    
+    # Assign CPU set for this service (for taskset and perf monitoring)
+    # Calculate CPU range based on service index
+    local service_index=0
+    for idx in "${!VALID_TIMING_SERVICES[@]}"; do
+        if [[ "${VALID_TIMING_SERVICES[$idx]}" == "$service" ]]; then
+            service_index=$idx
+            break
+        fi
+    done
+    
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
+    local cpu_set=""
+    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
+        if [ -z "$cpu_set" ]; then
+            cpu_set="$cpu"
+        else
+            cpu_set="$cpu_set,$cpu"
+        fi
+    done
+    
+    log "$exp_dir" "  Assigning CPU set for $service: $cpu_set"
+    if ! kubectl set env "deployment/$service" "CPU_SET=${cpu_set}"; then
+        log "$exp_dir" "ERROR: Failed to set CPU_SET for $service"
+        return 1
+    fi
+    
+    # Set ring buffer configuration (optional tuning parameters)
+    local buffer_size="${TIMING_BUFFER_SIZE:-2048}"
+    if ! kubectl set env "deployment/$service" "TIMING_BUFFER_SIZE=${buffer_size}"; then
+        log "$exp_dir" "ERROR: Failed to set TIMING_BUFFER_SIZE for $service"
+        return 1
+    fi
+    
+    local flush_threshold="${TIMING_FLUSH_THRESHOLD:-80}"
+    if ! kubectl set env "deployment/$service" "TIMING_FLUSH_THRESHOLD=${flush_threshold}"; then
+        log "$exp_dir" "ERROR: Failed to set TIMING_FLUSH_THRESHOLD for $service"
         return 1
     fi
     
     log "$exp_dir" "Successfully updated deployment configuration for $service"
+    log "$exp_dir" "  Windowed Sampling: enabled"
+    log "$exp_dir" "  CPU Set: $cpu_set (taskset pinning + perf monitoring)"
+    log "$exp_dir" "  Run Duration: ${EXPERIMENT_DURATION}s"
+    log "$exp_dir" "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
+    log "$exp_dir" "  Perf Events: ${PERF_EVENTS}"
+    log "$exp_dir" "  Ring Buffer: size=${buffer_size}, threshold=${flush_threshold}%"
+    
     return 0
 }
 
@@ -249,13 +363,13 @@ deploy_timing_service() {
     fi
 }
 
-# Retrieve timing data from service pod
-retrieve_timing_data() {
+# Retrieve windowed run data from service pod
+retrieve_windowed_run_data() {
     local service="$1"
     local exp_dir="$2"
     local iteration="$3"
     
-    log "$exp_dir" "Retrieving timing data from $service service"
+    log "$exp_dir" "Retrieving windowed run data from $service (iteration $iteration)"
     
     # Get pod name
     local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
@@ -266,39 +380,109 @@ retrieve_timing_data() {
     
     log "$exp_dir" "Found pod: $pod_name"
     
-    # Retrieve timing stats file
-    local stats_file="timing_stats_${service}.json"
-    local output_file="$exp_dir/timing/data/${service}_timing_iter${iteration}.json"
+    # Create output directory
+    local output_dir="$exp_dir/raw/windowed/${service}"
+    mkdir -p "$output_dir"
     
-    if kubectl exec "$pod_name" -- test -f "$stats_file" 2>/dev/null; then
-        log "$exp_dir" "Retrieving $stats_file from $pod_name"
-        kubectl exec "$pod_name" -- cat "$stats_file" > "$output_file" 2>/dev/null
+    # Retrieve run data file for this iteration
+    local run_file="/data/run_data_${service}_iter${iteration}.json"
+    if kubectl exec "$pod_name" -- test -f "$run_file" 2>/dev/null; then
+        log "$exp_dir" "  Retrieving run data: $run_file"
+        kubectl exec "$pod_name" -- cat "$run_file" > "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null
         
-        if [[ -s "$output_file" ]]; then
-            log "$exp_dir" "Successfully retrieved timing data: $output_file"
+        if [[ -s "$output_dir/run_data_iter${iteration}_raw.json" ]]; then
+            # Filter to keep only samples with non-zero timing data
+            if command -v jq >/dev/null 2>&1; then
+                log "$exp_dir" "  Filtering samples with timing data using jq"
+                
+                jq '{
+                    service_name,
+                    iteration_id,
+                    run_start,
+                    run_end,
+                    run_duration_ms,
+                    window_interval_ms,
+                    perf_events,
+                    samples: [.samples[] | select(
+                        .timing_window.processing_time.count > 0 or 
+                        .timing_window.total_time.count > 0 or 
+                        .timing_window.blocking_time.count > 0
+                    )],
+                    sample_count: ([.samples[] | select(
+                        .timing_window.processing_time.count > 0 or 
+                        .timing_window.total_time.count > 0 or 
+                        .timing_window.blocking_time.count > 0
+                    )] | length),
+                    aggregates: .aggregates
+                }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                
+                local total_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
+                local filtered_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
+                
+                log "$exp_dir" "  Filtered: $filtered_samples/$total_samples samples contain timing data"
+            else
+                # No jq available, just copy raw file
+                log "$exp_dir" "  WARNING: jq not available, skipping filter (keeping all samples)"
+                cp "$output_dir/run_data_iter${iteration}_raw.json" "$output_dir/run_data_iter${iteration}.json"
+                filtered_samples=$(grep -o '"sample_count":[^,}]*' "$output_dir/run_data_iter${iteration}.json" | cut -d':' -f2 | tr -d ' ' || echo "unknown")
+            fi
             
-            # Also get logs with timing information
-            local log_file="$exp_dir/timing/data/${service}_logs_iter${iteration}.txt"
-            kubectl logs "$pod_name" | grep -E "(processing_time_ms|total_time_ms|blocking_time_ms)" > "$log_file" 2>/dev/null || true
+            log "$exp_dir" "  Successfully retrieved and filtered run data with $filtered_samples samples"
+            
+            # Also get logs with timing and perf information
+            local log_file="$output_dir/service_logs_iter${iteration}.txt"
+            kubectl logs "$pod_name" | grep -E "(Windowed sampling|sample_id|perf_deltas|timing_window)" > "$log_file" 2>/dev/null || true
             
             return 0
         else
-            log "$exp_dir" "WARNING: Retrieved timing file is empty"
+            log "$exp_dir" "  WARNING: Retrieved run data file is empty"
             return 1
         fi
     else
-        log "$exp_dir" "WARNING: Timing stats file not found in pod $pod_name"
+        log "$exp_dir" "  WARNING: Run data file not found in pod $pod_name: $run_file"
+        # Check if there are any data files
+        log "$exp_dir" "  Checking for any data files in /data/"
+        kubectl exec "$pod_name" -- ls -la /data/ 2>/dev/null | tee -a "$exp_dir/logs/collector.log" || true
         return 1
     fi
 }
 
-# Cleanup timing-related resources
-cleanup_timing_resources() {
+# Update iteration ID for all victim services and restart pods
+update_iteration_id() {
+    local exp_dir="$1"
+    local iteration="$2"
+    
+    source "${exp_dir}/metadata/experiment_config.txt" 2>/dev/null || return 0
+    
+    log "$exp_dir" "Updating ITERATION_ID to $iteration for victim services"
+    
+    for service in $VICTIM_SERVICES; do
+        if validate_timing_service "$service"; then
+            log "$exp_dir" "  Setting ITERATION_ID=$iteration for $service"
+            
+            if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
+                log "$exp_dir" "WARNING: Failed to set ITERATION_ID for $service"
+                continue
+            fi
+            
+            # Restart pods to pick up new iteration ID
+            log "$exp_dir" "  Restarting $service pods for new iteration"
+            kubectl rollout restart "deployment/$service" 2>/dev/null || true
+            kubectl rollout status "deployment/$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service restart"
+        fi
+    done
+    
+    log "$exp_dir" "Iteration ID updated, waiting 10s for services to stabilize"
+    sleep 10
+}
+
+# Cleanup windowed sampling resources
+cleanup_windowed_sampling_resources() {
     local exp_dir="$1"
     
-    log "$exp_dir" "Cleaning up timing-related resources"
+    log "$exp_dir" "Cleaning up windowed sampling resources"
     
-    if [[ -f "$exp_dir/timing/original_configs.txt" ]]; then
+    if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
         while IFS=':' read -r service original_image original_env; do
             if [[ -n "$service" && -n "$original_image" ]]; then
                 log "$exp_dir" "Restoring original configuration for $service"
@@ -313,22 +497,27 @@ cleanup_timing_resources() {
                     log "$exp_dir" "WARNING: Failed to restore image for $service"
                 fi
                 
-                # Remove timing environment variables
-                log "$exp_dir" "Removing timing environment variables for $service"
-                kubectl set env "deployment/$service" ENABLE_TIMING- 2>/dev/null || true
-                kubectl set env "deployment/$service" STATS_FILE- 2>/dev/null || true
+                # Remove windowed sampling environment variables
+                log "$exp_dir" "Removing windowed sampling environment variables for $service"
+                kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- 2>/dev/null || true
+                kubectl set env "deployment/$service" ITERATION_ID- 2>/dev/null || true
+                kubectl set env "deployment/$service" EXPERIMENT_DURATION- 2>/dev/null || true
+                kubectl set env "deployment/$service" WINDOW_INTERVAL_MS- 2>/dev/null || true
+                kubectl set env "deployment/$service" CPU_SET- 2>/dev/null || true
+                kubectl set env "deployment/$service" PERF_EVENTS- 2>/dev/null || true
+                kubectl set env "deployment/$service" OUTPUT_DIR- 2>/dev/null || true
+                kubectl set env "deployment/$service" TIMING_BUFFER_SIZE- 2>/dev/null || true
+                kubectl set env "deployment/$service" TIMING_FLUSH_THRESHOLD- 2>/dev/null || true
                 
                 # Wait for rollout
                 kubectl rollout status deployment "$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service rollout"
                 
                 log "$exp_dir" "Restored configuration for $service"
             fi
-        done < "$exp_dir/timing/original_configs.txt"
+        done < "$exp_dir/metadata/original_configs.txt"
     fi
     
-    # Clean up temporary files
-    rm -rf "$exp_dir/timing/tmp" 2>/dev/null || true
-    log "$exp_dir" "Cleaned up temporary timing files"
+    log "$exp_dir" "Cleaned up windowed sampling resources"
 }
 
 # Validate configuration
@@ -343,7 +532,7 @@ validate_config() {
     source "$config_file"
     
     # Check required variables
-    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "PERF_COUNTER_SET" "NOISY_NEIGHBOR_TYPE" "EXPERIMENT_DURATION")
+    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "NOISY_NEIGHBOR_TYPE" "EXPERIMENT_DURATION")
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var}" ]]; then
             echo "ERROR: Required variable $var not set in config file"
@@ -352,12 +541,26 @@ validate_config() {
     done
     
     # Check if scripts exist
-    for script in "$STRESS_SCRIPT" "$MONITOR_SCRIPT" "$TAINT_SCRIPT"; do
+    for script in "$STRESS_SCRIPT" "$TAINT_SCRIPT"; do
         if [[ ! -f "$script" ]]; then
             echo "ERROR: Required script not found: $script"
             exit 1
         fi
     done
+    
+    # Set defaults for windowed sampling if not specified
+    WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
+    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}"
+    ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
+    TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-2048}"
+    TIMING_FLUSH_THRESHOLD="${TIMING_FLUSH_THRESHOLD:-80}"
+    USE_RING_BUFFER="${USE_RING_BUFFER:-true}"
+    
+    echo "Windowed Sampling Configuration:"
+    echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
+    echo "  Perf Events: ${PERF_EVENTS}"
+    echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+    echo "  Ring Buffer: size=${TIMING_BUFFER_SIZE}, threshold=${TIMING_FLUSH_THRESHOLD}%"
     
     # Validate target node exists
     if ! kubectl get node "$TARGET_NODE" &>/dev/null; then
@@ -1381,35 +1584,10 @@ cleanup_victim_services() {
     done
 }
 
-# Start performance monitoring for all victim services
-start_monitoring() {
-    local services="$1"
-    local duration="$2"
-    local counter_set="$3"
-    local exp_dir="$4"
-    local iteration="$5"
-    
-    log "$exp_dir" "Starting performance monitoring for services: $services"
-    
-    local monitor_pids=()
-    
-    for service in $services; do
-        log "$exp_dir" "Starting monitor for $service with counter set: $counter_set"
-        
-        # Start monitoring in background and redirect output
-        "$MONITOR_SCRIPT" "$service" default "$duration" "$counter_set" \
-            > "$exp_dir/raw/perf/${service}_iter${iteration}.txt" 2>&1 &
-        
-        local pid=$!
-        monitor_pids+=($pid)
-        echo "$pid:$service" >> "$exp_dir/raw/perf/monitor_pids_iter${iteration}.txt"
-        
-        log "$exp_dir" "Monitor started for $service (PID: $pid)"
-        sleep 2  # Stagger starts slightly
-    done
-    
-    echo "${monitor_pids[@]}"
-}
+# Note: Windowed sampling now runs automatically inside each service container
+# No external monitoring process needed - data is collected continuously and retrieved at end
+# This function is kept for reference but is no longer used
+# OLD: start_monitoring() - REMOVED in favor of windowed sampling inside service containers
 
 # Start wrk2 workload generation and collect e2e latency metrics
 start_workload_and_latency() {
@@ -1523,6 +1701,11 @@ run_iteration() {
     
     log "$exp_dir" "Starting iteration $iteration"
     
+    # Update iteration ID for all victim services (requires pod restart)
+    if [[ $iteration -gt 1 ]] || [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+        update_iteration_id "$exp_dir" "$iteration"
+    fi
+    
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
@@ -1567,13 +1750,11 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Wait before starting performance monitoring
-    log "$exp_dir" "Waiting 10s before starting performance monitoring..."
-    sleep 10
-    
-    # Start monitoring (runs for original experiment duration)
-    log "$exp_dir" "Starting performance monitoring (duration: ${EXPERIMENT_DURATION}s)"
-    local monitor_pids=($(start_monitoring "$VICTIM_SERVICES" "$EXPERIMENT_DURATION" "$PERF_COUNTER_SET" "$exp_dir" "$iteration"))
+    # NOTE: Windowed sampling now runs automatically inside service containers
+    # No external monitoring process needed
+    log "$exp_dir" "Windowed sampling is running inside service containers"
+    log "$exp_dir" "  Expected samples per service: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+    log "$exp_dir" "  Window interval: ${WINDOW_INTERVAL_MS}ms"
     
     # Collect metrics during stress
     sleep 30  # Let stress ramp up
@@ -1590,16 +1771,13 @@ run_iteration() {
     # Collect end metrics
     collect_system_metrics "$exp_dir" "$iteration" "end"
     
-    # Retrieve timing data from all victim services that support it
-    log "$exp_dir" "Retrieving timing data from victim services"
+    # Retrieve windowed run data from all victim services
+    log "$exp_dir" "Retrieving windowed run data from victim services"
     for service in $VICTIM_SERVICES; do
         if validate_timing_service "$service"; then
-            retrieve_timing_data "$service" "$exp_dir" "$iteration"
+            retrieve_windowed_run_data "$service" "$exp_dir" "$iteration"
         fi
     done
-    
-    # Wait for all monitoring to complete
-    wait_for_processes "${monitor_pids[@]}"
     
     # Wait for wrk2 to complete if it was started
     if [[ -n "$wrk2_pid" ]]; then
@@ -1628,7 +1806,12 @@ generate_metadata() {
     "configuration": {
         "target_node": "$TARGET_NODE",
         "victim_services": "$VICTIM_SERVICES",
-        "perf_counter_set": "$PERF_COUNTER_SET",
+        "windowed_sampling": {
+            "enabled": ${ENABLE_WINDOWED_SAMPLING:-true},
+            "window_interval_ms": ${WINDOW_INTERVAL_MS:-100},
+            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}",
+            "expected_samples_per_run": $((EXPERIMENT_DURATION * 1000 / ${WINDOW_INTERVAL_MS:-100}))
+        },
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
             "args": "${NOISY_NEIGHBOR_ARGS:-}",
@@ -1639,10 +1822,9 @@ generate_metadata() {
             "base_duration": $EXPERIMENT_DURATION,
             "stressor_duration": "$((EXPERIMENT_DURATION + 10))",
             "workload_duration": "$((EXPERIMENT_DURATION + 5))",
-            "monitoring_duration": $EXPERIMENT_DURATION,
             "startup_delays": {
-                "stressor_to_workload": 5,
-                "workload_to_monitoring": 5
+                "stressor_to_workload": 15,
+                "workload_start": 15
             }
         },
         "iterations": ${ITERATIONS:-3},
@@ -1663,14 +1845,14 @@ generate_metadata() {
     },
     "scripts_used": {
         "stress_script": "$STRESS_SCRIPT",
-        "monitor_script": "$MONITOR_SCRIPT",
         "taint_script": "$TAINT_SCRIPT"
     },
     "data_structure": {
-        "raw/perf/": "Performance counters per service per iteration",
+        "raw/windowed/": "Windowed sampling data (perf + timing) per service per iteration",
         "raw/latency/": "End-to-end latency metrics from wrk2",
         "raw/system/": "System-wide metrics (nodes, pods) per phase",
-        "raw/stress/": "Stress test logs per iteration"
+        "raw/stress/": "Stress test logs per iteration",
+        "processed/aggregated/": "Aggregated data across all iterations"
     }
 }
 EOF
@@ -1679,12 +1861,106 @@ sudo lshw -json > $exp_dir/metadata/hardware.json
 
 }
 
+# Aggregate windowed sampling data across iterations
+aggregate_windowed_data() {
+    local exp_dir="$1"
+    local total_iterations="$2"
+    local services="$3"
+    
+    log "$exp_dir" "Aggregating windowed data across $total_iterations iterations"
+    
+    for service in $services; do
+        log "$exp_dir" "  Aggregating data for service: $service"
+        
+        local input_dir="$exp_dir/raw/windowed/$service"
+        local output_dir="$exp_dir/processed/aggregated"
+        mkdir -p "$output_dir"
+        
+        if [[ ! -d "$input_dir" ]]; then
+            log "$exp_dir" "    No windowed data found for $service, skipping"
+            continue
+        fi
+        
+        # Use Python for JSON aggregation (if available)
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - <<EOF
+import json
+import glob
+import os
+
+service = "$service"
+input_dir = "$input_dir"
+output_dir = "$output_dir"
+total_iterations = int("$total_iterations")
+
+# Collect all run data files
+runs = []
+for iter_num in range(1, total_iterations + 1):
+    run_file = os.path.join(input_dir, f"run_data_iter{iter_num}.json")
+    if os.path.exists(run_file):
+        try:
+            with open(run_file) as f:
+                data = json.load(f)
+                runs.append({
+                    "iteration_id": data.get("iteration_id", iter_num),
+                    "run_file": os.path.basename(run_file),
+                    "run_duration_ms": data.get("run_duration_ms", 0),
+                    "sample_count": data.get("sample_count", 0),
+                    "total_requests": data.get("aggregates", {}).get("total_requests", 0),
+                    "cycles_total": data.get("aggregates", {}).get("perf_totals", {}).get("cycles", 0),
+                    "instructions_total": data.get("aggregates", {}).get("perf_totals", {}).get("instructions", 0)
+                })
+        except Exception as e:
+            print(f"Error processing {run_file}: {e}")
+
+if not runs:
+    print(f"No run data found for {service}")
+    exit(0)
+
+# Calculate experiment-level aggregates
+total_samples = sum(r["sample_count"] for r in runs)
+total_requests = sum(r["total_requests"] for r in runs)
+cycles_mean = sum(r["cycles_total"] for r in runs) / len(runs) if runs else 0
+instructions_mean = sum(r["instructions_total"] for r in runs) / len(runs) if runs else 0
+
+experiment_summary = {
+    "service_name": service,
+    "total_iterations": len(runs),
+    "runs": runs,
+    "experiment_aggregates": {
+        "total_samples": total_samples,
+        "total_requests": total_requests,
+        "avg_requests_per_run": total_requests / len(runs) if runs else 0,
+        "cycles_mean": cycles_mean,
+        "instructions_mean": instructions_mean,
+        "ipc_mean": instructions_mean / cycles_mean if cycles_mean > 0 else 0
+    }
+}
+
+# Write experiment summary
+output_file = os.path.join(output_dir, f"experiment_summary_{service}.json")
+with open(output_file, "w") as f:
+    json.dump(experiment_summary, f, indent=2)
+
+print(f"Created experiment summary: {output_file}")
+EOF
+        else
+            log "$exp_dir" "    Python3 not available, skipping JSON aggregation for $service"
+        fi
+    done
+}
+
 # Aggregate iteration data into summary files
 aggregate_data() {
     local exp_dir="$1"
     local total_iterations="$2"
     
     log "$exp_dir" "Aggregating data across $total_iterations iterations"
+    
+    # Aggregate windowed sampling data (perf + timing integrated)
+    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+        aggregate_windowed_data "$exp_dir" "$total_iterations" "$VICTIM_SERVICES"
+    fi
     
     # Aggregate latency data
     if ls "$exp_dir/raw/latency/"*_iter*.txt 1> /dev/null 2>&1; then
@@ -1705,84 +1981,34 @@ aggregate_data() {
         } > "$exp_dir/processed/latency_summary.txt"
     fi
     
-    # Aggregate performance data
-    if ls "$exp_dir/raw/perf/"*_iter*.txt 1> /dev/null 2>&1; then
-        {
-            echo "=== AGGREGATED PERFORMANCE METRICS ==="
-            echo "Generated: $(date -Iseconds)"
-            echo ""
-            for i in $(seq 1 $total_iterations); do
-                echo "=== ITERATION $i ==="
-                for file in "$exp_dir/raw/perf/"*_iter${i}.txt; do
-                    if [[ -f "$file" ]]; then
-                        echo "--- $(basename "$file") ---"
-                        cat "$file"
-                        echo ""
-                    fi
-                done
-            done
-        } > "$exp_dir/processed/performance_summary.txt"
-    fi
-    
-    # Aggregate timing data if available
-    if ls "$exp_dir/timing/data/"*_timing_iter*.json 1> /dev/null 2>&1; then
-        {
-            echo "=== AGGREGATED TIMING METRICS ==="
-            echo "Generated: $(date -Iseconds)"
-            echo ""
-            
-            # Get list of services with timing data
-            local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u)
-            
-            for service in $timing_services; do
-                echo "=== SERVICE: $service ==="
-                echo ""
-                for i in $(seq 1 $total_iterations); do
-                    echo "--- ITERATION $i ---"
-                    local timing_file="$exp_dir/timing/data/${service}_timing_iter${i}.json"
-                    if [[ -f "$timing_file" ]]; then
-                        echo "Timing Statistics:"
-                        cat "$timing_file"
-                        echo ""
-                    fi
-                    
-                    local log_file="$exp_dir/timing/data/${service}_logs_iter${i}.txt"
-                    if [[ -f "$log_file" && -s "$log_file" ]]; then
-                        echo "Timing Logs:"
-                        cat "$log_file"
-                        echo ""
-                    fi
-                done
-                echo ""
-            done
-        } > "$exp_dir/processed/timing_summary.txt"
-    fi
-    
     # Create experiment summary
     {
         echo "=== EXPERIMENT SUMMARY ==="
         echo "Generated: $(date -Iseconds)"
         echo ""
         
-        # Check if timing data was collected
-        local timing_enabled="false"
-        local timing_services_count=0
-        if [[ -d "$exp_dir/timing/data" ]]; then
-            timing_services_count=$(ls "$exp_dir/timing/data/"*_timing_iter*.json 2>/dev/null | wc -l)
-            if [[ $timing_services_count -gt 0 ]]; then
-                timing_enabled="true"
+        # Check if windowed sampling data was collected
+        local windowed_enabled="false"
+        local windowed_services_count=0
+        if [[ -d "$exp_dir/raw/windowed" ]]; then
+            windowed_services_count=$(find "$exp_dir/raw/windowed" -name "run_data_iter*.json" 2>/dev/null | wc -l)
+            if [[ $windowed_services_count -gt 0 ]]; then
+                windowed_enabled="true"
             fi
         fi
         
-        echo "Timing Integration: $timing_enabled"
-        if [[ "$timing_enabled" == "true" ]]; then
-            echo "Timing data files: $timing_services_count"
-            local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u | tr '\n' ' ')
-            echo "Services with timing data: $timing_services"
+        echo "Windowed Sampling: $windowed_enabled"
+        if [[ "$windowed_enabled" == "true" ]]; then
+            echo "  Run data files: $windowed_services_count"
+            echo "  Window interval: ${WINDOW_INTERVAL_MS}ms"
+            echo "  Perf events: ${PERF_EVENTS}"
+            local windowed_services=$(ls -d "$exp_dir/raw/windowed/"*/ 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+            echo "  Services with windowed data: $windowed_services"
         fi
         
-        echo "Raw data files: $(find "$exp_dir/raw" -name "*.txt" -o -name "*.csv" | wc -l)"
-        echo "Total data size: $(du -sh "$exp_dir" | cut -f1)"
+        echo ""
+        echo "Raw data files: $(find "$exp_dir/raw" -type f -name "*.txt" -o -name "*.json" | wc -l)"
+        echo "Total data size: $(du -sh "$exp_dir" 2>/dev/null | cut -f1 || echo 'unknown')"
         echo ""
         echo "=== FILE STRUCTURE ==="
         find "$exp_dir" -type f | sort
@@ -1879,8 +2105,8 @@ run_experiment() {
     # Aggregate data
     aggregate_data "$exp_dir" "$total_iterations"
     
-    # Cleanup timing resources (restore original deployments)
-    cleanup_timing_resources "$exp_dir"
+    # Cleanup windowed sampling resources (restore original deployments)
+    cleanup_windowed_sampling_resources "$exp_dir"
     
     # Remove anti-affinity rules from untolerated deployments
     if [[ -n "$untolerated_deployments" ]]; then
@@ -1889,19 +2115,31 @@ run_experiment() {
     
     log "$exp_dir" "Experiment completed successfully"
     
-    # Show timing data summary if available
-    if [[ -f "$exp_dir/processed/timing_summary.txt" ]]; then
-        log "$exp_dir" "Timing data collected and aggregated:"
-        log "$exp_dir" "  Summary: $exp_dir/processed/timing_summary.txt"
-        log "$exp_dir" "  Raw data: $exp_dir/timing/data/"
+    # Show windowed sampling summary if available
+    if [[ -d "$exp_dir/raw/windowed" ]]; then
+        log "$exp_dir" "Windowed sampling data collected and aggregated:"
+        log "$exp_dir" "  Raw data: $exp_dir/raw/windowed/"
+        log "$exp_dir" "  Aggregated: $exp_dir/processed/aggregated/"
         
-        # Show which services had timing data
-        local timing_services=$(ls "$exp_dir/timing/data/"*_timing_iter1.json 2>/dev/null | sed 's/.*\/\([^_]*\)_timing_iter1\.json/\1/' | sort -u | tr '\n' ' ')
-        if [[ -n "$timing_services" ]]; then
-            log "$exp_dir" "  Services with timing data:$timing_services"
+        # Show which services had windowed data
+        local windowed_services=$(ls -d "$exp_dir/raw/windowed/"*/ 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+        if [[ -n "$windowed_services" ]]; then
+            log "$exp_dir" "  Services with windowed data:$windowed_services"
+            
+            # Show sample counts
+            for service in $windowed_services; do
+                local first_run="$exp_dir/raw/windowed/$service/run_data_iter1.json"
+                if [[ -f "$first_run" ]]; then
+                    local sample_count="unknown"
+                    if command -v jq >/dev/null 2>&1; then
+                        sample_count=$(jq -r '.sample_count // "unknown"' "$first_run" 2>/dev/null)
+                    fi
+                    log "$exp_dir" "    $service: $sample_count samples per run"
+                fi
+            done
         fi
     else
-        log "$exp_dir" "No timing data was collected in this experiment"
+        log "$exp_dir" "No windowed sampling data was collected in this experiment"
     fi
 }
 
@@ -1918,15 +2156,22 @@ main() {
         echo "Timing data will be collected and aggregated automatically."
         echo ""
         echo "Example config file:"
-        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact with Timing'"
+        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact'"
         echo "TARGET_NODE='node-1'"
         echo "VICTIM_SERVICES='frontend search user'"
-        echo "PERF_COUNTER_SET='interference'"
         echo "NOISY_NEIGHBOR_TYPE='cpu'"
         echo "NOISY_NEIGHBOR_ARGS='4 300s'"
-        echo "EXPERIMENT_DURATION=300"
+        echo "EXPERIMENT_DURATION=30"
         echo "ITERATIONS=5"
-        echo "ITERATION_DELAY=120"
+        echo "ITERATION_DELAY=10"
+        echo "# Windowed sampling configuration:"
+        echo "ENABLE_WINDOWED_SAMPLING=true"
+        echo "WINDOW_INTERVAL_MS=100  # Sample every 100ms"
+        echo "PERF_EVENTS='cycles,instructions,cache-misses,llc-misses'"
+        echo "# Ring buffer configuration (lock-free, high performance):"
+        echo "TIMING_BUFFER_SIZE=2048         # Buffer size (power of 2), handles 100-1K req/s"
+        echo "TIMING_FLUSH_THRESHOLD=80       # Proactive flush at 80% full"
+        echo "USE_RING_BUFFER=true            # Enable lock-free ring buffer (default)"
         echo "# Jaeger tracing configuration:"
         echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
         echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
@@ -1964,12 +2209,18 @@ main() {
     echo "Data location: $exp_dir"
     echo "Summary: $exp_dir/processed/experiment_summary.txt"
     
-    # Show timing data information if available
-    if [[ -f "$exp_dir/processed/timing_summary.txt" ]]; then
-        echo "Timing data: $exp_dir/processed/timing_summary.txt"
+    # Show windowed sampling data information if available
+    if [[ -d "$exp_dir/raw/windowed" ]]; then
+        echo "Windowed sampling data: $exp_dir/raw/windowed/"
+        echo "Aggregated data: $exp_dir/processed/aggregated/"
     fi
 
-    rsync -av ./"$exp_dir" "$4"@homework.eecs.tufts.edu:/r/tcal/work/contention/
+    # Optional: sync to remote server (if 4th argument provided)
+    if [[ -n "$4" ]]; then
+        log "$exp_dir" "Syncing data to remote server..."
+        rsync -av "./$exp_dir" "$4"@linux.eecs.tufts.edu:/r/docclab_traces/contention_exp_data/"$exp_dir" || \
+            log "$exp_dir" "WARNING: Failed to sync data to remote server"
+    fi
     
 }
 

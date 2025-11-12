@@ -5,11 +5,11 @@ import (
 	"flag"
 	"io/ioutil"
 	"os"
+	"strconv"
 	"time"
 
-	"strconv"
-
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/search"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tracing"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/tune"
@@ -58,15 +58,73 @@ func main() {
 	}
 	log.Info().Msg("Consul agent initialized")
 
-	srv := &search.Server{
-		Tracer:     tracer,
-		Port:       servPort,
-		IpAddr:     servIP,
-		ConsulAddr: *consulAddr,
-		KnativeDns: knativeDNS,
-		Registry:   registry,
-	}
+	// Check if windowed sampling is enabled
+	enableWindowed := os.Getenv("ENABLE_WINDOWED_SAMPLING")
+	if enableWindowed == "true" {
+		// Use windowed sampling mode with perf counters
+		iterationID, _ := strconv.Atoi(os.Getenv("ITERATION_ID"))
+		if iterationID == 0 {
+			iterationID = 1
+		}
 
-	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+		log.Info().
+			Str("service", "search").
+			Int("iteration", iterationID).
+			Msg("Starting search service with windowed sampling")
+
+		// Setup continuous windowed sampling (runs for 24h, writes periodically)
+		sampler, timingAgg, _, err := perf.SetupContinuousSampling("search", iterationID)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to setup continuous sampling")
+		}
+		
+		// Cleanup handlers (will run when pod terminates)
+		defer func() {
+			log.Info().Msg("Pod terminating, stopping sampler")
+			runData, err := sampler.StopRun()
+			if err != nil {
+				log.Error().Err(err).Msg("Error stopping sampler")
+			} else if runData != nil {
+				log.Info().
+					Int("sample_count", runData.SampleCount).
+					Int("total_requests", runData.Aggregates.TotalRequests).
+					Msg("Sampling stopped on termination")
+			}
+			timingAgg.Stop()
+		}()
+		
+		srv := &search.Server{
+			Tracer:           tracer,
+			Port:             servPort,
+			IpAddr:           servIP,
+			ConsulAddr:       *consulAddr,
+			KnativeDns:       knativeDNS,
+			Registry:         registry,
+			TimingAggregator: timingAgg,
+		}
+
+		log.Info().Msg("Starting server with continuous windowed sampling...")
+		
+		// Start server (blocks until shutdown)
+		if err := srv.Run(); err != nil {
+			log.Error().Err(err).Msg("Server failed")
+			os.Exit(1)
+		}
+	} else {
+		// Standard mode without windowed sampling
+		srv := &search.Server{
+			Tracer:     tracer,
+			Port:       servPort,
+			IpAddr:     servIP,
+			ConsulAddr: *consulAddr,
+			KnativeDns: knativeDNS,
+			Registry:   registry,
+		}
+
+		log.Info().Msg("Starting server...")
+		if err := srv.Run(); err != nil {
+			log.Error().Err(err).Msg("Server failed")
+			os.Exit(1)
+		}
+	}
 }
