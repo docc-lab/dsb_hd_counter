@@ -206,6 +206,9 @@ update_deployment_for_timing() {
     
     log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
+    # IMPORTANT: Store original configuration BEFORE making any changes
+    store_original_config "$service" "$exp_dir"
+    
     # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
     
@@ -216,9 +219,6 @@ update_deployment_for_timing() {
     
     log "$exp_dir" "Will use windowed image: $timing_image"
     local container_name=$(get_container_name "$service")
-    
-    # Store original configuration for cleanup
-    store_original_config "$service" "$exp_dir"
     
     # Update image
     log "$exp_dir" "Setting image for $service: $timing_image"
