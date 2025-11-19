@@ -254,8 +254,9 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Set perf events
-    if ! kubectl set env "deployment/$service" "PERF_EVENTS=${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}"; then
+    # Set perf events (use comprehensive default if not specified)
+    local perf_events_value="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+    if ! kubectl set env "deployment/$service" "PERF_EVENTS=${perf_events_value}"; then
         log "$exp_dir" "ERROR: Failed to set PERF_EVENTS for $service"
         return 1
     fi
@@ -472,8 +473,8 @@ update_iteration_id() {
         fi
     done
     
-    log "$exp_dir" "Iteration ID updated, waiting 10s for services to stabilize"
-    sleep 10
+    log "$exp_dir" "Iteration ID updated, waiting 20s for services to stabilize and initialize sampling"
+    sleep 20
 }
 
 # Cleanup windowed sampling resources
@@ -550,7 +551,8 @@ validate_config() {
     
     # Set defaults for windowed sampling if not specified
     WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
-    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}"
+    # Comprehensive default performance counters covering CPU, cache, memory, and I/O
+    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
     ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
     TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-2048}"
     TIMING_FLUSH_THRESHOLD="${TIMING_FLUSH_THRESHOLD:-80}"
@@ -1757,16 +1759,21 @@ run_iteration() {
     log "$exp_dir" "  Window interval: ${WINDOW_INTERVAL_MS}ms"
     
     # Collect metrics during stress
-    sleep 30  # Let stress ramp up
+    sleep 10  # Let stress ramp up
     collect_system_metrics "$exp_dir" "$iteration" "during"
     
     # Wait for experiment to complete
-    # Total delays so far: 15s (stressor->workload) + 10s (workload->monitoring) + 30s (ramp) = 55s
-    local remaining_time=$((EXPERIMENT_DURATION - 55))
+    # Total delays so far: 15s (before workload) + 10s (ramp) = 25s
+    # The workload runs for workload_duration, so we need to wait for it to complete
+    local remaining_time=$((workload_duration - 10))  # Subtract the 10s we already waited
     if [[ $remaining_time -gt 0 ]]; then
-        log "$exp_dir" "Waiting ${remaining_time}s for experiment to complete..."
+        log "$exp_dir" "Waiting ${remaining_time}s for workload to complete..."
         sleep "$remaining_time"
     fi
+    
+    # Additional wait to ensure data is written to disk
+    log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
+    sleep 5
     
     # Collect end metrics
     collect_system_metrics "$exp_dir" "$iteration" "end"
@@ -1809,7 +1816,7 @@ generate_metadata() {
         "windowed_sampling": {
             "enabled": ${ENABLE_WINDOWED_SAMPLING:-true},
             "window_interval_ms": ${WINDOW_INTERVAL_MS:-100},
-            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-misses,llc-misses}",
+            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
             "expected_samples_per_run": $((EXPERIMENT_DURATION * 1000 / ${WINDOW_INTERVAL_MS:-100}))
         },
         "noisy_neighbor": {
@@ -2167,7 +2174,10 @@ main() {
         echo "# Windowed sampling configuration:"
         echo "ENABLE_WINDOWED_SAMPLING=true"
         echo "WINDOW_INTERVAL_MS=100  # Sample every 100ms"
-        echo "PERF_EVENTS='cycles,instructions,cache-misses,llc-misses'"
+        echo "# Default includes comprehensive CPU, cache, memory, TLB, and I/O counters:"
+        echo "# PERF_EVENTS='cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations'"
+        echo "# Or customize with specific counters (see perf list):"
+        echo "PERF_EVENTS='cycles,instructions,cache-misses,llc-misses'  # Minimal set"
         echo "# Ring buffer configuration (lock-free, high performance):"
         echo "TIMING_BUFFER_SIZE=2048         # Buffer size (power of 2), handles 100-1K req/s"
         echo "TIMING_FLUSH_THRESHOLD=80       # Proactive flush at 80% full"

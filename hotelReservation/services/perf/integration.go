@@ -39,7 +39,13 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 	// Get perf events from environment
 	perfEventsStr := os.Getenv("PERF_EVENTS")
 	if perfEventsStr == "" {
-		perfEventsStr = "cycles,instructions,cache-misses,llc-misses"
+		// Default comprehensive set of performance counters
+		perfEventsStr = "cycles,instructions,cache-references,cache-misses," +
+			"llc-references,llc-misses,l2-references,l2-misses," +
+			"branch-instructions,branch-misses," +
+			"dtlb-misses,dtlb-references,itlb-misses," +
+			"page-faults,minor-faults,major-faults," +
+			"context-switches,cpu-migrations"
 	}
 	perfEvents := strings.Split(perfEventsStr, ",")
 	// Trim whitespace from each event
