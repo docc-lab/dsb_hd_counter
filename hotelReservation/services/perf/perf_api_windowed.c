@@ -20,50 +20,103 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
 
 // Supported event configurations
 static const perf_event_config_t event_configs[] = {
-    // Hardware events
+    // Hardware events (universally available)
     {"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+    {"cpu-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
     {"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
     {"cache-references", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES},
     {"cache-misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
     {"branch-instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS},
+    {"branches", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS},
     {"branch-misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES},
     {"bus-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BUS_CYCLES},
     {"stalled-cycles-frontend", PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_FRONTEND},
     {"stalled-cycles-backend", PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_BACKEND},
+    {"ref-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES},
     
-    // Cache events - L1
-    {"l1-misses", PERF_TYPE_HW_CACHE, 
+    // Cache events - L1 Data Cache
+    {"l1-dcache-loads", PERF_TYPE_HW_CACHE, 
+        PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"l1-dcache-load-misses", PERF_TYPE_HW_CACHE, 
         PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    {"l1-dcache-stores", PERF_TYPE_HW_CACHE, 
+        PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    // Aliases for convenience
     {"l1-references", PERF_TYPE_HW_CACHE, 
         PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"l1-misses", PERF_TYPE_HW_CACHE, 
+        PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    
+    // Cache events - L1 Instruction Cache
+    {"l1-icache-load-misses", PERF_TYPE_HW_CACHE, 
+        PERF_COUNT_HW_CACHE_L1I | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     {"l1i-misses", PERF_TYPE_HW_CACHE, 
         PERF_COUNT_HW_CACHE_L1I | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     
-    // Cache events - L2 (note: not all CPUs support L2 separately, may alias to LL)
-    {"l2-misses", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
-    {"l2-references", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
-    
     // Cache events - LLC (Last Level Cache)
-    {"llc-misses", PERF_TYPE_HW_CACHE,
+    {"llc-loads", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"llc-load-misses", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    {"llc-stores", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"llc-store-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    // Aliases for convenience
     {"llc-references", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"llc-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    
+    // Note: L2 cache events not separately available on many CPUs (aliases to LLC)
+    {"l2-references", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"l2-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     
     // TLB events - Data TLB
-    {"dtlb-misses", PERF_TYPE_HW_CACHE,
+    {"dtlb-loads", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"dtlb-load-misses", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    {"dtlb-stores", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"dtlb-store-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    // Aliases for convenience
     {"dtlb-references", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"dtlb-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     {"dtlb-write-misses", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     
     // TLB events - Instruction TLB
-    {"itlb-misses", PERF_TYPE_HW_CACHE,
+    {"itlb-loads", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"itlb-load-misses", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    // Aliases for convenience
     {"itlb-references", PERF_TYPE_HW_CACHE,
         PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"itlb-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_ITLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    
+    // Branch events
+    {"branch-loads", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_BPU | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"branch-load-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_BPU | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    
+    // NUMA/Node events
+    {"node-loads", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"node-load-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
+    {"node-stores", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
+    {"node-store-misses", PERF_TYPE_HW_CACHE,
+        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
     
     // Software events - context and scheduling
     {"context-switches", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
@@ -79,35 +132,7 @@ static const perf_event_config_t event_configs[] = {
     {"alignment-faults", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_ALIGNMENT_FAULTS},
     {"emulation-faults", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_EMULATION_FAULTS},
     
-    // Node events (for NUMA-aware systems) - BPF and dummy events
-    {"bpf-output", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_BPF_OUTPUT},
-    
-    // Hardware cache prefetch events
-    {"l1-prefetch-misses", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_PREFETCH << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
-    {"llc-prefetch-misses", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_PREFETCH << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
-    
-    // Node/NUMA events - requires PMU support
-    {"node-loads", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
-    {"node-load-misses", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
-    {"node-stores", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16)},
-    {"node-store-misses", PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_NODE | (PERF_COUNT_HW_CACHE_OP_WRITE << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16)},
-    
-    // Intel-specific RAW events (for DRAM bandwidth monitoring on Intel CPUs)
-    // These event codes are for Intel Skylake/Cascade Lake - may need adjustment for other CPUs
-    // UNC_M_CAS_COUNT.RD - DRAM read requests (Uncore Memory Controller)
-    {"dram-reads", PERF_TYPE_RAW, 0x0304},  // Event 0x04, Umask 0x03
-    // UNC_M_CAS_COUNT.WR - DRAM write requests
-    {"dram-writes", PERF_TYPE_RAW, 0x0C04}, // Event 0x04, Umask 0x0C
-    
-    // Memory load/store instructions retired (architectural events)
-    {"mem-loads", PERF_TYPE_RAW, 0x01CD},   // MEM_TRANS_RETIRED.LOAD_LATENCY (approximate)
-    {"mem-stores", PERF_TYPE_RAW, 0x02CD},  // MEM_TRANS_RETIRED.STORE_LATENCY (approximate)
+    // Note: Prefetch and some Intel-specific RAW events removed as they're not universally available
 };
 
 static const int num_event_configs = sizeof(event_configs) / sizeof(event_configs[0]);

@@ -254,8 +254,8 @@ update_deployment_for_timing() {
         return 1
     fi
     
-    # Set perf events (use comprehensive default if not specified)
-    local perf_events_value="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+    # Set perf events (use safe default if not specified)
+    local perf_events_value="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
     if ! kubectl set env "deployment/$service" "PERF_EVENTS=${perf_events_value}"; then
         log "$exp_dir" "ERROR: Failed to set PERF_EVENTS for $service"
         return 1
@@ -550,8 +550,8 @@ validate_config() {
     
     # Set defaults for windowed sampling if not specified
     WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
-    # Comprehensive default performance counters covering CPU, cache, memory, and I/O
-    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+    # Safe default using only universally available counters
+    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
     ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
     TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-2048}"
     TIMING_FLUSH_THRESHOLD="${TIMING_FLUSH_THRESHOLD:-80}"
@@ -1815,7 +1815,7 @@ generate_metadata() {
         "windowed_sampling": {
             "enabled": ${ENABLE_WINDOWED_SAMPLING:-true},
             "window_interval_ms": ${WINDOW_INTERVAL_MS:-100},
-            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,llc-references,llc-misses,l2-references,l2-misses,branch-instructions,branch-misses,dtlb-misses,dtlb-references,itlb-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
+            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
             "expected_samples_per_run": $((EXPERIMENT_DURATION * 1000 / ${WINDOW_INTERVAL_MS:-100}))
         },
         "noisy_neighbor": {
@@ -2162,16 +2162,21 @@ main() {
         echo "Timing data will be collected and aggregated automatically."
         echo ""
         echo "Available Performance Counters:"
-        echo "  CPU: cycles, instructions, bus-cycles, stalled-cycles-frontend, stalled-cycles-backend"
-        echo "  Cache L1: l1-references, l1-misses, l1i-misses, l1-prefetch-misses"
-        echo "  Cache L2: l2-references, l2-misses"
-        echo "  Cache LLC: llc-references (cache-references), llc-misses (cache-misses), llc-prefetch-misses"
-        echo "  Branch: branch-instructions, branch-misses"
-        echo "  TLB: dtlb-references, dtlb-misses, dtlb-write-misses, itlb-references, itlb-misses"
+        echo "  CPU: cycles (cpu-cycles), instructions, bus-cycles, ref-cycles"
+        echo "       stalled-cycles-frontend, stalled-cycles-backend"
+        echo "  Cache L1: l1-dcache-loads, l1-dcache-load-misses, l1-dcache-stores"
+        echo "            l1-icache-load-misses (or use aliases: l1-misses, l1i-misses)"
+        echo "  Cache LLC: llc-loads, llc-load-misses, llc-stores, llc-store-misses"
+        echo "             (or use aliases: llc-references, llc-misses)"
+        echo "  Branch: branch-instructions (branches), branch-misses"
+        echo "          branch-loads, branch-load-misses"
+        echo "  TLB Data: dtlb-loads, dtlb-load-misses, dtlb-stores, dtlb-store-misses"
+        echo "  TLB Inst: itlb-loads, itlb-load-misses"
         echo "  Memory: page-faults, minor-faults, major-faults"
-        echo "  DRAM (Intel): dram-reads, dram-writes, mem-loads, mem-stores"
         echo "  NUMA: node-loads, node-load-misses, node-stores, node-store-misses"
         echo "  System: context-switches, cpu-migrations, task-clock, alignment-faults"
+        echo ""
+        echo "Note: Run 'perf list hardware' and 'perf list cache' on your node to see available events"
         echo ""
         echo "Example config file:"
         echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact'"
