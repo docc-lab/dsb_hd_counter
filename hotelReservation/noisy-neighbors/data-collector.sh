@@ -452,12 +452,11 @@ retrieve_windowed_run_data() {
 update_iteration_id() {
     local exp_dir="$1"
     local iteration="$2"
-    
-    source "${exp_dir}/metadata/experiment_config.txt" 2>/dev/null || return 0
+    local victim_services="$3"
     
     log "$exp_dir" "Updating ITERATION_ID to $iteration for victim services"
     
-    for service in $VICTIM_SERVICES; do
+    for service in $victim_services; do
         if validate_timing_service "$service"; then
             log "$exp_dir" "  Setting ITERATION_ID=$iteration for $service"
             
@@ -1705,7 +1704,7 @@ run_iteration() {
     
     # Update iteration ID for all victim services (requires pod restart)
     if [[ $iteration -gt 1 ]] || [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
-        update_iteration_id "$exp_dir" "$iteration"
+        update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES"
     fi
     
     # Collect baseline metrics
