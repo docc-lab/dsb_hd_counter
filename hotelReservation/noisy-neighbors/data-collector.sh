@@ -482,20 +482,20 @@ validate_config() {
         fi
     done
     
-    # Set defaults for windowed sampling if not specified
-    WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
-    # Safe default using only universally available counters
-    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
-    ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
-    TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-2048}"
-    TIMING_FLUSH_THRESHOLD="${TIMING_FLUSH_THRESHOLD:-80}"
-    USE_RING_BUFFER="${USE_RING_BUFFER:-true}"
-    
-    echo "Windowed Sampling Configuration:"
-    echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
-    echo "  Perf Events: ${PERF_EVENTS}"
-    echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
-    echo "  Ring Buffer: size=${TIMING_BUFFER_SIZE}, threshold=${TIMING_FLUSH_THRESHOLD}%"
+	# Set defaults for windowed sampling if not specified
+	WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
+	# Safe default using only universally available counters
+	PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+	ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
+	# Large buffer size for channel + ring buffer architecture
+	TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-16384}"
+	
+	echo "Windowed Sampling Configuration:"
+	echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
+	echo "  Perf Events: ${PERF_EVENTS}"
+	echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+	echo "  Ring Buffer: size=${TIMING_BUFFER_SIZE}"
+	echo "  Architecture: non-blocking channel → consumer goroutine → ring buffer → window flush"
     
     # Validate target node exists
     if ! kubectl get node "$TARGET_NODE" &>/dev/null; then
@@ -2083,28 +2083,27 @@ main() {
         echo "VICTIM_SERVICES='frontend search user'"
         echo "NOISY_NEIGHBOR_TYPE='cpu'"
         echo "NOISY_NEIGHBOR_ARGS='4 300s'"
-        echo "EXPERIMENT_DURATION=30"
-        echo "ITERATIONS=5"
-        echo "ITERATION_DELAY=10"
-        echo "# Windowed sampling configuration:"
-        echo "ENABLE_WINDOWED_SAMPLING=true"
-        echo "WINDOW_INTERVAL_MS=100  # Sample every 100ms"
-        echo "PERF_EVENTS='cycles,instructions,cache-misses,llc-misses' "
-        echo "# Ring buffer configuration (lock-free, high performance):"
-        echo "TIMING_BUFFER_SIZE=2048         # Buffer size (power of 2), handles 100-1K req/s"
-        echo "TIMING_FLUSH_THRESHOLD=80       # Proactive flush at 80% full"
-        echo "USE_RING_BUFFER=true            # Enable lock-free ring buffer (default)"
-        echo "# Jaeger tracing configuration:"
-        echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
-        echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
-        echo "# wrk2 configuration:"
-        echo "WRK2_TARGET_SERVICE='frontend'"
-        echo "WRK2_TARGET_IP='192.168.202.238'"
-        echo "WRK2_TARGET_PORT=5000"
-        echo "WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'"
-        echo "WRK2_RATE=200"
-        echo "WRK2_THREADS=2"
-        echo "WRK2_CONNECTIONS=2"
+		echo "EXPERIMENT_DURATION=30"
+		echo "ITERATIONS=5"
+		echo "ITERATION_DELAY=10"
+		echo "# Windowed sampling configuration:"
+		echo "ENABLE_WINDOWED_SAMPLING=true"
+		echo "WINDOW_INTERVAL_MS=100  # Sample every 100ms"
+		echo "PERF_EVENTS='cycles,instructions,LLC-load-misses,branch-misses,dTLB-load-misses,iTLB-load-misses,page-faults'"
+		echo "# Ring buffer configuration:"
+		echo "# Architecture: non-blocking channel → consumer goroutine → ring buffer → window flush"
+		echo "TIMING_BUFFER_SIZE=16384  # Buffer size (power of 2), handles bursts up to 1600 req/s"
+		echo "# Jaeger tracing configuration:"
+		echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
+		echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
+		echo "# wrk2 configuration:"
+		echo "WRK2_TARGET_SERVICE='frontend'"
+		echo "WRK2_TARGET_IP='192.168.202.238'"
+		echo "WRK2_TARGET_PORT=5000"
+		echo "WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'"
+		echo "WRK2_RATE=200"
+		echo "WRK2_THREADS=3"
+		echo "WRK2_CONNECTIONS=3"
         exit 1
     fi
     
