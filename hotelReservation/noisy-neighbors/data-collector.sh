@@ -189,16 +189,26 @@ store_original_config() {
     # Get current image
     local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
     
+    log "$exp_dir" "Current image from deployment: $current_image"
+    
     # If current image is a windowed image from previous run, use the specific windowed tag
     if [[ "$current_image" == *"-windowed"* ]]; then
-        log "$exp_dir" "Current image is windowed: $current_image - using specific windowed tag"
+        log "$exp_dir" "Detected windowed image, converting to: docclabgroup/${service}-windowed:windowed-v4.5"
         # Hardcode to specific windowed image tag
         current_image="docclabgroup/${service}-windowed:windowed-v4.5"
-        log "$exp_dir" "Will restore to: $current_image"
+    else
+        log "$exp_dir" "Not a windowed image, keeping as-is: $current_image"
     fi
     
     # Get current environment variables
     local current_env=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
+    
+    # Ensure file exists and is unique per service (avoid duplicates from iterations)
+    # Remove any previous entries for this service
+    if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
+        grep -v "^$service:" "$exp_dir/metadata/original_configs.txt" > "$exp_dir/metadata/original_configs.txt.tmp" 2>/dev/null || true
+        mv "$exp_dir/metadata/original_configs.txt.tmp" "$exp_dir/metadata/original_configs.txt" 2>/dev/null || true
+    fi
     
     # Store in file for cleanup
     echo "$service:$current_image:$current_env" >> "$exp_dir/metadata/original_configs.txt"
