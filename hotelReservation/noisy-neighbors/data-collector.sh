@@ -503,19 +503,19 @@ cleanup_windowed_sampling_resources() {
     if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
         while read -r line; do
             # Parse line: service:image:env
-            # Use first colon for service, last colon for env separator (image can have colon for tag)
+            # Use first colon for service, handle image with colon for tag
             local service=$(echo "$line" | cut -d':' -f1)
-            # Get everything after first colon and before the last occurrence of :[{
+            # Get everything after first colon
             local rest="${line#*:}"  # Remove service and first colon
             
             # The env part starts with [{ if present, otherwise the whole rest is the image
             if [[ "$rest" =~ ^(.+):(\[.*\])$ ]]; then
-                # Has env part
+                # Has env part: extract image and env
                 local original_image="${BASH_REMATCH[1]}"
                 local original_env="${BASH_REMATCH[2]}"
             else
-                # No env part or simple format
-                local original_image="$rest"
+                # No env part or simple format - take everything, remove trailing colons
+                local original_image="${rest%:}"  # Remove trailing colon if present
                 local original_env=""
             fi
             
