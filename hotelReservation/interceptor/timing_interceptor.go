@@ -118,7 +118,7 @@ type timingContext struct {
 
 // TimingServerInterceptorWithAggregator creates interceptor using a provided aggregator
 // This allows sharing the aggregator across all requests for proper windowed batching
-// Uses object pooling to eliminate allocations
+// Uses object pooling and deferred submission to eliminate request path overhead
 func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		// Get objects from pool (zero allocation in steady state)
@@ -160,10 +160,14 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 		timingData.ProcessingTime = processingTime
 		timingData.BlockingTime = pausedTime
 
-		// Send to aggregator (via buffered channel, non-blocking)
-		aggregator.AddTimingData(*timingData)
+		// Submit asynchronously in goroutine to avoid blocking request
+		// Make a copy for the goroutine since we're returning timingData to pool
+		dataCopy := *timingData
+		go func() {
+			aggregator.AddTimingData(dataCopy)
+		}()
 		
-		// Return objects to pool for reuse
+		// Return objects to pool immediately (request can complete)
 		timingDataPool.Put(timingData)
 		timingContextPool.Put(timingCtx)
 
