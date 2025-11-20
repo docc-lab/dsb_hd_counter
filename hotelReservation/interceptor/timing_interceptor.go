@@ -155,23 +155,25 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 		
 		processingTime := totalTime - pausedTime
 
-		// Update timing data with final values
-		timingData.TotalTime = totalTime
-		timingData.ProcessingTime = processingTime
-		timingData.BlockingTime = pausedTime
+	// Update timing data with final values
+	timingData.TotalTime = totalTime
+	timingData.ProcessingTime = processingTime
+	timingData.BlockingTime = pausedTime
 
-		// Submit asynchronously in goroutine to avoid blocking request
-		// Make a copy for the goroutine since we're returning timingData to pool
-		dataCopy := *timingData
-		go func() {
-			aggregator.AddTimingData(dataCopy)
-		}()
-		
-		// Return objects to pool immediately (request can complete)
-		timingDataPool.Put(timingData)
-		timingContextPool.Put(timingCtx)
+	// Make a copy of timing data before returning to pool
+	// The aggregator's channel consumer will handle this asynchronously
+	dataCopy := *timingData
+	
+	// Return objects to pool immediately (before channel send)
+	timingDataPool.Put(timingData)
+	timingContextPool.Put(timingCtx)
 
-		return resp, err
+	// Non-blocking send to aggregator's channel
+	// The pre-existing consumer goroutine will process this
+	// Request doesn't wait - returns immediately
+	aggregator.AddTimingData(dataCopy)
+
+	return resp, err
 	}
 }
 
