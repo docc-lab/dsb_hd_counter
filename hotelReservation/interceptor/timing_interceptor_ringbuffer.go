@@ -17,10 +17,6 @@ type RingBufferTimingAggregator struct {
 	windowInterval     time.Duration
 	windowStatsChannel chan *WindowTimingStats
 	
-	// Intermediate buffer for window accumulation
-	windowData         []TimingData
-	windowDataMu       sync.Mutex
-	
 	// Flush control
 	windowTicker       *time.Ticker
 	ctx                context.Context
@@ -32,21 +28,20 @@ type RingBufferTimingAggregator struct {
 func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggregator {
 	ctx, cancel := context.WithCancel(context.Background())
 	
-	// Determine buffer size from environment or use default
-	bufferSize := parseBufferSize(os.Getenv("TIMING_BUFFER_SIZE"), 2048)
-	flushThreshold := parseFlushThreshold(os.Getenv("TIMING_FLUSH_THRESHOLD"), 80)
+	// Determine buffer size from environment or use larger default
+	// Large buffer to hold multiple windows of data without overflow
+	bufferSize := parseBufferSize(os.Getenv("TIMING_BUFFER_SIZE"), 16384)
 	
 	agg := &RingBufferTimingAggregator{
 		serviceName:        config.ServiceName,
-		ringBuffer:         NewLockFreeRingBuffer(bufferSize, flushThreshold),
+		ringBuffer:         NewLockFreeRingBuffer(bufferSize, 100), // Threshold doesn't matter anymore
 		windowInterval:     config.WindowInterval,
 		windowStatsChannel: config.WindowStatsChannel,
-		windowData:         make([]TimingData, 0, bufferSize*2), // Unbounded intermediate buffer
 		ctx:                ctx,
 		cancel:             cancel,
 	}
 	
-	// Start periodic window flush loop (only this, no threshold monitoring loop)
+	// Start periodic window flush loop
 	agg.wg.Add(1)
 	go agg.windowedFlushLoop()
 	
@@ -54,8 +49,7 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 		Str("service", config.ServiceName).
 		Dur("window_interval", config.WindowInterval).
 		Uint64("buffer_size", bufferSize).
-		Uint64("flush_threshold", agg.ringBuffer.flushThreshold).
-		Msg("Started ring-buffer timing aggregator")
+		Msg("Started ring-buffer timing aggregator (no intermediate buffer)")
 	
 	return agg
 }
@@ -113,30 +107,9 @@ func parseFlushThreshold(thresholdStr string, defaultPct int) int {
 // NO LOCKS - uses atomic CAS operations only
 func (rba *RingBufferTimingAggregator) AddTimingData(data TimingData) {
 	// Try to push to ring buffer (lock-free)
-	success := rba.ringBuffer.TryPush(data)
-	
-	// If buffer is approaching capacity threshold, trigger proactive drain
-	if !success || rba.ringBuffer.ShouldFlush() {
-		// Drain ring buffer to intermediate buffer immediately (non-blocking)
-		go rba.drainToIntermediateBuffer()
-	}
-}
-
-// drainToIntermediateBuffer drains ring buffer to intermediate buffer
-// This is called when ring buffer reaches threshold (triggered by AddTimingData)
-// Moves data from fixed-size ring buffer to unbounded intermediate buffer
-func (rba *RingBufferTimingAggregator) drainToIntermediateBuffer() {
-	// Pop all items from ring buffer
-	items := rba.ringBuffer.PopAll()
-	
-	if len(items) == 0 {
-		return
-	}
-	
-	// Add to intermediate buffer (briefly locked)
-	rba.windowDataMu.Lock()
-	rba.windowData = append(rba.windowData, items...)
-	rba.windowDataMu.Unlock()
+	// If buffer is full, data is dropped (tracked in stats)
+	// Buffer is sized large enough to hold multiple windows worth of data
+	rba.ringBuffer.TryPush(data)
 }
 
 // windowedFlushLoop periodically computes and outputs window stats at fixed interval
@@ -161,29 +134,12 @@ func (rba *RingBufferTimingAggregator) windowedFlushLoop() {
 }
 
 // flushWindow is called at END OF WINDOW INTERVAL
-// It drains any remaining ring buffer data, then computes stats from intermediate buffer
+// It reads all data accumulated since last window and advances tail pointer
 func (rba *RingBufferTimingAggregator) flushWindow() {
-	// 1. Drain any remaining data from ring buffer to intermediate buffer
-	remaining := rba.ringBuffer.PopAll()
+	// Pop all data accumulated in this window (advances tail pointer)
+	// This is the ONLY place we read from the ring buffer
+	windowData := rba.ringBuffer.PopAll()
 	
-	// 2. Lock intermediate buffer and get all window data
-	rba.windowDataMu.Lock()
-	
-	// Add remaining items from ring buffer
-	if len(remaining) > 0 {
-		rba.windowData = append(rba.windowData, remaining...)
-	}
-	
-	// Get snapshot of all data for this window
-	windowData := make([]TimingData, len(rba.windowData))
-	copy(windowData, rba.windowData)
-	
-	// Clear intermediate buffer for next window
-	rba.windowData = rba.windowData[:0] // Keep capacity, reset length
-	
-	rba.windowDataMu.Unlock()
-	
-	// 3. Calculate window stats (outside lock)
 	if len(windowData) == 0 {
 		// No data in this window, send empty stats
 		if rba.windowStatsChannel != nil {
@@ -195,10 +151,10 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 		return
 	}
 	
-	// Calculate aggregated window statistics
+	// Calculate aggregated window statistics directly from ring buffer data
 	stats := rba.calculateWindowStats(windowData)
 	
-	// 4. Send aggregated stats to windowed sampler (non-blocking)
+	// Send aggregated stats to windowed sampler (non-blocking)
 	if rba.windowStatsChannel != nil {
 		select {
 		case rba.windowStatsChannel <- stats:
