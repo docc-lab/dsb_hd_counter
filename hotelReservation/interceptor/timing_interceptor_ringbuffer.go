@@ -17,6 +17,9 @@ type RingBufferTimingAggregator struct {
 	windowInterval     time.Duration
 	windowStatsChannel chan *WindowTimingStats
 	
+	// Input channel for timing data (non-blocking writes)
+	timingDataChan     chan TimingData
+	
 	// Flush control
 	windowTicker       *time.Ticker
 	ctx                context.Context
@@ -32,14 +35,23 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 	// Large buffer to hold multiple windows of data without overflow
 	bufferSize := parseBufferSize(os.Getenv("TIMING_BUFFER_SIZE"), 16384)
 	
+	// Create large buffered channel to decouple writers from ring buffer
+	// Channel size should be > typical requests per window
+	timingDataChan := make(chan TimingData, 10000)
+	
 	agg := &RingBufferTimingAggregator{
 		serviceName:        config.ServiceName,
 		ringBuffer:         NewLockFreeRingBuffer(bufferSize, 100), // Threshold doesn't matter anymore
 		windowInterval:     config.WindowInterval,
 		windowStatsChannel: config.WindowStatsChannel,
+		timingDataChan:     timingDataChan,
 		ctx:                ctx,
 		cancel:             cancel,
 	}
+	
+	// Start consumer goroutine to read from channel and push to ring buffer
+	agg.wg.Add(1)
+	go agg.consumeTimingData()
 	
 	// Start periodic window flush loop
 	agg.wg.Add(1)
@@ -49,7 +61,8 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 		Str("service", config.ServiceName).
 		Dur("window_interval", config.WindowInterval).
 		Uint64("buffer_size", bufferSize).
-		Msg("Started ring-buffer timing aggregator (no intermediate buffer)")
+		Int("channel_size", cap(timingDataChan)).
+		Msg("Started ring-buffer timing aggregator with channel")
 	
 	return agg
 }
@@ -102,14 +115,43 @@ func parseFlushThreshold(thresholdStr string, defaultPct int) int {
 	return threshold
 }
 
-// AddTimingData adds timing data to ring buffer (LOCK-FREE!)
+// AddTimingData adds timing data via buffered channel (NON-BLOCKING!)
 // This is called by MANY concurrent gRPC requests
-// NO LOCKS - uses atomic CAS operations only
+// Uses non-blocking channel send to avoid any delays in request path
 func (rba *RingBufferTimingAggregator) AddTimingData(data TimingData) {
-	// Try to push to ring buffer (lock-free)
-	// If buffer is full, data is dropped (tracked in stats)
-	// Buffer is sized large enough to hold multiple windows worth of data
-	rba.ringBuffer.TryPush(data)
+	// Non-blocking send to channel
+	select {
+	case rba.timingDataChan <- data:
+		// Sent successfully, request can return immediately
+	default:
+		// Channel full, drop this measurement
+		// This is better than blocking the request
+	}
+}
+
+// consumeTimingData runs in a dedicated goroutine to consume from channel
+// and push to ring buffer, decoupling request path from ring buffer operations
+func (rba *RingBufferTimingAggregator) consumeTimingData() {
+	defer rba.wg.Done()
+	
+	for {
+		select {
+		case data := <-rba.timingDataChan:
+			// Push to ring buffer (may retry with CAS, but doesn't block requests)
+			rba.ringBuffer.TryPush(data)
+			
+		case <-rba.ctx.Done():
+			// Drain remaining items from channel
+			for {
+				select {
+				case data := <-rba.timingDataChan:
+					rba.ringBuffer.TryPush(data)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 // windowedFlushLoop periodically computes and outputs window stats at fixed interval
