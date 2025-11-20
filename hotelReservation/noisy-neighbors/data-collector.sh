@@ -193,9 +193,9 @@ store_original_config() {
     
     # If current image is a windowed image from previous run, use the specific windowed tag
     if [[ "$current_image" == *"-windowed"* ]]; then
-        log "$exp_dir" "Detected windowed image, converting to: docclabgroup/${service}-windowed:windowed-v4.5"
+        log "$exp_dir" "Detected windowed image, converting to: docclabgroup/${service}-windowed:windowed-v4.6"
         # Hardcode to specific windowed image tag
-        current_image="docclabgroup/${service}-windowed:windowed-v4.5"
+        current_image="docclabgroup/${service}-windowed:windowed-v4.6"
     else
         log "$exp_dir" "Not a windowed image, keeping as-is: $current_image"
     fi
