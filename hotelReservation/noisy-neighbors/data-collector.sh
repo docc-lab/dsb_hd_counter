@@ -905,13 +905,25 @@ configure_jaeger_tracing() {
         log "$exp_dir" "WARNING: Service registration validation failed, performing refresh..."
         refresh_consul_service_discovery "$exp_dir"
         
-        # If still failing after refresh, try manual registration as fallback
+        # If still failing after refresh, verify and fix IP mismatches
         if ! validate_and_ensure_service_registration "$exp_dir" 1; then
-            log "$exp_dir" "WARNING: Consul refresh failed, attempting manual service registration..."
-            manual_register_all_services "$exp_dir"
+            log "$exp_dir" "WARNING: Consul refresh failed, checking for IP mismatches..."
+            
+            # CRITICAL FIX: Verify pod IPs match Consul registrations
+            if ! verify_and_fix_consul_pod_ips "$exp_dir"; then
+                log "$exp_dir" "WARNING: IP verification/fix failed, attempting manual registration..."
+                manual_register_all_services "$exp_dir"
+            fi
+            
+            # Force DNS cache refresh to ensure services can resolve updated IPs
+            force_dns_cache_refresh "$exp_dir"
         fi
     else
         log "$exp_dir" " All services properly registered, skipping unnecessary Consul restart"
+        
+        # Even if registration looks good, verify IPs match to catch stale registrations
+        log "$exp_dir" "Verifying Consul registrations have correct IPs..."
+        verify_and_fix_consul_pod_ips "$exp_dir"
     fi
     
     # Verification
@@ -1109,6 +1121,174 @@ validate_and_ensure_service_registration() {
     return 1
 }
 
+# Verify Consul registrations match actual pod IPs and fix mismatches
+verify_and_fix_consul_pod_ips() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Verifying Consul registrations match actual pod IPs..."
+    
+    # Check if Consul is available
+    if ! kubectl get deployment consul &>/dev/null; then
+        log "$exp_dir" "WARNING: Consul deployment not found, skipping IP verification"
+        return 1
+    fi
+    
+    # Get Consul pod
+    local consul_pod=$(kubectl get pods -l io.kompose.service=consul -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$consul_pod" ]]; then
+        log "$exp_dir" "ERROR: Could not find Consul pod"
+        return 1
+    fi
+    
+    local services_to_check=(
+        "search:srv-search:8082"
+        "geo:srv-geo:8083"
+        "profile:srv-profile:8081"
+        "rate:srv-rate:8084"
+        "recommendation:srv-recommendation:8085"
+        "reservation:srv-reservation:8087"
+        "user:srv-user:8086"
+    )
+    
+    local mismatches=0
+    local fixed=0
+    
+    for service_info in "${services_to_check[@]}"; do
+        IFS=':' read -r service_name consul_name port <<< "$service_info"
+        
+        # Get actual pod IP
+        local pod_ip=$(kubectl get pod -l io.kompose.service="$service_name" -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+        
+        if [[ -z "$pod_ip" ]]; then
+            log "$exp_dir" "  WARNING: $service_name pod not found or not ready"
+            continue
+        fi
+        
+        # Get Consul registered IP using consul catalog
+        local consul_ip=$(kubectl exec -it "$consul_pod" -- consul catalog service "$consul_name" -detailed 2>/dev/null | grep -A5 "Service:" | grep "Address:" | head -1 | awk '{print $2}' | tr -d '\r\n' || echo "")
+        
+        # If catalog query didn't work, try HTTP API
+        if [[ -z "$consul_ip" ]]; then
+            consul_ip=$(kubectl exec -it "$consul_pod" -- wget -qO- "http://localhost:8500/v1/catalog/service/${consul_name}" 2>/dev/null | grep -o '"Address":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+        fi
+        
+        if [[ -z "$consul_ip" ]]; then
+            log "$exp_dir" "  $service_name: NOT registered in Consul (will register)"
+            ((mismatches++))
+            
+            # Deregister any existing instances first
+            deregister_consul_service "$exp_dir" "$consul_pod" "$consul_name"
+            
+            # Register with correct IP
+            if kubectl exec -it "$consul_pod" -- consul services register \
+                -name="$consul_name" \
+                -port="$port" \
+                -address="$pod_ip" \
+                -id="$service_name-auto" 2>/dev/null; then
+                log "$exp_dir" "    ✓ Registered $consul_name at $pod_ip:$port"
+                ((fixed++))
+            else
+                log "$exp_dir" "    ✗ Failed to register $consul_name"
+            fi
+        elif [[ "$consul_ip" != "$pod_ip" ]]; then
+            log "$exp_dir" "  $service_name: IP MISMATCH (Consul: $consul_ip, Pod: $pod_ip)"
+            ((mismatches++))
+            
+            # Deregister old IP
+            deregister_consul_service "$exp_dir" "$consul_pod" "$consul_name"
+            
+            # Register with correct IP
+            if kubectl exec -it "$consul_pod" -- consul services register \
+                -name="$consul_name" \
+                -port="$port" \
+                -address="$pod_ip" \
+                -id="$service_name-auto" 2>/dev/null; then
+                log "$exp_dir" "    ✓ Updated $consul_name to $pod_ip:$port"
+                ((fixed++))
+            else
+                log "$exp_dir" "    ✗ Failed to update $consul_name"
+            fi
+        else
+            log "$exp_dir" "  $service_name: ✓ IP matches ($pod_ip)"
+        fi
+    done
+    
+    if [[ $mismatches -eq 0 ]]; then
+        log "$exp_dir" " All Consul registrations match pod IPs"
+        return 0
+    elif [[ $fixed -eq $mismatches ]]; then
+        log "$exp_dir" " Fixed $fixed IP mismatches"
+        return 0
+    else
+        log "$exp_dir" " WARNING: Fixed $fixed of $mismatches IP mismatches"
+        return 1
+    fi
+}
+
+# Deregister a service from Consul (all instances)
+deregister_consul_service() {
+    local exp_dir="$1"
+    local consul_pod="$2"
+    local service_name="$3"
+    
+    # Get all service instances
+    local instances=$(kubectl exec -it "$consul_pod" -- consul catalog service "$service_name" 2>/dev/null | grep "ServiceID:" | awk '{print $2}' | tr -d '\r\n')
+    
+    if [[ -n "$instances" ]]; then
+        while IFS= read -r instance_id; do
+            if [[ -n "$instance_id" ]]; then
+                kubectl exec -it "$consul_pod" -- consul services deregister -id="$instance_id" 2>/dev/null || true
+            fi
+        done <<< "$instances"
+    fi
+    
+    # Also try common ID patterns
+    for id_pattern in "manual-${service_name#srv-}" "${service_name#srv-}-auto" "$service_name"; do
+        kubectl exec -it "$consul_pod" -- consul services deregister -id="$id_pattern" 2>/dev/null || true
+    done
+}
+
+# Force DNS cache refresh on all service pods
+force_dns_cache_refresh() {
+    local exp_dir="$1"
+    
+    log "$exp_dir" "Forcing DNS cache refresh..."
+    
+    # Restart CoreDNS to clear DNS cache at cluster level
+    log "$exp_dir" "  Restarting CoreDNS..."
+    if kubectl rollout restart deployment/coredns -n kube-system 2>/dev/null; then
+        kubectl rollout status deployment/coredns -n kube-system --timeout=30s 2>/dev/null || \
+            log "$exp_dir" "  WARNING: CoreDNS restart timeout"
+        log "$exp_dir" "    ✓ CoreDNS restarted"
+    else
+        log "$exp_dir" "    WARNING: Could not restart CoreDNS (insufficient permissions?)"
+    fi
+    
+    # Force services to re-resolve DNS by restarting them
+    log "$exp_dir" "  Restarting service pods to clear pod-level DNS cache..."
+    local services=("search" "geo" "profile" "rate" "recommendation" "reservation" "user" "frontend")
+    
+    for service in "${services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            # Delete pods to force fresh DNS resolution (faster than rollout restart)
+            kubectl delete pod -l io.kompose.service="$service" --grace-period=0 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for pods to be recreated and ready
+    log "$exp_dir" "  Waiting for pods to be ready after DNS refresh..."
+    sleep 15
+    
+    for service in "${services[@]}"; do
+        if kubectl get deployment "$service" &>/dev/null; then
+            kubectl wait --for=condition=ready pod -l io.kompose.service="$service" --timeout=60s 2>/dev/null || \
+                log "$exp_dir" "    WARNING: $service not ready after DNS refresh"
+        fi
+    done
+    
+    log "$exp_dir" " DNS cache refresh completed"
+}
+
 # Manual registration of all services as fallback
 manual_register_all_services() {
     local exp_dir="$1"
@@ -1150,6 +1330,10 @@ manual_register_all_services() {
         if [[ -n "$service_ip" ]]; then
             log "$exp_dir" "  Registering $consul_name at $service_ip:$port"
             
+            # CRITICAL FIX: Deregister any stale entries first
+            deregister_consul_service "$exp_dir" "$consul_pod" "$consul_name"
+            sleep 2  # Give Consul time to process deregistration
+            
             # Register service without health checks to avoid deregistration
             if kubectl exec -it "$consul_pod" -- consul services register \
                 -name="$consul_name" \
@@ -1157,10 +1341,10 @@ manual_register_all_services() {
                 -address="$service_ip" \
                 -id="manual-$service_name" 2>/dev/null; then
                 
-                log "$exp_dir" "    Successfully registered $consul_name"
+                log "$exp_dir" "    ✓ Successfully registered $consul_name"
                 ((registered_count++))
             else
-                log "$exp_dir" "    Failed to register $consul_name"
+                log "$exp_dir" "    ✗ Failed to register $consul_name"
             fi
         else
             log "$exp_dir" "  Skipping $service_name - no pod found or not ready"
@@ -1985,11 +2169,20 @@ run_experiment() {
     if ! validate_system_readiness "$exp_dir"; then
         log "$exp_dir" "WARNING: Initial system validation failed. Attempting recovery..."
         
+        # Try IP verification and correction first
+        log "$exp_dir" "Step 1: Verifying and fixing IP mismatches..."
+        verify_and_fix_consul_pod_ips "$exp_dir"
+        
+        # Force DNS refresh
+        log "$exp_dir" "Step 2: Forcing DNS cache refresh..."
+        force_dns_cache_refresh "$exp_dir"
+        
         # Try manual registration as last resort
+        log "$exp_dir" "Step 3: Manual service registration..."
         if manual_register_all_services "$exp_dir"; then
             log "$exp_dir" "Manual registration successful. Re-validating system..."
             if validate_system_readiness "$exp_dir"; then
-                log "$exp_dir" " System validation passed after manual registration. Ready to start experiments."
+                log "$exp_dir" " System validation passed after recovery. Ready to start experiments."
             else
                 log "$exp_dir" "ERROR: System validation still failed after manual registration. Aborting experiment."
                 exit 1
