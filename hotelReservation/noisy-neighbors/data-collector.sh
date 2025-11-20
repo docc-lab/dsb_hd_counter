@@ -189,13 +189,12 @@ store_original_config() {
     # Get current image
     local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
     
-    # If current image is a windowed image from previous run, derive the original
-    if [[ "$current_image" == *"-windowed:"* ]]; then
-        log "$exp_dir" "Current image is windowed: $current_image - deriving original"
-        # Convert: docclabgroup/search-windowed:windowed-v4.5 → docclabgroup/search:windowed-v4.5
-        # Remove "-windowed" from the image name but keep registry and tag
-        current_image="${current_image//-windowed:/:}"
-        log "$exp_dir" "Derived original image: $current_image"
+    # If current image is a windowed image from previous run, use the specific windowed tag
+    if [[ "$current_image" == *"-windowed"* ]]; then
+        log "$exp_dir" "Current image is windowed: $current_image - using specific windowed tag"
+        # Hardcode to specific windowed image tag
+        current_image="docclabgroup/${service}-windowed:windowed-v4.5"
+        log "$exp_dir" "Will restore to: $current_image"
     fi
     
     # Get current environment variables
