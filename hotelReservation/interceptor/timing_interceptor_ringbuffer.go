@@ -35,9 +35,10 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 	// Large buffer to hold multiple windows of data without overflow
 	bufferSize := parseBufferSize(os.Getenv("TIMING_BUFFER_SIZE"), 16384)
 	
-	// Create large buffered channel to decouple writers from ring buffer
-	// Channel size should be > typical requests per window
-	timingDataChan := make(chan TimingData, 10000)
+	// Create VERY large buffered channel - large enough that it never fills
+	// At 1000 req/s, 100k capacity = 100 seconds of buffering
+	// Consumer should keep up, so this provides massive headroom
+	timingDataChan := make(chan TimingData, 100000)
 	
 	agg := &RingBufferTimingAggregator{
 		serviceName:        config.ServiceName,
@@ -49,9 +50,13 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 		cancel:             cancel,
 	}
 	
-	// Start consumer goroutine to read from channel and push to ring buffer
-	agg.wg.Add(1)
-	go agg.consumeTimingData()
+	// Start multiple consumer goroutines for parallel processing
+	// Multiple consumers to ensure channel is drained quickly
+	numConsumers := 4
+	for i := 0; i < numConsumers; i++ {
+		agg.wg.Add(1)
+		go agg.consumeTimingData()
+	}
 	
 	// Start periodic window flush loop
 	agg.wg.Add(1)
@@ -62,7 +67,8 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 		Dur("window_interval", config.WindowInterval).
 		Uint64("buffer_size", bufferSize).
 		Int("channel_size", cap(timingDataChan)).
-		Msg("Started ring-buffer timing aggregator with channel")
+		Int("num_consumers", numConsumers).
+		Msg("Started ring-buffer timing aggregator with parallel consumers")
 	
 	return agg
 }
@@ -115,18 +121,15 @@ func parseFlushThreshold(thresholdStr string, defaultPct int) int {
 	return threshold
 }
 
-// AddTimingData adds timing data via buffered channel (NON-BLOCKING!)
+// AddTimingData adds timing data via buffered channel (BLOCKING but fast!)
 // This is called by MANY concurrent gRPC requests
-// Uses non-blocking channel send to avoid any delays in request path
+// Uses blocking send to huge channel - faster than select/default
+// Channel is large enough (100k) that blocking is extremely rare
 func (rba *RingBufferTimingAggregator) AddTimingData(data TimingData) {
-	// Non-blocking send to channel
-	select {
-	case rba.timingDataChan <- data:
-		// Sent successfully, request can return immediately
-	default:
-		// Channel full, drop this measurement
-		// This is better than blocking the request
-	}
+	// Blocking send to channel
+	// With 100k buffer and multiple fast consumers, this never blocks in practice
+	// This is FASTER than select because it avoids the select overhead
+	rba.timingDataChan <- data
 }
 
 // consumeTimingData runs in a dedicated goroutine to consume from channel
