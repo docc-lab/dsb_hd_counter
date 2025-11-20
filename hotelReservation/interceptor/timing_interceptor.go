@@ -5,7 +5,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 )
 
@@ -137,12 +136,11 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 		// Calculate timing metrics
 		totalTime := processingEnd.Sub(arrivalTime)
 		
-		// Get the accumulated paused time from the mutable context (lock-free atomic read)
-		pausedTimeNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
-		pausedTime := time.Duration(pausedTimeNs)
-		blockingCount := atomic.LoadInt32(&timingCtx.totalCallCount)
-		
-		processingTime := totalTime - pausedTime
+	// Get the accumulated paused time from the mutable context (lock-free atomic read)
+	pausedTimeNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
+	pausedTime := time.Duration(pausedTimeNs)
+	
+	processingTime := totalTime - pausedTime
 
 	// Update timing data with final values
 	timingData.TotalTime = totalTime
@@ -167,7 +165,7 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		// Check if we have timing context (meaning timing is enabled)
-		timingData, hasTimingData := ctx.Value(timingDataKey).(*TimingData)
+		_, hasTimingData := ctx.Value(timingDataKey).(*TimingData)
 		timingCtx, hasTimingCtx := ctx.Value(pauseTimeKey).(*timingContext)
 		
 		if !hasTimingData || !hasTimingCtx {
@@ -178,21 +176,18 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		// PAUSE TIMER: Push onto call stack (LOCK-FREE atomic increment)
 		// If this is the first call (0→1), we transition to blocking state
 		oldCount := atomic.AddInt32(&timingCtx.activeCallCount, 1) - 1
-		currentCount := oldCount + 1
 		
-	if oldCount == 0 {
-		// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
-		pauseStartNs := time.Now().UnixNano()
-		atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
-	}
+		if oldCount == 0 {
+			// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
+			pauseStartNs := time.Now().UnixNano()
+			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
+		}
 		
 		// Increment total call counter (LOCK-FREE atomic)
 		atomic.AddInt32(&timingCtx.totalCallCount, 1)
 		
 		// Make the actual downstream call (THIS IS THE BLOCKING PART)
-		callStart := time.Now()
 		err := invoker(ctx, method, req, reply, cc, opts...)
-		callDuration := time.Since(callStart)
 		
 		// RESUME TIMER: Pop from call stack (LOCK-FREE atomic decrement)
 		// If this was the last call (1→0), we transition back to processing state
@@ -201,12 +196,12 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		if newCount == 0 {
 			// Stack is now empty - END blocking period and accumulate time (RESUME TIMER)
 			pauseStartNs := atomic.LoadInt64(&timingCtx.pauseStartTimeNs)
-		if pauseStartNs > 0 {
-			blockingDurationNs := time.Now().UnixNano() - pauseStartNs
-			atomic.AddInt64(&timingCtx.totalPausedTimeNs, blockingDurationNs)
-			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
+			if pauseStartNs > 0 {
+				blockingDurationNs := time.Now().UnixNano() - pauseStartNs
+				atomic.AddInt64(&timingCtx.totalPausedTimeNs, blockingDurationNs)
+				atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
+			}
 		}
-	}
 		
 		// Return back to service handler
 		// Server interceptor will STOP TIMER when response is sent
