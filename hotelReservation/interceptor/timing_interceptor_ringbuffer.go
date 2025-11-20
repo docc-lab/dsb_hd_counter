@@ -133,12 +133,6 @@ func (rba *RingBufferTimingAggregator) drainToIntermediateBuffer() {
 		return
 	}
 	
-	log.Debug().
-		Str("service", rba.serviceName).
-		Int("items_drained", len(items)).
-		Float64("usage_before", rba.ringBuffer.UsagePercent()).
-		Msg("Proactive drain: moving data from ring buffer to intermediate buffer")
-	
 	// Add to intermediate buffer (briefly locked)
 	rba.windowDataMu.Lock()
 	rba.windowData = append(rba.windowData, items...)
@@ -203,15 +197,6 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 	
 	// Calculate aggregated window statistics
 	stats := rba.calculateWindowStats(windowData)
-	
-	// Log flush info
-	bufferStats := rba.ringBuffer.GetStats()
-	log.Debug().
-		Str("service", rba.serviceName).
-		Int("window_requests", stats.RequestCount).
-		Int64("mean_processing_ns", stats.ProcessingTime.MeanNs).
-		Uint64("ring_buffer_dropped", bufferStats.Dropped).
-		Msg("Window stats computed at window end")
 	
 	// 4. Send aggregated stats to windowed sampler (non-blocking)
 	if rba.windowStatsChannel != nil {

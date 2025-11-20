@@ -124,17 +124,11 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 			totalCallCount:    0,
 		}
 		
-		// Store timing data and mutable context for client interceptor to access
-		ctx = context.WithValue(ctx, timingDataKey, timingData)
-		ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
+	// Store timing data and mutable context for client interceptor to access
+	ctx = context.WithValue(ctx, timingDataKey, timingData)
+	ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
 
-		log.Debug().
-			Str("method", info.FullMethod).
-			Str("service", serviceName).
-			Time("arrival_time", arrivalTime).
-			Msg("gRPC request started")
-
-		// Call the actual handler (may call client interceptor which pauses/resumes timer)
+	// Call the actual handler (may call client interceptor which pauses/resumes timer)
 		resp, err := handler(ctx, req)
 		
 		// STOP TIMER: Response is about to be sent back
@@ -150,25 +144,12 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 		
 		processingTime := totalTime - pausedTime
 
-		// Update timing data with final values
-		timingData.TotalTime = totalTime
-		timingData.ProcessingTime = processingTime
-		timingData.BlockingTime = pausedTime
+	// Update timing data with final values
+	timingData.TotalTime = totalTime
+	timingData.ProcessingTime = processingTime
+	timingData.BlockingTime = pausedTime
 
-		// Log detailed timing information for this request
-		log.Debug().
-			Str("method", info.FullMethod).
-			Str("service", serviceName).
-			Int32("downstream_calls", blockingCount).
-			Dur("total_time", totalTime).
-			Dur("processing_time", processingTime).
-			Dur("blocking_time", pausedTime).
-			Float64("processing_time_ms", float64(processingTime.Nanoseconds())/1000000).
-			Float64("total_time_ms", float64(totalTime.Nanoseconds())/1000000).
-			Float64("blocking_time_ms", float64(pausedTime.Nanoseconds())/1000000).
-			Msg("gRPC request completed")
-
-		// ADD TO WINDOW BUFFER: Add completed timing data to aggregator
+	// ADD TO WINDOW BUFFER: Add completed timing data to aggregator
 		// This goes into the window data buffer and will be aggregated with other concurrent requests
 		aggregator.AddTimingData(*timingData)
 
@@ -199,25 +180,11 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		oldCount := atomic.AddInt32(&timingCtx.activeCallCount, 1) - 1
 		currentCount := oldCount + 1
 		
-		if oldCount == 0 {
-			// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
-			pauseStartNs := time.Now().UnixNano()
-			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
-			
-			log.Debug().
-				Str("outgoing_method", method).
-				Str("parent_service", timingData.ServiceName).
-				Str("parent_method", timingData.Method).
-				Int32("stack_depth", currentCount).
-				Msg("PAUSE TIMER - Starting downstream call (stack 0→1)")
-		} else {
-			log.Debug().
-				Str("outgoing_method", method).
-				Str("parent_service", timingData.ServiceName).
-				Str("parent_method", timingData.Method).
-				Int32("stack_depth", currentCount).
-				Msg("Nested downstream call - already paused (stack depth increased)")
-		}
+	if oldCount == 0 {
+		// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
+		pauseStartNs := time.Now().UnixNano()
+		atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
+	}
 		
 		// Increment total call counter (LOCK-FREE atomic)
 		atomic.AddInt32(&timingCtx.totalCallCount, 1)
@@ -234,32 +201,12 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		if newCount == 0 {
 			// Stack is now empty - END blocking period and accumulate time (RESUME TIMER)
 			pauseStartNs := atomic.LoadInt64(&timingCtx.pauseStartTimeNs)
-			if pauseStartNs > 0 {
-				blockingDurationNs := time.Now().UnixNano() - pauseStartNs
-				atomic.AddInt64(&timingCtx.totalPausedTimeNs, blockingDurationNs)
-				atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
-				
-				totalPausedNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
-				
-				log.Debug().
-					Str("outgoing_method", method).
-					Str("parent_service", timingData.ServiceName).
-					Str("parent_method", timingData.Method).
-					Int32("stack_depth", newCount).
-					Dur("this_call_duration", callDuration).
-					Float64("blocking_period_ms", float64(blockingDurationNs)/1000000).
-					Float64("total_paused_ms", float64(totalPausedNs)/1000000).
-					Msg("RESUME TIMER - Downstream call completed (stack 1→0)")
-			}
-		} else {
-			log.Debug().
-				Str("outgoing_method", method).
-				Str("parent_service", timingData.ServiceName).
-				Str("parent_method", timingData.Method).
-				Int32("stack_depth", newCount).
-				Dur("this_call_duration", callDuration).
-				Msg("Nested downstream call completed - still paused (stack depth decreased)")
+		if pauseStartNs > 0 {
+			blockingDurationNs := time.Now().UnixNano() - pauseStartNs
+			atomic.AddInt64(&timingCtx.totalPausedTimeNs, blockingDurationNs)
+			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
 		}
+	}
 		
 		// Return back to service handler
 		// Server interceptor will STOP TIMER when response is sent
