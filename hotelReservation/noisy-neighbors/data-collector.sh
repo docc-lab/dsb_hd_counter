@@ -501,9 +501,27 @@ cleanup_windowed_sampling_resources() {
     log "$exp_dir" "Cleaning up windowed sampling resources"
     
     if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
-        while IFS=':' read -r service original_image original_env; do
+        while read -r line; do
+            # Parse line: service:image:env
+            # Use first colon for service, last colon for env separator (image can have colon for tag)
+            local service=$(echo "$line" | cut -d':' -f1)
+            # Get everything after first colon and before the last occurrence of :[{
+            local rest="${line#*:}"  # Remove service and first colon
+            
+            # The env part starts with [{ if present, otherwise the whole rest is the image
+            if [[ "$rest" =~ ^(.+):(\[.*\])$ ]]; then
+                # Has env part
+                local original_image="${BASH_REMATCH[1]}"
+                local original_env="${BASH_REMATCH[2]}"
+            else
+                # No env part or simple format
+                local original_image="$rest"
+                local original_env=""
+            fi
+            
             if [[ -n "$service" && -n "$original_image" ]]; then
                 log "$exp_dir" "Restoring original configuration for $service"
+                log "$exp_dir" "  Parsed image: $original_image"
                 
                 local container_name=$(get_container_name "$service")
                 
