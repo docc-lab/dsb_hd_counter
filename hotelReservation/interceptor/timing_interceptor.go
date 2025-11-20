@@ -2,10 +2,26 @@ package interceptor
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
+)
+
+// Object pools for zero-allocation timing
+var (
+	timingDataPool = sync.Pool{
+		New: func() interface{} {
+			return &TimingData{}
+		},
+	}
+	
+	timingContextPool = sync.Pool{
+		New: func() interface{} {
+			return &timingContext{}
+		},
+	}
 )
 
 // TimingConfig holds configuration for timing interceptor
@@ -102,54 +118,54 @@ type timingContext struct {
 
 // TimingServerInterceptorWithAggregator creates interceptor using a provided aggregator
 // This allows sharing the aggregator across all requests for proper windowed batching
+// Uses object pooling to eliminate allocations
 func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		// START TIMER: Record timestamp when new gRPC call arrives
+		// Get objects from pool (zero allocation in steady state)
+		timingData := timingDataPool.Get().(*TimingData)
+		timingCtx := timingContextPool.Get().(*timingContext)
+		
+		// START TIMER: Single time.Now() call at start
 		arrivalTime := time.Now()
 		
-		// Initialize timing data in context
-		timingData := &TimingData{
-			ServiceName: serviceName,
-			Method:      info.FullMethod,
-			ArrivalTime: arrivalTime,
-			Timestamp:   arrivalTime,
-		}
+		// Initialize timing data (reuse pooled object)
+		timingData.ServiceName = serviceName
+		timingData.Method = info.FullMethod
+		timingData.ArrivalTime = arrivalTime
+		timingData.Timestamp = arrivalTime
 		
-		// Create mutable timing context that can be updated by client interceptors (lock-free)
-		timingCtx := &timingContext{
-			activeCallCount:   0,
-			pauseStartTimeNs:  0,
-			totalPausedTimeNs: 0,
-			totalCallCount:    0,
-		}
+		// Reset timing context counters (reuse pooled object)
+		atomic.StoreInt32(&timingCtx.activeCallCount, 0)
+		atomic.StoreInt64(&timingCtx.pauseStartTimeNs, 0)
+		atomic.StoreInt64(&timingCtx.totalPausedTimeNs, 0)
+		atomic.StoreInt32(&timingCtx.totalCallCount, 0)
 		
-	// Store timing data and mutable context for client interceptor to access
-	ctx = context.WithValue(ctx, timingDataKey, timingData)
-	ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
+		// Store timing data and mutable context for client interceptor to access
+		ctx = context.WithValue(ctx, timingDataKey, timingData)
+		ctx = context.WithValue(ctx, pauseTimeKey, timingCtx)
 
-	// Call the actual handler (may call client interceptor which pauses/resumes timer)
+		// Call the actual handler (may call client interceptor which pauses/resumes timer)
 		resp, err := handler(ctx, req)
 		
-		// STOP TIMER: Response is about to be sent back
-		processingEnd := time.Now()
+		// STOP TIMER: Single time.Now() call at end
+		totalTime := time.Since(arrivalTime)
 
-		// Calculate timing metrics
-		totalTime := processingEnd.Sub(arrivalTime)
+		// Get the accumulated paused time from the mutable context (lock-free atomic read)
+		pausedTime := time.Duration(atomic.LoadInt64(&timingCtx.totalPausedTimeNs))
 		
-	// Get the accumulated paused time from the mutable context (lock-free atomic read)
-	pausedTimeNs := atomic.LoadInt64(&timingCtx.totalPausedTimeNs)
-	pausedTime := time.Duration(pausedTimeNs)
-	
-	processingTime := totalTime - pausedTime
+		processingTime := totalTime - pausedTime
 
-	// Update timing data with final values
-	timingData.TotalTime = totalTime
-	timingData.ProcessingTime = processingTime
-	timingData.BlockingTime = pausedTime
+		// Update timing data with final values
+		timingData.TotalTime = totalTime
+		timingData.ProcessingTime = processingTime
+		timingData.BlockingTime = pausedTime
 
-	// ADD TO WINDOW BUFFER: Add completed timing data to aggregator
-		// This goes into the window data buffer and will be aggregated with other concurrent requests
+		// Send to aggregator (via buffered channel, non-blocking)
 		aggregator.AddTimingData(*timingData)
+		
+		// Return objects to pool for reuse
+		timingDataPool.Put(timingData)
+		timingContextPool.Put(timingCtx)
 
 		return resp, err
 	}
@@ -162,6 +178,7 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 // - Empty stack (counter=0) means service is processing (not blocked)
 // - Non-empty stack (counter>0) means service is blocked
 // NO LOCKS: All operations use atomic instructions for thread-safety
+// Optimized: minimal time.Now() calls, only when transitioning states
 func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		// Check if we have timing context (meaning timing is enabled)
@@ -179,6 +196,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		
 		if oldCount == 0 {
 			// Stack was empty, now has 1 item - START blocking period (PAUSE TIMER)
+			// OPTIMIZATION: Only call time.Now() when transitioning to blocked state
 			pauseStartNs := time.Now().UnixNano()
 			atomic.StoreInt64(&timingCtx.pauseStartTimeNs, pauseStartNs)
 		}
@@ -195,6 +213,7 @@ func TimingClientInterceptor() grpc.UnaryClientInterceptor {
 		
 		if newCount == 0 {
 			// Stack is now empty - END blocking period and accumulate time (RESUME TIMER)
+			// OPTIMIZATION: Only call time.Now() when transitioning to processing state
 			pauseStartNs := atomic.LoadInt64(&timingCtx.pauseStartTimeNs)
 			if pauseStartNs > 0 {
 				blockingDurationNs := time.Now().UnixNano() - pauseStartNs
