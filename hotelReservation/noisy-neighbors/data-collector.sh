@@ -179,43 +179,6 @@ ensure_timing_image_exists() {
     fi
 }
 
-# Store original deployment configuration for cleanup
-store_original_config() {
-    local service="$1"
-    local exp_dir="$2"
-    
-    log "$exp_dir" "Storing original configuration for $service"
-    
-    # Get current image
-    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
-    
-    log "$exp_dir" "Current image from deployment: $current_image"
-    
-    # If current image is a windowed image from previous run, use the specific windowed tag
-    if [[ "$current_image" == *"-windowed"* ]]; then
-        log "$exp_dir" "Detected windowed image, converting to: docclabgroup/${service}-windowed:windowed-v4.6"
-        # Hardcode to specific windowed image tag
-        current_image="docclabgroup/${service}-windowed:windowed-v4.6"
-    else
-        log "$exp_dir" "Not a windowed image, keeping as-is: $current_image"
-    fi
-    
-    # Get current environment variables
-    local current_env=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].env}' 2>/dev/null)
-    
-    # Ensure file exists and is unique per service (avoid duplicates from iterations)
-    # Remove any previous entries for this service
-    if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
-        grep -v "^$service:" "$exp_dir/metadata/original_configs.txt" > "$exp_dir/metadata/original_configs.txt.tmp" 2>/dev/null || true
-        mv "$exp_dir/metadata/original_configs.txt.tmp" "$exp_dir/metadata/original_configs.txt" 2>/dev/null || true
-    fi
-    
-    # Store in file for cleanup
-    echo "$service:$current_image:$current_env" >> "$exp_dir/metadata/original_configs.txt"
-    
-    log "$exp_dir" "Stored original config - Image: $current_image"
-}
-
 # Update deployment to use timing-enabled image and environment (with windowed sampling)
 update_deployment_for_timing() {
     local service="$1"
@@ -223,9 +186,6 @@ update_deployment_for_timing() {
     local iteration="${3:-1}"  # Optional: iteration number (default 1)
     
     log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
-    
-    # IMPORTANT: Store original configuration BEFORE making any changes
-    store_original_config "$service" "$exp_dir"
     
     # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
@@ -492,68 +452,6 @@ update_iteration_id() {
     
     log "$exp_dir" "Iteration ID updated, waiting 20s for services to stabilize and initialize sampling"
     sleep 20
-}
-
-# Cleanup windowed sampling resources
-cleanup_windowed_sampling_resources() {
-    local exp_dir="$1"
-    
-    log "$exp_dir" "Cleaning up windowed sampling resources"
-    
-    if [[ -f "$exp_dir/metadata/original_configs.txt" ]]; then
-        while read -r line; do
-            # Parse line: service:image:env
-            # Use first colon for service, handle image with colon for tag
-            local service=$(echo "$line" | cut -d':' -f1)
-            # Get everything after first colon
-            local rest="${line#*:}"  # Remove service and first colon
-            
-            # The env part starts with [{ if present, otherwise the whole rest is the image
-            if [[ "$rest" =~ ^(.+):(\[.*\])$ ]]; then
-                # Has env part: extract image and env
-                local original_image="${BASH_REMATCH[1]}"
-                local original_env="${BASH_REMATCH[2]}"
-            else
-                # No env part or simple format - take everything, remove trailing colons
-                local original_image="${rest%:}"  # Remove trailing colon if present
-                local original_env=""
-            fi
-            
-            if [[ -n "$service" && -n "$original_image" ]]; then
-                log "$exp_dir" "Restoring original configuration for $service"
-                log "$exp_dir" "  Parsed image: $original_image"
-                
-                local container_name=$(get_container_name "$service")
-                
-                # Restore original image
-                log "$exp_dir" "Restoring image for $service: $original_image"
-                if kubectl set image "deployment/$service" "$container_name=$original_image" 2>/dev/null; then
-                    log "$exp_dir" "Successfully restored image for $service"
-                else
-                    log "$exp_dir" "WARNING: Failed to restore image for $service"
-                fi
-                
-                # Remove windowed sampling environment variables
-                log "$exp_dir" "Removing windowed sampling environment variables for $service"
-                kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- 2>/dev/null || true
-                kubectl set env "deployment/$service" ITERATION_ID- 2>/dev/null || true
-                kubectl set env "deployment/$service" EXPERIMENT_DURATION- 2>/dev/null || true
-                kubectl set env "deployment/$service" WINDOW_INTERVAL_MS- 2>/dev/null || true
-                kubectl set env "deployment/$service" CPU_SET- 2>/dev/null || true
-                kubectl set env "deployment/$service" PERF_EVENTS- 2>/dev/null || true
-                kubectl set env "deployment/$service" OUTPUT_DIR- 2>/dev/null || true
-                kubectl set env "deployment/$service" TIMING_BUFFER_SIZE- 2>/dev/null || true
-                kubectl set env "deployment/$service" TIMING_FLUSH_THRESHOLD- 2>/dev/null || true
-                
-                # Wait for rollout
-                kubectl rollout status deployment "$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service rollout"
-                
-                log "$exp_dir" "Restored configuration for $service"
-            fi
-        done < "$exp_dir/metadata/original_configs.txt"
-    fi
-    
-    log "$exp_dir" "Cleaned up windowed sampling resources"
 }
 
 # Validate configuration
@@ -1599,33 +1497,6 @@ remove_anti_affinity() {
     done
 }
 
-
-
-# Cleanup victim services
-cleanup_victim_services() {
-    local services="$1"
-    local target_node="$2"
-    local exp_dir="$3"
-    
-    log "$exp_dir" "Cleaning up victim services: $services"
-    
-    for service in $services; do
-        # Remove taint and toleration
-        "$TAINT_SCRIPT" "$target_node" "$service" --untolerate
-        
-        # Delete the deployment TODO: figure out why I wanted to delete deployment during post exp clean...
-        # kubectl delete deployment "$service" --ignore-not-found=true
-        # kubectl delete service "$service" --ignore-not-found=true
-        
-        log "$exp_dir" "Service $service cleaned up"
-    done
-}
-
-# Note: Windowed sampling now runs automatically inside each service container
-# No external monitoring process needed - data is collected continuously and retrieved at end
-# This function is kept for reference but is no longer used
-# OLD: start_monitoring() - REMOVED in favor of windowed sampling inside service containers
-
 # Start wrk2 workload generation and collect e2e latency metrics
 start_workload_and_latency() {
     local target_service="$1"
@@ -2146,14 +2017,6 @@ run_experiment() {
     
     # Aggregate data
     aggregate_data "$exp_dir" "$total_iterations"
-    
-    # Cleanup windowed sampling resources (restore original deployments)
-    cleanup_windowed_sampling_resources "$exp_dir"
-    
-    # Remove anti-affinity rules from untolerated deployments
-    if [[ -n "$untolerated_deployments" ]]; then
-        remove_anti_affinity "$untolerated_deployments" "$exp_dir"
-    fi
     
     log "$exp_dir" "Experiment completed successfully"
     
