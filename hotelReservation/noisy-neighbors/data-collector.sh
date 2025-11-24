@@ -721,16 +721,21 @@ deploy_victim_services() {
     sleep 5  # Wait for affinity rules to be removed
     
     for service in $services; do
-        # Check if this service supports timing integration
-        if validate_timing_service "$service"; then
-            log "$exp_dir" "Deploying timing-enabled $service"
+        # Check if windowed sampling is enabled and this service supports timing integration
+        if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]] && validate_timing_service "$service"; then
+            log "$exp_dir" "Deploying timing-enabled $service with windowed sampling"
             if ! deploy_timing_service "$service" "$target_node" "$exp_dir"; then
                 log "$exp_dir" "ERROR: Failed to deploy timing-enabled $service, falling back to regular deployment"
                 # Fall back to regular deployment
                 deploy_regular_service "$service" "$target_node" "$exp_dir"
             fi
         else
-            # Deploy regular service
+            # Deploy regular service (either windowed sampling is disabled or service doesn't support it)
+            if validate_timing_service "$service" && [[ "${ENABLE_WINDOWED_SAMPLING:-true}" != "true" ]]; then
+                log "$exp_dir" "Deploying regular $service (windowed sampling disabled)"
+            else
+                log "$exp_dir" "Deploying regular $service"
+            fi
             deploy_regular_service "$service" "$target_node" "$exp_dir"
         fi
     done
@@ -1609,8 +1614,8 @@ run_iteration() {
     
     log "$exp_dir" "Starting iteration $iteration"
     
-    # Update iteration ID for all victim services (requires pod restart)
-    if [[ $iteration -gt 1 ]] || [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+    # Update iteration ID for all victim services (only needed when windowed sampling is enabled)
+    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]] && [[ $iteration -gt 1 ]]; then
         update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES"
     fi
     
@@ -1658,11 +1663,14 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # NOTE: Windowed sampling now runs automatically inside service containers
-    # No external monitoring process needed
-    log "$exp_dir" "Windowed sampling is running inside service containers"
-    log "$exp_dir" "  Expected samples per service: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
-    log "$exp_dir" "  Window interval: ${WINDOW_INTERVAL_MS}ms"
+    # NOTE: Windowed sampling runs automatically inside service containers (if enabled)
+    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+        log "$exp_dir" "Windowed sampling is running inside service containers"
+        log "$exp_dir" "  Expected samples per service: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+        log "$exp_dir" "  Window interval: ${WINDOW_INTERVAL_MS}ms"
+    else
+        log "$exp_dir" "Windowed sampling is disabled - only collecting latency data"
+    fi
     
     # Collect metrics during stress
     sleep 10  # Let stress ramp up
@@ -1684,13 +1692,17 @@ run_iteration() {
     # Collect end metrics
     collect_system_metrics "$exp_dir" "$iteration" "end"
     
-    # Retrieve windowed run data from all victim services
-    log "$exp_dir" "Retrieving windowed run data from victim services"
-    for service in $VICTIM_SERVICES; do
-        if validate_timing_service "$service"; then
-            retrieve_windowed_run_data "$service" "$exp_dir" "$iteration"
-        fi
-    done
+    # Retrieve windowed run data from all victim services (only if enabled)
+    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
+        log "$exp_dir" "Retrieving windowed run data from victim services"
+        for service in $VICTIM_SERVICES; do
+            if validate_timing_service "$service"; then
+                retrieve_windowed_run_data "$service" "$exp_dir" "$iteration"
+            fi
+        done
+    else
+        log "$exp_dir" "Windowed sampling disabled, skipping windowed data retrieval"
+    fi
     
     # Wait for wrk2 to complete if it was started
     if [[ -n "$wrk2_pid" ]]; then
