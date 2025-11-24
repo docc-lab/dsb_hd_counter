@@ -33,9 +33,9 @@ spec:
             - containerPort: 27017
           resources:
             requests:
-              cpu: 100m
+              cpu: "1"
             limits:
-              cpu: 1000m
+              cpu: "3"
           volumeMounts:
             - mountPath: /data/db
               name: recommendation

@@ -34,9 +34,9 @@ spec:
             - containerPort: 8083
           resources:
             requests:
-              cpu: 100m
+              cpu: "1"
             limits:
-              cpu: 1000m
+              cpu: "3"
           securityContext:
             capabilities:
               add:
