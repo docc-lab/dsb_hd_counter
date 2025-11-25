@@ -597,6 +597,11 @@ validate_config() {
         exit 1
     fi
     
+    # Source shapes script FIRST so helper functions are available to config file
+    if [[ -f "$SHAPES_SCRIPT" ]]; then
+        source "$SHAPES_SCRIPT"
+    fi
+    
     source "$config_file"
     
     # Check required variables
@@ -629,9 +634,6 @@ validate_config() {
             exit 1
         fi
     done
-    
-    # Source shapes script
-    source "$SHAPES_SCRIPT"
     
 	# Set defaults for windowed sampling if not specified
 	WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
@@ -2382,9 +2384,7 @@ TARGET_NODE='node-1'  # CHANGE TO YOUR NODE
 VICTIM_SERVICES='frontend search'
 NOISY_NEIGHBOR_TYPE='cpu'
 
-# Define burst schedule using helper functions
-source ./contention-shapes.sh
-
+# Define burst schedule using helper functions (auto-sourced by data-collector.sh)
 # repeat_burst <start> <duration> <idle> <num_bursts> <intensity>
 #   start:      first burst starts at this time (seconds from iteration start)
 #   duration:   each burst runs for this many seconds
