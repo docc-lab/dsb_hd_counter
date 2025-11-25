@@ -146,10 +146,13 @@ create_exp_directory() {
 }
 
 # Log function with timestamp
+# Outputs to stderr AND log file (so it doesn't pollute function return values on stdout)
 log() {
     local exp_dir="$1"
     shift
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$exp_dir/logs/collector.log"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg" >&2
+    echo "$msg" >> "$exp_dir/logs/collector.log"
 }
 
 # Validate timing service
