@@ -457,24 +457,24 @@ retrieve_windowed_run_data() {
                 
                 if [[ $workload_start_ts -gt 0 && $iteration_end_ts -gt 0 ]]; then
                     jq --arg ws "$workload_start_ms" --arg ie "$iteration_end_ms" '{
-                        service_name,
-                        iteration_id,
-                        run_start,
-                        run_end,
-                        run_duration_ms,
-                        window_interval_ms,
-                        perf_events,
+                    service_name,
+                    iteration_id,
+                    run_start,
+                    run_end,
+                    run_duration_ms,
+                    window_interval_ms,
+                    perf_events,
                         filtering: {
                             applied: true,
                             workload_start_ms: ($ws | tonumber),
                             iteration_end_ms: ($ie | tonumber),
                             rationale: "Includes all samples (with and without timing data) from workload start to iteration end to capture contention dynamics"
                         },
-                        samples: [.samples[] | select(
+                    samples: [.samples[] | select(
                             .window_start_ms >= ($ws | tonumber) and 
                             .window_end_ms <= ($ie | tonumber)
-                        )],
-                        sample_count: ([.samples[] | select(
+                    )],
+                    sample_count: ([.samples[] | select(
                             .window_start_ms >= ($ws | tonumber) and 
                             .window_end_ms <= ($ie | tonumber)
                         )] | length),
@@ -512,17 +512,17 @@ retrieve_windowed_run_data() {
                         samples: .samples,
                         sample_count: (.samples | length),
                         samples_with_timing: ([.samples[] | select(
-                            .timing_window.processing_time.count > 0 or 
-                            .timing_window.total_time.count > 0 or 
-                            .timing_window.blocking_time.count > 0
-                        )] | length),
+                        .timing_window.processing_time.count > 0 or 
+                        .timing_window.total_time.count > 0 or 
+                        .timing_window.blocking_time.count > 0
+                    )] | length),
                         samples_idle: ([.samples[] | select(
                             .timing_window.processing_time.count == 0 and
                             .timing_window.total_time.count == 0 and
                             .timing_window.blocking_time.count == 0
                         )] | length),
-                        aggregates: .aggregates
-                    }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                    aggregates: .aggregates
+                }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
                 fi
                 
                 local total_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
@@ -666,7 +666,7 @@ validate_config() {
 	if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
 		echo "  Note: Samples collected for entire iteration duration (including idle periods)"
 	else
-		echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+	echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
 	fi
 	echo "  Ring Buffer: size=${TIMING_BUFFER_SIZE}"
 	echo "  Architecture: non-blocking channel → consumer goroutine → ring buffer → window flush"
@@ -2382,13 +2382,17 @@ TARGET_NODE='node-1'  # CHANGE TO YOUR NODE
 VICTIM_SERVICES='frontend search'
 NOISY_NEIGHBOR_TYPE='cpu'
 
-# Define burst schedule: 5 bursts, 30s each, 10s idle, 4 CPU workers
-# Method 1: Direct specification
-CONTENTION_BURSTS='0:30:4 40:30:4 80:30:4 120:30:4 160:30:4'
+# Define burst schedule using helper functions
+source ./contention-shapes.sh
 
-# Method 2: Using helper function (uncomment to use)
-# source ./contention-shapes.sh
-# CONTENTION_BURSTS=$(repeat_burst 0 30 10 5 4)
+# repeat_burst <start> <duration> <idle> <num_bursts> <intensity>
+#   start:      first burst starts at this time (seconds from iteration start)
+#   duration:   each burst runs for this many seconds
+#   idle:       seconds of rest between end of one burst and start of next
+#   num_bursts: total number of bursts to create
+#   intensity:  workers per burst (CPU cores for 'cpu', MB for 'mem', workers for 'io')
+CONTENTION_BURSTS=$(repeat_burst 0 30 10 5 4)
+# This generates: 5 bursts, each 30s long, 10s idle between, using 4 CPU workers
 
 # Experiment configuration
 ITERATIONS=3
@@ -2427,25 +2431,30 @@ EXAMPLE_EOF
         echo ""
         echo "════════════════════════════════════════════════════════════════"
         echo ""
-        echo "=== BASE FUNCTIONS (contention-shapes.sh) ==="
+        echo "=== HELPER FUNCTIONS (contention-shapes.sh) ==="
         echo ""
         echo "  burst <start> <duration> <intensity>"
-        echo "    Single burst"
+        echo "    Single burst. Output: \"start:duration:intensity\""
         echo ""
-        echo "  repeat_burst <start> <duration> <idle> <num> <intensity>"
-        echo "    Multiple identical bursts (10s idle recommended)"
+        echo "  repeat_burst <start> <duration> <idle> <num_bursts> <intensity>"
+        echo "    Multiple identical bursts."
+        echo "    Parameters:"
+        echo "      start      - first burst starts at this second"
+        echo "      duration   - each burst runs for this many seconds"
+        echo "      idle       - seconds between end of one burst and start of next"
+        echo "      num_bursts - total number of bursts"
+        echo "      intensity  - workers per burst"
         echo ""
-        echo "  linear_intensity <start> <dur> <idle> <num> <start_int> <end_int>"
-        echo "    Escalating/de-escalating intensity"
+        echo "  linear_intensity <start> <duration> <idle> <num_bursts> <start_int> <end_int>"
+        echo "    Bursts with linearly changing intensity (escalating/de-escalating)."
         echo ""
-        echo "Run './contention-shapes.sh help' for details"
+        echo "Run './contention-shapes.sh help' for more details"
         echo ""
-        echo "=== BURST FORMAT ==="
+        echo "=== INTENSITY VALUES ==="
         echo ""
-        echo "  \"start_time:duration:intensity\""
-        echo "    - start_time: seconds from iteration start"
-        echo "    - duration: seconds"
-        echo "    - intensity: CPU workers (cpu), memory MB (mem), IO workers (io)"
+        echo "  cpu type: number of CPU workers (cores to stress)"
+        echo "  mem type: memory in MB to allocate"
+        echo "  io type:  number of IO workers"
         echo ""
         echo "=== SUPPORTED SERVICES ==="
         echo ""
