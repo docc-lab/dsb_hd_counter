@@ -563,13 +563,17 @@ retrieve_windowed_run_data() {
     fi
 }
 
-# Update iteration ID for all victim services and restart pods
+# Update iteration ID and experiment duration for all victim services and restart pods
 update_iteration_id() {
     local exp_dir="$1"
     local iteration="$2"
     local victim_services="$3"
+    local experiment_duration="${4:-}"  # Optional: updated duration for this iteration
     
     log "$exp_dir" "Updating ITERATION_ID to $iteration for victim services"
+    if [[ -n "$experiment_duration" ]]; then
+        log "$exp_dir" "Updating EXPERIMENT_DURATION to ${experiment_duration}s"
+    fi
     
     for service in $victim_services; do
         if validate_timing_service "$service"; then
@@ -578,6 +582,13 @@ update_iteration_id() {
             if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
                 log "$exp_dir" "WARNING: Failed to set ITERATION_ID for $service"
                 continue
+            fi
+            
+            # Also update EXPERIMENT_DURATION if provided
+            if [[ -n "$experiment_duration" ]]; then
+                if ! kubectl set env "deployment/$service" "EXPERIMENT_DURATION=${experiment_duration}"; then
+                    log "$exp_dir" "WARNING: Failed to set EXPERIMENT_DURATION for $service"
+                fi
             fi
             
             # Restart pods to pick up new iteration ID
@@ -1888,9 +1899,9 @@ run_iteration() {
     local experiment_duration=$((total_duration - 10))  # Exclude buffer time
     export EXPERIMENT_DURATION=$experiment_duration
     
-    # Update iteration ID for all victim services (only needed when windowed sampling is enabled)
+    # Update iteration ID and duration for all victim services (only needed when windowed sampling is enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]] && [[ $iteration -gt 1 ]]; then
-        update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES"
+        update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES" "$experiment_duration"
     fi
     
     # Collect baseline metrics
@@ -2282,6 +2293,13 @@ run_experiment() {
     local untolerated_deployments=""
     if [[ -f "$exp_dir/metadata/untolerated_deployments.txt" ]]; then
         untolerated_deployments=$(cat "$exp_dir/metadata/untolerated_deployments.txt")
+    fi
+    
+    # Pre-calculate experiment duration from burst schedule for initial deployment
+    if [[ -n "${CONTENTION_BURSTS:-}" ]]; then
+        local initial_duration=$(calculate_iteration_duration "$CONTENTION_BURSTS")
+        export EXPERIMENT_DURATION=$((initial_duration - 10))  # Exclude buffer time
+        log "$exp_dir" "Calculated EXPERIMENT_DURATION from burst schedule: ${EXPERIMENT_DURATION}s"
     fi
     
     # Deploy victim services
