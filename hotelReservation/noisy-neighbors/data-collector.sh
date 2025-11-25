@@ -2368,146 +2368,106 @@ main() {
         echo ""
         echo "=== BURST-BASED CONTENTION EXPERIMENTS ==="
         echo ""
-        echo "Manually define burst schedules using base functions or direct specification."
-        echo "Captures full timeline including idle periods for contention dynamics analysis."
+        echo "Define burst schedules to study contention dynamics with idle periods."
+        echo "Captures full timeline for performance degradation/recovery analysis."
         echo ""
-        echo "=== BASE FUNCTIONS ==="
+        echo "=== COMPLETE CONFIGURATION EXAMPLE ==="
         echo ""
-        echo "1. burst <start> <duration> <intensity>"
-        echo "   Create a single burst"
-        echo "   Example: burst 0 30 4  →  \"0:30:4\""
-        echo ""
-        echo "2. repeat_burst <start> <dur> <idle> <num> <intensity>"
-        echo "   Multiple identical bursts with idle gaps"
-        echo "   Example: repeat_burst 0 30 10 5 4  →  \"0:30:4 40:30:4 80:30:4 ...\""
-        echo ""
-        echo "3. linear_intensity <start> <dur> <idle> <num> <start_int> <end_int>"
-        echo "   Linearly changing intensity (escalating/de-escalating)"
-        echo "   Example: linear_intensity 0 20 10 5 2 10  →  \"0:20:2 30:20:4 60:20:6 ...\""
-        echo ""
-        echo "Run './contention-shapes.sh help' for detailed documentation"
-        echo ""
-        echo "=== CONFIGURATION EXAMPLES ==="
-        echo ""
-        echo "Example 1: Simple Periodic Bursts"
-        echo "────────────────────────────────────────────────────────────────"
-        echo "EXPERIMENT_NAME='Periodic CPU Contention'"
-        echo "TARGET_NODE='node-1'"
-        echo "VICTIM_SERVICES='frontend search'"
-        echo "NOISY_NEIGHBOR_TYPE='cpu'"
-        echo ""
-        echo "# Method 1: Direct specification (5 bursts, 30s each, 10s idle, 4 CPUs)"
-        echo "CONTENTION_BURSTS='0:30:4 40:30:4 80:30:4 120:30:4 160:30:4'"
-        echo ""
-        echo "# Method 2: Using helper function (cleaner)"
-        echo "source ./contention-shapes.sh"
-        echo "CONTENTION_BURSTS=\$(repeat_burst 0 30 10 5 4)"
-        echo ""
-        echo "ITERATIONS=3"
-        echo "ENABLE_WINDOWED_SAMPLING=true"
-        echo "WINDOW_INTERVAL_MS=100"
-        echo "WRK2_TARGET_SERVICE='frontend'"
-        echo "WRK2_RATE=200"
-        echo ""
-        echo "# Timeline: 0-30s (burst), 30-40s (idle), 40-70s (burst), ..."
-        echo "# Total: ~200s per iteration"
-        echo ""
-        echo "────────────────────────────────────────────────────────────────"
-        echo "Example 2: Escalating Intensity"
-        echo "────────────────────────────────────────────────────────────────"
-        echo "EXPERIMENT_NAME='Escalating CPU Contention'"
-        echo "TARGET_NODE='node-1'"
-        echo "VICTIM_SERVICES='frontend search'"
-        echo "NOISY_NEIGHBOR_TYPE='cpu'"
-        echo ""
-        echo "source ./contention-shapes.sh"
-        echo "# 5 bursts: 20s each, 10s idle, intensity 2→10 CPUs"
-        echo "CONTENTION_BURSTS=\$(linear_intensity 0 20 10 5 2 10)"
-        echo "# Result: \"0:20:2 30:20:4 60:20:6 90:20:8 120:20:10\""
-        echo ""
-        echo "ITERATIONS=3"
-        echo "ENABLE_WINDOWED_SAMPLING=true"
-        echo "WRK2_TARGET_SERVICE='frontend'"
-        echo ""
-        echo "# Timeline:"
-        echo "#  0-20s:   2 CPUs"
-        echo "#  30-50s:  4 CPUs"
-        echo "#  60-80s:  6 CPUs"
-        echo "#  90-110s: 8 CPUs"
-        echo "# 120-140s: 10 CPUs"
-        echo ""
-        echo "────────────────────────────────────────────────────────────────"
-        echo "Example 3: Spike Pattern (Composite)"
-        echo "────────────────────────────────────────────────────────────────"
-        echo "EXPERIMENT_NAME='Spike Pattern - Major Event with Background'"
-        echo "TARGET_NODE='node-1'"
-        echo "VICTIM_SERVICES='frontend search'"
-        echo "NOISY_NEIGHBOR_TYPE='cpu'"
-        echo ""
-        echo "source ./contention-shapes.sh"
-        echo "# Minor bursts before spike (3 bursts, 15s each, 30s idle, 2 CPUs)"
-        echo "MINOR_BEFORE=\$(repeat_burst 0 15 30 3 2)"
-        echo "# Major spike at 135s (60s, 8 CPUs)"
-        echo "MAJOR_SPIKE=\$(burst 135 60 8)"
-        echo "# Minor bursts after spike (3 bursts, 15s each, 30s idle, 2 CPUs)"
-        echo "MINOR_AFTER=\$(repeat_burst 225 15 30 3 2)"
-        echo "# Combine all patterns"
-        echo "CONTENTION_BURSTS=\"\$MINOR_BEFORE \$MAJOR_SPIKE \$MINOR_AFTER\""
-        echo ""
-        echo "ITERATIONS=3"
-        echo "ENABLE_WINDOWED_SAMPLING=true"
-        echo "WRK2_TARGET_SERVICE='frontend'"
-        echo ""
-        echo "# Timeline:"
-        echo "#   0-15s:   Minor (2 CPUs)"
-        echo "#  45-60s:   Minor (2 CPUs)"
-        echo "#  90-105s:  Minor (2 CPUs)"
-        echo "# 135-195s:  MAJOR SPIKE (8 CPUs)"
-        echo "# 225-240s:  Minor (2 CPUs)"
-        echo "# ... continued"
-        echo ""
-        echo "────────────────────────────────────────────────────────────────"
-        echo "Example 4: Legacy Model (Backward Compatible)"
-        echo "────────────────────────────────────────────────────────────────"
-        echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact'"
-        echo "TARGET_NODE='node-1'"
-        echo "VICTIM_SERVICES='frontend search'"
-        echo "NOISY_NEIGHBOR_TYPE='cpu'"
-        echo "NOISY_NEIGHBOR_ARGS='4 300s'"
-        echo "EXPERIMENT_DURATION=300  # Single sustained burst"
-        echo "ITERATIONS=5"
+        cat << 'EXAMPLE_EOF'
+#!/bin/bash
+# Periodic CPU Contention Experiment
+
+EXPERIMENT_NAME='Periodic CPU Contention'
+TARGET_NODE='node-1'  # CHANGE TO YOUR NODE
+VICTIM_SERVICES='frontend search'
+NOISY_NEIGHBOR_TYPE='cpu'
+
+# Define burst schedule: 5 bursts, 30s each, 10s idle, 4 CPU workers
+# Method 1: Direct specification
+CONTENTION_BURSTS='0:30:4 40:30:4 80:30:4 120:30:4 160:30:4'
+
+# Method 2: Using helper function (uncomment to use)
+# source ./contention-shapes.sh
+# CONTENTION_BURSTS=$(repeat_burst 0 30 10 5 4)
+
+# Experiment configuration
+ITERATIONS=3
+ITERATION_DELAY=60
+
+# Windowed sampling
+ENABLE_WINDOWED_SAMPLING=true
+WINDOW_INTERVAL_MS=100
+PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
+TIMING_BUFFER_SIZE=16384
+
+# Jaeger tracing
+JAEGER_SAMPLE_RATIO=0.01  # 1% sampling, set to 0 to disable
+
+# wrk2 workload
+WRK2_TARGET_SERVICE='frontend'
+WRK2_TARGET_IP='192.168.1.100'  # CHANGE TO YOUR IP
+WRK2_TARGET_PORT=5000
+WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
+WRK2_RATE=200
+WRK2_THREADS=3
+WRK2_CONNECTIONS=3
+
+# Timeline (per iteration):
+#   0-30s:   Burst 1 (4 CPUs) - active samples
+#  30-40s:   Idle (10s) - idle samples ✓
+#  40-70s:   Burst 2 (4 CPUs)
+#  70-80s:   Idle (10s) ✓
+#  80-110s:  Burst 3 (4 CPUs)
+# 110-120s:  Idle (10s) ✓
+# 120-150s:  Burst 4 (4 CPUs)
+# 150-160s:  Idle (10s) ✓
+# 160-190s:  Burst 5 (4 CPUs)
+# Total: ~200s per iteration
+EXAMPLE_EOF
         echo ""
         echo "════════════════════════════════════════════════════════════════"
         echo ""
-        echo "=== KEY FEATURES ==="
+        echo "=== BASE FUNCTIONS (contention-shapes.sh) ==="
         echo ""
-        echo "  • Early workload start: +5s (was +15s)"
-        echo "  • Full timeline data: Captures idle periods for recovery analysis"
-        echo "  • Flexible patterns: Compose complex schedules from base functions"
-        echo "  • Direct control: See exact burst specifications"
-        echo "  • Burst format: \"start_time:duration:intensity\""
+        echo "  burst <start> <duration> <intensity>"
+        echo "    Single burst"
+        echo ""
+        echo "  repeat_burst <start> <duration> <idle> <num> <intensity>"
+        echo "    Multiple identical bursts (10s idle recommended)"
+        echo ""
+        echo "  linear_intensity <start> <dur> <idle> <num> <start_int> <end_int>"
+        echo "    Escalating/de-escalating intensity"
+        echo ""
+        echo "Run './contention-shapes.sh help' for details"
+        echo ""
+        echo "=== BURST FORMAT ==="
+        echo ""
+        echo "  \"start_time:duration:intensity\""
         echo "    - start_time: seconds from iteration start"
         echo "    - duration: seconds"
         echo "    - intensity: CPU workers (cpu), memory MB (mem), IO workers (io)"
         echo ""
-        echo "=== SUPPORTED SERVICES (Timing Interceptors) ==="
+        echo "=== SUPPORTED SERVICES ==="
         echo ""
         echo "  user, frontend, search, profile, rate, recommendation, reservation, geo"
         echo ""
         echo "=== AVAILABLE PERFORMANCE COUNTERS ==="
         echo ""
-        echo "  CPU:      cycles, instructions, bus-cycles, ref-cycles"
+        echo "  CPU:      cycles (cpu-cycles), instructions, bus-cycles, ref-cycles"
         echo "            stalled-cycles-frontend, stalled-cycles-backend"
-        echo "  Cache L1: L1-dcache-loads/stores, L1-dcache-load-misses"
+        echo "  Cache L1: L1-dcache-loads, L1-dcache-load-misses, L1-dcache-stores"
         echo "            L1-icache-load-misses"
-        echo "  Cache LLC: LLC-loads/stores, LLC-load/store-misses"
+        echo "  Cache LLC: LLC-loads, LLC-load-misses, LLC-stores, LLC-store-misses"
         echo "             cache-references, cache-misses"
-        echo "  Branch:   branch-instructions, branch-misses"
-        echo "  TLB:      dTLB/iTLB-loads, dTLB/iTLB-load-misses"
+        echo "  Branch:   branch-instructions (branches), branch-misses"
+        echo "            branch-loads, branch-load-misses"
+        echo "  TLB Data: dTLB-loads, dTLB-load-misses, dTLB-stores, dTLB-store-misses"
+        echo "  TLB Inst: iTLB-loads, iTLB-load-misses"
         echo "  Memory:   page-faults, minor-faults, major-faults"
-        echo "  System:   context-switches, cpu-migrations, task-clock"
+        echo "  NUMA:     node-loads, node-load-misses, node-stores, node-store-misses"
+        echo "  System:   context-switches, cpu-migrations, task-clock, alignment-faults"
         echo ""
-        echo "Run 'perf list' on your node to see all available events"
+        echo "Note: Run 'perf list hardware' and 'perf list cache' on your node to see available events"
         echo ""
         exit 1
     fi
