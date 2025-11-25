@@ -67,10 +67,70 @@ TIMING_BUILD_SCRIPT="../build-timing-images.sh"
 # existing script paths
 STRESS_SCRIPT="$SCRIPTS_DIR/stress-ng/stress-ng-helpers.sh"
 TAINT_SCRIPT="$SCRIPTS_DIR/node-taint.sh"
+SHAPES_SCRIPT="$SCRIPTS_DIR/contention-shapes.sh"
 
 # Generate unique experiment ID
 generate_exp_id() {
     echo "exp_$(date +%Y%m%d_%H%M%S)_$(uuidgen | cut -d'-' -f1)"
+}
+
+# Generate contention burst schedule for an iteration
+# Returns: array of burst specs "start_time:duration:intensity"
+generate_burst_schedule() {
+    local exp_dir="$1"
+    local iteration="$2"
+    
+    if [[ -n "${CONTENTION_BURSTS:-}" ]]; then
+        # User-defined burst schedule
+        log "$exp_dir" "Using user-defined burst schedule for iteration $iteration"
+        log "$exp_dir" "Burst schedule: $CONTENTION_BURSTS"
+        echo "$CONTENTION_BURSTS"
+    elif [[ -n "${EXPERIMENT_DURATION:-}" ]]; then
+        # Legacy single-duration model (backward compatibility)
+        log "$exp_dir" "Using legacy single-duration model: ${EXPERIMENT_DURATION}s"
+        echo "0:${EXPERIMENT_DURATION}:${NOISY_NEIGHBOR_ARGS}"
+    else
+        log "$exp_dir" "ERROR: Must specify either CONTENTION_BURSTS or EXPERIMENT_DURATION"
+        return 1
+    fi
+}
+
+# Calculate total iteration duration from burst schedule
+calculate_iteration_duration() {
+    local bursts=($1)
+    local max_end_time=0
+    
+    for burst in "${bursts[@]}"; do
+        IFS=':' read -r start duration intensity <<< "$burst"
+        local end_time=$((start + duration))
+        [[ $end_time -gt $max_end_time ]] && max_end_time=$end_time
+    done
+    
+    # Add buffer time for data collection
+    echo $((max_end_time + 10))
+}
+
+# Parse intensity value for stress command
+# For CPU: returns number of workers
+# For MEM: returns memory size
+parse_stress_intensity() {
+    local stress_type="$1"
+    local intensity="$2"
+    
+    case "$stress_type" in
+        cpu)
+            echo "$intensity"  # Number of CPU workers
+            ;;
+        mem|memory)
+            echo "${intensity}M"  # Memory in MB
+            ;;
+        io|iomix)
+            echo "$intensity"  # Number of IO workers
+            ;;
+        *)
+            echo "$intensity"
+            ;;
+    esac
 }
 
 # Create experiment directory structure
@@ -370,43 +430,117 @@ retrieve_windowed_run_data() {
         kubectl exec "$pod_name" -- cat "$run_file" > "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null
         
         if [[ -s "$output_dir/run_data_iter${iteration}_raw.json" ]]; then
-            # Filter to keep only samples with non-zero timing data
+            # Load iteration timing metadata
+            local workload_start_file="$exp_dir/metadata/iteration_${iteration}_workload_start.txt"
+            local iteration_end_file="$exp_dir/metadata/iteration_${iteration}_end.txt"
+            
+            local workload_start_ts=0
+            local iteration_end_ts=0
+            
+            if [[ -f "$workload_start_file" ]]; then
+                workload_start_ts=$(cat "$workload_start_file")
+            fi
+            if [[ -f "$iteration_end_file" ]]; then
+                iteration_end_ts=$(cat "$iteration_end_file")
+            fi
+            
+            # Filter samples to include only those from workload start to iteration end
+            # IMPORTANT: We keep ALL samples including idle periods (zero timing data)
+            # This captures the full dynamics of contention development
             if command -v jq >/dev/null 2>&1; then
-                log "$exp_dir" "  Filtering samples with timing data using jq"
+                log "$exp_dir" "  Filtering samples by time range (workload start to iteration end)"
+                log "$exp_dir" "    Keeping ALL samples including idle periods to capture contention dynamics"
                 
-                jq '{
-                    service_name,
-                    iteration_id,
-                    run_start,
-                    run_end,
-                    run_duration_ms,
-                    window_interval_ms,
-                    perf_events,
-                    samples: [.samples[] | select(
-                        .timing_window.processing_time.count > 0 or 
-                        .timing_window.total_time.count > 0 or 
-                        .timing_window.blocking_time.count > 0
-                    )],
-                    sample_count: ([.samples[] | select(
-                        .timing_window.processing_time.count > 0 or 
-                        .timing_window.total_time.count > 0 or 
-                        .timing_window.blocking_time.count > 0
-                    )] | length),
-                    aggregates: .aggregates
-                }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                # Convert timestamps to milliseconds for comparison
+                local workload_start_ms=$((workload_start_ts * 1000))
+                local iteration_end_ms=$((iteration_end_ts * 1000))
+                
+                if [[ $workload_start_ts -gt 0 && $iteration_end_ts -gt 0 ]]; then
+                    jq --arg ws "$workload_start_ms" --arg ie "$iteration_end_ms" '{
+                        service_name,
+                        iteration_id,
+                        run_start,
+                        run_end,
+                        run_duration_ms,
+                        window_interval_ms,
+                        perf_events,
+                        filtering: {
+                            applied: true,
+                            workload_start_ms: ($ws | tonumber),
+                            iteration_end_ms: ($ie | tonumber),
+                            rationale: "Includes all samples (with and without timing data) from workload start to iteration end to capture contention dynamics"
+                        },
+                        samples: [.samples[] | select(
+                            .window_start_ms >= ($ws | tonumber) and 
+                            .window_end_ms <= ($ie | tonumber)
+                        )],
+                        sample_count: ([.samples[] | select(
+                            .window_start_ms >= ($ws | tonumber) and 
+                            .window_end_ms <= ($ie | tonumber)
+                        )] | length),
+                        samples_with_timing: ([.samples[] | select(
+                            .window_start_ms >= ($ws | tonumber) and 
+                            .window_end_ms <= ($ie | tonumber) and
+                            (.timing_window.processing_time.count > 0 or 
+                             .timing_window.total_time.count > 0 or 
+                             .timing_window.blocking_time.count > 0)
+                        )] | length),
+                        samples_idle: ([.samples[] | select(
+                            .window_start_ms >= ($ws | tonumber) and 
+                            .window_end_ms <= ($ie | tonumber) and
+                            .timing_window.processing_time.count == 0 and
+                            .timing_window.total_time.count == 0 and
+                            .timing_window.blocking_time.count == 0
+                        )] | length),
+                        aggregates: .aggregates
+                    }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                else
+                    # Fallback: no time filtering, keep all samples
+                    log "$exp_dir" "    WARNING: Missing timing metadata, keeping all samples without time filtering"
+                    jq '{
+                        service_name,
+                        iteration_id,
+                        run_start,
+                        run_end,
+                        run_duration_ms,
+                        window_interval_ms,
+                        perf_events,
+                        filtering: {
+                            applied: false,
+                            rationale: "Timing metadata not available, kept all samples"
+                        },
+                        samples: .samples,
+                        sample_count: (.samples | length),
+                        samples_with_timing: ([.samples[] | select(
+                            .timing_window.processing_time.count > 0 or 
+                            .timing_window.total_time.count > 0 or 
+                            .timing_window.blocking_time.count > 0
+                        )] | length),
+                        samples_idle: ([.samples[] | select(
+                            .timing_window.processing_time.count == 0 and
+                            .timing_window.total_time.count == 0 and
+                            .timing_window.blocking_time.count == 0
+                        )] | length),
+                        aggregates: .aggregates
+                    }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                fi
                 
                 local total_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
                 local filtered_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
+                local samples_with_timing=$(jq -r '.samples_with_timing // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
+                local samples_idle=$(jq -r '.samples_idle // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
                 
-                log "$exp_dir" "  Filtered: $filtered_samples/$total_samples samples contain timing data"
+                log "$exp_dir" "  Filtered: $filtered_samples/$total_samples samples in experiment window"
+                log "$exp_dir" "    Active samples (with timing data): $samples_with_timing"
+                log "$exp_dir" "    Idle samples (no timing data): $samples_idle"
             else
                 # No jq available, just copy raw file
-                log "$exp_dir" "  WARNING: jq not available, skipping filter (keeping all samples)"
+                log "$exp_dir" "  WARNING: jq not available, copying all samples without filtering"
                 cp "$output_dir/run_data_iter${iteration}_raw.json" "$output_dir/run_data_iter${iteration}.json"
                 filtered_samples=$(grep -o '"sample_count":[^,}]*' "$output_dir/run_data_iter${iteration}.json" | cut -d':' -f2 | tr -d ' ' || echo "unknown")
             fi
             
-            log "$exp_dir" "  Successfully retrieved and filtered run data with $filtered_samples samples"
+            log "$exp_dir" "  Successfully retrieved run data with $filtered_samples samples"
             
             # Also get logs with timing and perf information
             local log_file="$output_dir/service_logs_iter${iteration}.txt"
@@ -466,7 +600,21 @@ validate_config() {
     source "$config_file"
     
     # Check required variables
-    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "NOISY_NEIGHBOR_TYPE" "EXPERIMENT_DURATION")
+    local required_vars=("EXPERIMENT_NAME" "TARGET_NODE" "VICTIM_SERVICES" "NOISY_NEIGHBOR_TYPE")
+    
+    # Check if using burst-based model or legacy single-duration model
+    if [[ -n "${CONTENTION_BURSTS:-}" ]]; then
+        # User-defined burst model
+        echo "Using user-defined burst schedule model"
+        echo "Burst schedule: ${CONTENTION_BURSTS}"
+    elif [[ -n "${EXPERIMENT_DURATION:-}" ]]; then
+        # Legacy single-duration model (backward compatibility)
+        echo "Using legacy single-duration contention model (EXPERIMENT_DURATION=${EXPERIMENT_DURATION}s)"
+    else
+        echo "ERROR: Must specify either CONTENTION_BURSTS or EXPERIMENT_DURATION"
+        exit 1
+    fi
+    
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var}" ]]; then
             echo "ERROR: Required variable $var not set in config file"
@@ -475,12 +623,15 @@ validate_config() {
     done
     
     # Check if scripts exist
-    for script in "$STRESS_SCRIPT" "$TAINT_SCRIPT"; do
+    for script in "$STRESS_SCRIPT" "$TAINT_SCRIPT" "$SHAPES_SCRIPT"; do
         if [[ ! -f "$script" ]]; then
             echo "ERROR: Required script not found: $script"
             exit 1
         fi
     done
+    
+    # Source shapes script
+    source "$SHAPES_SCRIPT"
     
 	# Set defaults for windowed sampling if not specified
 	WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
@@ -490,10 +641,33 @@ validate_config() {
 	# Large buffer size for channel + ring buffer architecture
 	TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-16384}"
 	
+	# Burst-based model configuration
+	if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
+		echo ""
+		echo "Burst-based Contention Configuration:"
+		echo "  Shape: ${CONTENTION_SHAPE}"
+		echo "  Shape Args: ${CONTENTION_SHAPE_ARGS}"
+		echo "  Randomize: ${CONTENTION_RANDOMIZE:-false}"
+		if [[ "${CONTENTION_RANDOMIZE:-false}" == "true" ]]; then
+			echo "  Random Seed: ${CONTENTION_RANDOM_SEED:-auto}"
+		fi
+		
+		# Calculate estimated duration
+		local test_bursts=$(generate_shape "$CONTENTION_SHAPE" ${CONTENTION_SHAPE_ARGS})
+		local est_duration=$(calculate_iteration_duration "$test_bursts")
+		echo "  Estimated iteration duration: ~${est_duration}s (varies per iteration)"
+		echo "  Burst schedule preview: $test_bursts"
+	fi
+	
+	echo ""
 	echo "Windowed Sampling Configuration:"
 	echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
 	echo "  Perf Events: ${PERF_EVENTS}"
-	echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+	if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
+		echo "  Note: Samples collected for entire iteration duration (including idle periods)"
+	else
+		echo "  Expected samples per run: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+	fi
 	echo "  Ring Buffer: size=${TIMING_BUFFER_SIZE}"
 	echo "  Architecture: non-blocking channel → consumer goroutine → ring buffer → window flush"
     
@@ -1604,6 +1778,83 @@ wait_for_processes() {
     done
 }
 
+# Execute a single stress burst
+execute_stress_burst() {
+    local stress_type="$1"
+    local intensity="$2"
+    local duration="$3"
+    local target_node="$4"
+    local exp_dir="$5"
+    local burst_id="$6"
+    
+    log "$exp_dir" "  Starting burst $burst_id: type=$stress_type intensity=$intensity duration=${duration}s"
+    
+    # Parse intensity based on stress type
+    local stress_intensity=$(parse_stress_intensity "$stress_type" "$intensity")
+    
+    # Build stress args
+    local stress_args="${stress_intensity} ${duration}s"
+    
+    # Execute stress in background
+    "$STRESS_SCRIPT" "$stress_type" $stress_args --node "$target_node" \
+        > "$exp_dir/raw/stress/stress_burst${burst_id}.txt" 2>&1 &
+    
+    local stress_pid=$!
+    echo "$stress_pid" >> "$exp_dir/raw/stress/burst_pids.txt"
+    
+    log "$exp_dir" "  Burst $burst_id started (PID: $stress_pid)"
+    echo "$stress_pid"
+}
+
+# Execute burst schedule with proper timing
+execute_burst_schedule() {
+    local exp_dir="$1"
+    local iteration="$2"
+    local target_node="$3"
+    local stress_type="$4"
+    local burst_schedule="$5"
+    
+    log "$exp_dir" "Executing burst schedule for iteration $iteration"
+    
+    local bursts=($burst_schedule)
+    local burst_pids=()
+    local iteration_start=$(date +%s)
+    
+    # Clear previous burst PID file
+    rm -f "$exp_dir/raw/stress/burst_pids.txt"
+    
+    local burst_num=0
+    for burst_spec in "${bursts[@]}"; do
+        IFS=':' read -r start_time duration intensity <<< "$burst_spec"
+        ((burst_num++))
+        
+        local burst_id="iter${iteration}_burst${burst_num}"
+        
+        # Calculate when to start this burst
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - iteration_start))
+        local wait_time=$((start_time - elapsed))
+        
+        # Wait until it's time for this burst
+        if [[ $wait_time -gt 0 ]]; then
+            log "$exp_dir" "  Waiting ${wait_time}s before burst $burst_num..."
+            sleep "$wait_time"
+        elif [[ $wait_time -lt -5 ]]; then
+            # If we're more than 5s behind schedule, log warning
+            log "$exp_dir" "  WARNING: Burst $burst_num is ${wait_time#-}s behind schedule"
+        fi
+        
+        # Start the burst in background
+        local pid=$(execute_stress_burst "$stress_type" "$intensity" "$duration" "$target_node" "$exp_dir" "$burst_id")
+        burst_pids+=("$pid")
+    done
+    
+    log "$exp_dir" "All bursts scheduled (${#bursts[@]} total)"
+    
+    # Return PIDs as space-separated string
+    echo "${burst_pids[@]}"
+}
+
 # Run single iteration
 run_iteration() {
     local config_file="$1"
@@ -1614,6 +1865,24 @@ run_iteration() {
     
     log "$exp_dir" "Starting iteration $iteration"
     
+    # Generate burst schedule for this iteration
+    local burst_schedule=$(generate_burst_schedule "$exp_dir" "$iteration")
+    if [[ -z "$burst_schedule" ]]; then
+        log "$exp_dir" "ERROR: Failed to generate burst schedule"
+        return 1
+    fi
+    
+    # Calculate total iteration duration
+    local total_duration=$(calculate_iteration_duration "$burst_schedule")
+    log "$exp_dir" "Total iteration duration: ${total_duration}s (including buffer time)"
+    
+    # Save burst schedule to metadata
+    echo "$burst_schedule" > "$exp_dir/metadata/burst_schedule_iter${iteration}.txt"
+    
+    # Update EXPERIMENT_DURATION for this iteration (used by windowed sampling)
+    local experiment_duration=$((total_duration - 10))  # Exclude buffer time
+    export EXPERIMENT_DURATION=$experiment_duration
+    
     # Update iteration ID for all victim services (only needed when windowed sampling is enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]] && [[ $iteration -gt 1 ]]; then
         update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES"
@@ -1622,39 +1891,24 @@ run_iteration() {
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
-    # Calculate adjusted durations to account for startup delays
-    # Add 10s to stressor duration and 5s to workload duration
-    local stress_duration=$((EXPERIMENT_DURATION + 10))
-    local workload_duration=$((EXPERIMENT_DURATION + 5))
+    # Record iteration start time
+    local iteration_start=$(date +%s)
+    echo "$iteration_start" > "$exp_dir/metadata/iteration_${iteration}_start.txt"
     
-    # Start noisy neighbor first
-    log "$exp_dir" "Starting noisy neighbor: $NOISY_NEIGHBOR_TYPE with extended duration: ${stress_duration}s"
+    # Start workload generation EARLY (at +5s instead of +15s)
+    log "$exp_dir" "Waiting 5s before starting workload generation..."
+    sleep 5
     
-    # Modify stress args to include extended duration if the original args contain a duration
-    local modified_stress_args="${NOISY_NEIGHBOR_ARGS:-}"
-    if [[ "$modified_stress_args" =~ ([0-9]+)s ]]; then
-        # Replace existing duration with extended duration
-        modified_stress_args=$(echo "$modified_stress_args" | sed "s/[0-9]\+s/${stress_duration}s/")
-        log "$exp_dir" "Modified stress args: $modified_stress_args"
-    else
-        log "$exp_dir" "Original stress args: $modified_stress_args (no duration modification needed)"
-    fi
+    local workload_start=$(date +%s)
+    echo "$workload_start" > "$exp_dir/metadata/iteration_${iteration}_workload_start.txt"
     
-    "$STRESS_SCRIPT" "$NOISY_NEIGHBOR_TYPE" $modified_stress_args --node "$TARGET_NODE" \
-        > "$exp_dir/raw/stress/stress_iter${iteration}.txt" 2>&1 &
-    local stress_pid=$!
-    
-    # Wait longer before starting workload generation to ensure services are ready
-    log "$exp_dir" "Waiting 15s before starting workload generation..."
-    sleep 15
-    
-    # Start workload generation and latency collection
+    # Start workload generation (runs for entire iteration duration)
     local wrk2_pid=""
     if [[ -n "${WRK2_TARGET_SERVICE:-}" ]]; then
-        log "$exp_dir" "Starting workload generation (duration: ${workload_duration}s)"
+        log "$exp_dir" "Starting workload generation (duration: ${total_duration}s)"
         wrk2_pid=$(start_workload_and_latency \
             "${WRK2_TARGET_SERVICE}" \
-            "$workload_duration" \
+            "$total_duration" \
             "$exp_dir" \
             "$iteration" \
             "${WRK2_SCRIPT:-}" \
@@ -1663,34 +1917,48 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
+    # Start burst schedule execution in background
+    log "$exp_dir" "Starting burst schedule execution"
+    local burst_pids=$(execute_burst_schedule "$exp_dir" "$iteration" "$TARGET_NODE" "$NOISY_NEIGHBOR_TYPE" "$burst_schedule")
+    
     # NOTE: Windowed sampling runs automatically inside service containers (if enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
         log "$exp_dir" "Windowed sampling is running inside service containers"
-        log "$exp_dir" "  Expected samples per service: $((EXPERIMENT_DURATION * 1000 / WINDOW_INTERVAL_MS))"
+        log "$exp_dir" "  Sampling duration: ${experiment_duration}s"
         log "$exp_dir" "  Window interval: ${WINDOW_INTERVAL_MS}ms"
+        log "$exp_dir" "  Expected samples: $((experiment_duration * 1000 / WINDOW_INTERVAL_MS))"
+        log "$exp_dir" "  Note: Samples include idle periods between bursts"
     else
         log "$exp_dir" "Windowed sampling is disabled - only collecting latency data"
     fi
     
-    # Collect metrics during stress
-    sleep 10  # Let stress ramp up
+    # Collect metrics during stress (sample at 1/4 point)
+    local sample_time=$((experiment_duration / 4))
+    log "$exp_dir" "Waiting ${sample_time}s before collecting 'during' metrics..."
+    sleep "$sample_time"
     collect_system_metrics "$exp_dir" "$iteration" "during"
     
-    # Wait for experiment to complete
-    # Total delays so far: 15s (before workload) + 10s (ramp) = 25s
-    # The workload runs for workload_duration, so we need to wait for it to complete
-    local remaining_time=$((workload_duration - 10))  # Subtract the 10s we already waited
+    # Wait for the rest of the experiment to complete
+    local remaining_time=$((total_duration - sample_time - 5))  # -5 for initial wait
     if [[ $remaining_time -gt 0 ]]; then
-        log "$exp_dir" "Waiting ${remaining_time}s for workload to complete..."
+        log "$exp_dir" "Waiting ${remaining_time}s for experiment to complete..."
         sleep "$remaining_time"
     fi
     
-    # Additional wait to ensure data is written to disk
-    log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
-    sleep 5
-    
     # Collect end metrics
     collect_system_metrics "$exp_dir" "$iteration" "end"
+    
+    # Record iteration end time
+    local iteration_end=$(date +%s)
+    echo "$iteration_end" > "$exp_dir/metadata/iteration_${iteration}_end.txt"
+    
+    # Calculate actual duration
+    local actual_duration=$((iteration_end - iteration_start))
+    log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
+    
+    # Wait a bit more for data to be written to disk
+    log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
+    sleep 5
     
     # Retrieve windowed run data from all victim services (only if enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
@@ -1706,10 +1974,18 @@ run_iteration() {
     
     # Wait for wrk2 to complete if it was started
     if [[ -n "$wrk2_pid" ]]; then
+        log "$exp_dir" "Waiting for workload generation to complete..."
         wait "$wrk2_pid" 2>/dev/null || true
     fi
     
+    # Wait for all burst stress processes to complete
+    if [[ -n "$burst_pids" ]]; then
+        log "$exp_dir" "Waiting for all stress bursts to complete..."
+        wait_for_processes $burst_pids
+    fi
+    
     # Cleanup stress pods
+    log "$exp_dir" "Cleaning up stress pods..."
     "$STRESS_SCRIPT" cleanup
     
     log "$exp_dir" "Iteration $iteration completed"
@@ -1723,11 +1999,41 @@ generate_metadata() {
     
     source "$config_file"
     
+    # Determine contention model and duration info
+    local contention_model="legacy-single-burst"
+    local duration_info=""
+    local burst_info=""
+    
+    if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
+        contention_model="burst-based"
+        burst_info=",
+        \"contention_bursts\": {
+            \"shape\": \"$CONTENTION_SHAPE\",
+            \"shape_args\": \"${CONTENTION_SHAPE_ARGS}\",
+            \"randomize\": ${CONTENTION_RANDOMIZE:-false},
+            \"random_seed\": \"${CONTENTION_RANDOM_SEED:-auto}\",
+            \"note\": \"Duration varies per iteration based on burst schedule\"
+        }"
+    else
+        duration_info=",
+        \"experiment_duration\": $EXPERIMENT_DURATION,
+        \"timing\": {
+            \"base_duration\": $EXPERIMENT_DURATION,
+            \"stressor_duration\": \"$((EXPERIMENT_DURATION + 10))\",
+            \"workload_duration\": \"$((EXPERIMENT_DURATION + 5))\",
+            \"startup_delays\": {
+                \"stressor_to_workload\": 15,
+                \"workload_start\": 15
+            }
+        }"
+    fi
+    
     cat > "$exp_dir/metadata/experiment.json" << EOF
 {
     "experiment_id": "$exp_id",
     "experiment_name": "$EXPERIMENT_NAME",
     "timestamp": "$(date -Iseconds)",
+    "contention_model": "$contention_model",
     "configuration": {
         "target_node": "$TARGET_NODE",
         "victim_services": "$VICTIM_SERVICES",
@@ -1735,23 +2041,14 @@ generate_metadata() {
             "enabled": ${ENABLE_WINDOWED_SAMPLING:-true},
             "window_interval_ms": ${WINDOW_INTERVAL_MS:-100},
             "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
-            "expected_samples_per_run": $((EXPERIMENT_DURATION * 1000 / ${WINDOW_INTERVAL_MS:-100}))
+            "data_collection": "Full timeline from workload start to iteration end, including idle periods",
+            "rationale": "Captures development of contention and performance changes when approaching/leaving contention"
         },
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
             "args": "${NOISY_NEIGHBOR_ARGS:-}",
             "command": "$NOISY_NEIGHBOR_TYPE ${NOISY_NEIGHBOR_ARGS:-}"
-        },
-        "experiment_duration": $EXPERIMENT_DURATION,
-        "timing": {
-            "base_duration": $EXPERIMENT_DURATION,
-            "stressor_duration": "$((EXPERIMENT_DURATION + 10))",
-            "workload_duration": "$((EXPERIMENT_DURATION + 5))",
-            "startup_delays": {
-                "stressor_to_workload": 15,
-                "workload_start": 15
-            }
-        },
+        }${duration_info}${burst_info},
         "iterations": ${ITERATIONS:-3},
         "iteration_delay": ${ITERATION_DELAY:-60},
         "wrk2_config": {
@@ -1761,7 +2058,8 @@ generate_metadata() {
             "script": "${WRK2_SCRIPT:-none}",
             "rate": ${WRK2_RATE:-200},
             "threads": ${WRK2_THREADS:-2},
-            "connections": ${WRK2_CONNECTIONS:-2}
+            "connections": ${WRK2_CONNECTIONS:-2},
+            "start_timing": "5s after iteration start (early start)"
         }
     },
     "system_info": {
@@ -1770,13 +2068,16 @@ generate_metadata() {
     },
     "scripts_used": {
         "stress_script": "$STRESS_SCRIPT",
-        "taint_script": "$TAINT_SCRIPT"
+        "taint_script": "$TAINT_SCRIPT",
+        "shapes_script": "$SHAPES_SCRIPT"
     },
     "data_structure": {
-        "raw/windowed/": "Windowed sampling data (perf + timing) per service per iteration",
+        "raw/windowed/": "Windowed sampling data (perf + timing) per service per iteration - includes idle periods",
         "raw/latency/": "End-to-end latency metrics from wrk2",
         "raw/system/": "System-wide metrics (nodes, pods) per phase",
-        "raw/stress/": "Stress test logs per iteration",
+        "raw/stress/": "Stress burst logs per iteration",
+        "metadata/burst_schedule_iterN.txt": "Burst schedule for each iteration",
+        "metadata/iteration_N_*.txt": "Timing metadata for each iteration (start, workload_start, end)",
         "processed/aggregated/": "Aggregated data across all iterations"
     }
 }
@@ -2065,57 +2366,149 @@ main() {
     if [[ $# -eq 0 ]]; then
         echo "Usage: $0 <experiment-config-file>"
         echo ""
-        echo "This script automatically enables timing interceptors for victim services."
-        echo "It will use existing timing images or build them automatically if needed."
-        echo "Supported services: user, frontend, search, profile, rate, recommendation, reservation, geo"
+        echo "=== BURST-BASED CONTENTION EXPERIMENTS ==="
         echo ""
-        echo "To pre-build timing images manually, use: ../build-timing-images.sh"
-        echo "Timing data will be collected and aggregated automatically."
+        echo "Manually define burst schedules using base functions or direct specification."
+        echo "Captures full timeline including idle periods for contention dynamics analysis."
         echo ""
-        echo "Available Performance Counters:"
-        echo "  CPU: cycles (cpu-cycles), instructions, bus-cycles, ref-cycles"
-        echo "       stalled-cycles-frontend, stalled-cycles-backend"
-        echo "  Cache L1: L1-dcache-loads, L1-dcache-load-misses, L1-dcache-stores"
-        echo "            L1-icache-load-misses"
-        echo "  Cache LLC: LLC-loads, LLC-load-misses, LLC-stores, LLC-store-misses"
-        echo "             cache-references, cache-misses"
-        echo "  Branch: branch-instructions (branches), branch-misses"
-        echo "          branch-loads, branch-load-misses"
-        echo "  TLB Data: dTLB-loads, dTLB-load-misses, dTLB-stores, dTLB-store-misses"
-        echo "  TLB Inst: iTLB-loads, iTLB-load-misses"
-        echo "  Memory: page-faults, minor-faults, major-faults"
-        echo "  NUMA: node-loads, node-load-misses, node-stores, node-store-misses"
-        echo "  System: context-switches, cpu-migrations, task-clock, alignment-faults"
+        echo "=== BASE FUNCTIONS ==="
         echo ""
-        echo "Note: Run 'perf list hardware' and 'perf list cache' on your node to see available events"
+        echo "1. burst <start> <duration> <intensity>"
+        echo "   Create a single burst"
+        echo "   Example: burst 0 30 4  →  \"0:30:4\""
         echo ""
-        echo "Example config file:"
+        echo "2. repeat_burst <start> <dur> <idle> <num> <intensity>"
+        echo "   Multiple identical bursts with idle gaps"
+        echo "   Example: repeat_burst 0 30 10 5 4  →  \"0:30:4 40:30:4 80:30:4 ...\""
+        echo ""
+        echo "3. linear_intensity <start> <dur> <idle> <num> <start_int> <end_int>"
+        echo "   Linearly changing intensity (escalating/de-escalating)"
+        echo "   Example: linear_intensity 0 20 10 5 2 10  →  \"0:20:2 30:20:4 60:20:6 ...\""
+        echo ""
+        echo "Run './contention-shapes.sh help' for detailed documentation"
+        echo ""
+        echo "=== CONFIGURATION EXAMPLES ==="
+        echo ""
+        echo "Example 1: Simple Periodic Bursts"
+        echo "────────────────────────────────────────────────────────────────"
+        echo "EXPERIMENT_NAME='Periodic CPU Contention'"
+        echo "TARGET_NODE='node-1'"
+        echo "VICTIM_SERVICES='frontend search'"
+        echo "NOISY_NEIGHBOR_TYPE='cpu'"
+        echo ""
+        echo "# Method 1: Direct specification (5 bursts, 30s each, 10s idle, 4 CPUs)"
+        echo "CONTENTION_BURSTS='0:30:4 40:30:4 80:30:4 120:30:4 160:30:4'"
+        echo ""
+        echo "# Method 2: Using helper function (cleaner)"
+        echo "source ./contention-shapes.sh"
+        echo "CONTENTION_BURSTS=\$(repeat_burst 0 30 10 5 4)"
+        echo ""
+        echo "ITERATIONS=3"
+        echo "ENABLE_WINDOWED_SAMPLING=true"
+        echo "WINDOW_INTERVAL_MS=100"
+        echo "WRK2_TARGET_SERVICE='frontend'"
+        echo "WRK2_RATE=200"
+        echo ""
+        echo "# Timeline: 0-30s (burst), 30-40s (idle), 40-70s (burst), ..."
+        echo "# Total: ~200s per iteration"
+        echo ""
+        echo "────────────────────────────────────────────────────────────────"
+        echo "Example 2: Escalating Intensity"
+        echo "────────────────────────────────────────────────────────────────"
+        echo "EXPERIMENT_NAME='Escalating CPU Contention'"
+        echo "TARGET_NODE='node-1'"
+        echo "VICTIM_SERVICES='frontend search'"
+        echo "NOISY_NEIGHBOR_TYPE='cpu'"
+        echo ""
+        echo "source ./contention-shapes.sh"
+        echo "# 5 bursts: 20s each, 10s idle, intensity 2→10 CPUs"
+        echo "CONTENTION_BURSTS=\$(linear_intensity 0 20 10 5 2 10)"
+        echo "# Result: \"0:20:2 30:20:4 60:20:6 90:20:8 120:20:10\""
+        echo ""
+        echo "ITERATIONS=3"
+        echo "ENABLE_WINDOWED_SAMPLING=true"
+        echo "WRK2_TARGET_SERVICE='frontend'"
+        echo ""
+        echo "# Timeline:"
+        echo "#  0-20s:   2 CPUs"
+        echo "#  30-50s:  4 CPUs"
+        echo "#  60-80s:  6 CPUs"
+        echo "#  90-110s: 8 CPUs"
+        echo "# 120-140s: 10 CPUs"
+        echo ""
+        echo "────────────────────────────────────────────────────────────────"
+        echo "Example 3: Spike Pattern (Composite)"
+        echo "────────────────────────────────────────────────────────────────"
+        echo "EXPERIMENT_NAME='Spike Pattern - Major Event with Background'"
+        echo "TARGET_NODE='node-1'"
+        echo "VICTIM_SERVICES='frontend search'"
+        echo "NOISY_NEIGHBOR_TYPE='cpu'"
+        echo ""
+        echo "source ./contention-shapes.sh"
+        echo "# Minor bursts before spike (3 bursts, 15s each, 30s idle, 2 CPUs)"
+        echo "MINOR_BEFORE=\$(repeat_burst 0 15 30 3 2)"
+        echo "# Major spike at 135s (60s, 8 CPUs)"
+        echo "MAJOR_SPIKE=\$(burst 135 60 8)"
+        echo "# Minor bursts after spike (3 bursts, 15s each, 30s idle, 2 CPUs)"
+        echo "MINOR_AFTER=\$(repeat_burst 225 15 30 3 2)"
+        echo "# Combine all patterns"
+        echo "CONTENTION_BURSTS=\"\$MINOR_BEFORE \$MAJOR_SPIKE \$MINOR_AFTER\""
+        echo ""
+        echo "ITERATIONS=3"
+        echo "ENABLE_WINDOWED_SAMPLING=true"
+        echo "WRK2_TARGET_SERVICE='frontend'"
+        echo ""
+        echo "# Timeline:"
+        echo "#   0-15s:   Minor (2 CPUs)"
+        echo "#  45-60s:   Minor (2 CPUs)"
+        echo "#  90-105s:  Minor (2 CPUs)"
+        echo "# 135-195s:  MAJOR SPIKE (8 CPUs)"
+        echo "# 225-240s:  Minor (2 CPUs)"
+        echo "# ... continued"
+        echo ""
+        echo "────────────────────────────────────────────────────────────────"
+        echo "Example 4: Legacy Model (Backward Compatible)"
+        echo "────────────────────────────────────────────────────────────────"
         echo "EXPERIMENT_NAME='CPU Heavy Neighbor Impact'"
         echo "TARGET_NODE='node-1'"
-        echo "VICTIM_SERVICES='frontend search user'"
+        echo "VICTIM_SERVICES='frontend search'"
         echo "NOISY_NEIGHBOR_TYPE='cpu'"
         echo "NOISY_NEIGHBOR_ARGS='4 300s'"
-		echo "EXPERIMENT_DURATION=30"
-		echo "ITERATIONS=5"
-		echo "ITERATION_DELAY=10"
-		echo "# Windowed sampling configuration:"
-		echo "ENABLE_WINDOWED_SAMPLING=true"
-		echo "WINDOW_INTERVAL_MS=100  # Sample every 100ms"
-		echo "PERF_EVENTS='cycles,instructions,LLC-load-misses,branch-misses,dTLB-load-misses,iTLB-load-misses,page-faults'"
-		echo "# Ring buffer configuration:"
-		echo "# Architecture: non-blocking channel → consumer goroutine → ring buffer → window flush"
-		echo "TIMING_BUFFER_SIZE=16384  # Buffer size (power of 2), handles bursts up to 1600 req/s"
-		echo "# Jaeger tracing configuration:"
-		echo "JAEGER_SAMPLE_RATIO=0.01  # 1% sampling rate (default if not specified)"
-		echo "#JAEGER_SAMPLE_RATIO=0    # Set to 0 to skip Jaeger configuration entirely"
-		echo "# wrk2 configuration:"
-		echo "WRK2_TARGET_SERVICE='frontend'"
-		echo "WRK2_TARGET_IP='192.168.202.238'"
-		echo "WRK2_TARGET_PORT=5000"
-		echo "WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'"
-		echo "WRK2_RATE=200"
-		echo "WRK2_THREADS=3"
-		echo "WRK2_CONNECTIONS=3"
+        echo "EXPERIMENT_DURATION=300  # Single sustained burst"
+        echo "ITERATIONS=5"
+        echo ""
+        echo "════════════════════════════════════════════════════════════════"
+        echo ""
+        echo "=== KEY FEATURES ==="
+        echo ""
+        echo "  • Early workload start: +5s (was +15s)"
+        echo "  • Full timeline data: Captures idle periods for recovery analysis"
+        echo "  • Flexible patterns: Compose complex schedules from base functions"
+        echo "  • Direct control: See exact burst specifications"
+        echo "  • Burst format: \"start_time:duration:intensity\""
+        echo "    - start_time: seconds from iteration start"
+        echo "    - duration: seconds"
+        echo "    - intensity: CPU workers (cpu), memory MB (mem), IO workers (io)"
+        echo ""
+        echo "=== SUPPORTED SERVICES (Timing Interceptors) ==="
+        echo ""
+        echo "  user, frontend, search, profile, rate, recommendation, reservation, geo"
+        echo ""
+        echo "=== AVAILABLE PERFORMANCE COUNTERS ==="
+        echo ""
+        echo "  CPU:      cycles, instructions, bus-cycles, ref-cycles"
+        echo "            stalled-cycles-frontend, stalled-cycles-backend"
+        echo "  Cache L1: L1-dcache-loads/stores, L1-dcache-load-misses"
+        echo "            L1-icache-load-misses"
+        echo "  Cache LLC: LLC-loads/stores, LLC-load/store-misses"
+        echo "             cache-references, cache-misses"
+        echo "  Branch:   branch-instructions, branch-misses"
+        echo "  TLB:      dTLB/iTLB-loads, dTLB/iTLB-load-misses"
+        echo "  Memory:   page-faults, minor-faults, major-faults"
+        echo "  System:   context-switches, cpu-migrations, task-clock"
+        echo ""
+        echo "Run 'perf list' on your node to see all available events"
+        echo ""
         exit 1
     fi
     
