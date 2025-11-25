@@ -447,59 +447,80 @@ retrieve_windowed_run_data() {
                 iteration_end_ts=$(cat "$iteration_end_file")
             fi
             
-            # Filter samples to include only those from workload start to iteration end
-            # IMPORTANT: We keep ALL samples including idle periods (zero timing data)
-            # This captures the full dynamics of contention development
+            # Filter samples using offset_ms
+            # For iteration > 1, pod restarts and offset_ms counts from pod start
+            # We need to filter to only include samples from workload start onwards
             if command -v jq >/dev/null 2>&1; then
-                log "$exp_dir" "  Filtering samples by time range (workload start to iteration end)"
-                log "$exp_dir" "    Keeping ALL samples including idle periods to capture contention dynamics"
+                # Get run_start timestamp from the JSON (when pod/sampling started)
+                local run_start_ts=$(jq -r '.run_start // ""' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
                 
-                # Convert timestamps to milliseconds for comparison
-                local workload_start_ms=$((workload_start_ts * 1000))
-                local iteration_end_ms=$((iteration_end_ts * 1000))
+                # Calculate the offset_ms threshold (time from pod start to workload start)
+                local offset_threshold_ms=0
+                if [[ -n "$run_start_ts" && $workload_start_ts -gt 0 ]]; then
+                    # Parse run_start timestamp to epoch seconds
+                    local run_start_epoch=$(date -d "$run_start_ts" +%s 2>/dev/null || echo "0")
+                    if [[ $run_start_epoch -gt 0 ]]; then
+                        # Calculate offset: how many ms after pod start did workload start?
+                        offset_threshold_ms=$(( (workload_start_ts - run_start_epoch) * 1000 ))
+                        if [[ $offset_threshold_ms -lt 0 ]]; then
+                            offset_threshold_ms=0
+                        fi
+                    fi
+                fi
                 
-                if [[ $workload_start_ts -gt 0 && $iteration_end_ts -gt 0 ]]; then
-                    jq --arg ws "$workload_start_ms" --arg ie "$iteration_end_ms" '{
-                    service_name,
-                    iteration_id,
-                    run_start,
-                    run_end,
-                    run_duration_ms,
-                    window_interval_ms,
-                    perf_events,
+                # Calculate iteration duration for end threshold
+                local iteration_duration_ms=0
+                if [[ $iteration_end_ts -gt 0 && $workload_start_ts -gt 0 ]]; then
+                    iteration_duration_ms=$(( (iteration_end_ts - workload_start_ts) * 1000 ))
+                fi
+                local offset_end_ms=$((offset_threshold_ms + iteration_duration_ms))
+                
+                log "$exp_dir" "  Filtering samples by offset_ms range"
+                log "$exp_dir" "    Pod start (run_start): $run_start_ts"
+                log "$exp_dir" "    Workload start offset: ${offset_threshold_ms}ms from pod start"
+                log "$exp_dir" "    Iteration end offset: ${offset_end_ms}ms from pod start"
+                
+                if [[ $offset_threshold_ms -gt 0 || $offset_end_ms -gt 0 ]]; then
+                    jq --argjson start_offset "$offset_threshold_ms" --argjson end_offset "$offset_end_ms" '{
+                        service_name,
+                        iteration_id,
+                        run_start,
+                        run_end,
+                        run_duration_ms,
+                        window_interval_ms,
+                        perf_events,
                         filtering: {
                             applied: true,
-                            workload_start_ms: ($ws | tonumber),
-                            iteration_end_ms: ($ie | tonumber),
-                            rationale: "Includes all samples (with and without timing data) from workload start to iteration end to capture contention dynamics"
+                            method: "offset_ms based",
+                            offset_start_ms: $start_offset,
+                            offset_end_ms: $end_offset,
+                            rationale: "Filtered to samples from workload start to iteration end, excluding pre-workload samples"
                         },
-                    samples: [.samples[] | select(
-                            .window_start_ms >= ($ws | tonumber) and 
-                            .window_end_ms <= ($ie | tonumber)
-                    )],
-                    sample_count: ([.samples[] | select(
-                            .window_start_ms >= ($ws | tonumber) and 
-                            .window_end_ms <= ($ie | tonumber)
+                        samples: [.samples[] | select(
+                            .offset_ms >= $start_offset and 
+                            .offset_ms <= $end_offset
+                        ) | . + {
+                            offset_from_workload_ms: (.offset_ms - $start_offset)
+                        }],
+                        sample_count: ([.samples[] | select(
+                            .offset_ms >= $start_offset and 
+                            .offset_ms <= $end_offset
                         )] | length),
                         samples_with_timing: ([.samples[] | select(
-                            .window_start_ms >= ($ws | tonumber) and 
-                            .window_end_ms <= ($ie | tonumber) and
-                            (.timing_window.processing_time.count > 0 or 
-                             .timing_window.total_time.count > 0 or 
-                             .timing_window.blocking_time.count > 0)
+                            .offset_ms >= $start_offset and 
+                            .offset_ms <= $end_offset and
+                            (.timing_window.request_count > 0)
                         )] | length),
                         samples_idle: ([.samples[] | select(
-                            .window_start_ms >= ($ws | tonumber) and 
-                            .window_end_ms <= ($ie | tonumber) and
-                            .timing_window.processing_time.count == 0 and
-                            .timing_window.total_time.count == 0 and
-                            .timing_window.blocking_time.count == 0
+                            .offset_ms >= $start_offset and 
+                            .offset_ms <= $end_offset and
+                            .timing_window.request_count == 0
                         )] | length),
                         aggregates: .aggregates
                     }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
                 else
-                    # Fallback: no time filtering, keep all samples
-                    log "$exp_dir" "    WARNING: Missing timing metadata, keeping all samples without time filtering"
+                    # Fallback: no offset filtering needed (iteration 1 or missing metadata)
+                    log "$exp_dir" "    No offset filtering needed, keeping all samples"
                     jq '{
                         service_name,
                         iteration_id,
@@ -510,32 +531,24 @@ retrieve_windowed_run_data() {
                         perf_events,
                         filtering: {
                             applied: false,
-                            rationale: "Timing metadata not available, kept all samples"
+                            rationale: "No offset filtering needed (iteration 1 or missing metadata)"
                         },
-                        samples: .samples,
+                        samples: [.samples[] | . + {offset_from_workload_ms: .offset_ms}],
                         sample_count: (.samples | length),
-                        samples_with_timing: ([.samples[] | select(
-                        .timing_window.processing_time.count > 0 or 
-                        .timing_window.total_time.count > 0 or 
-                        .timing_window.blocking_time.count > 0
-                    )] | length),
-                        samples_idle: ([.samples[] | select(
-                            .timing_window.processing_time.count == 0 and
-                            .timing_window.total_time.count == 0 and
-                            .timing_window.blocking_time.count == 0
-                        )] | length),
-                    aggregates: .aggregates
-                }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
+                        samples_with_timing: ([.samples[] | select(.timing_window.request_count > 0)] | length),
+                        samples_idle: ([.samples[] | select(.timing_window.request_count == 0)] | length),
+                        aggregates: .aggregates
+                    }' "$output_dir/run_data_iter${iteration}_raw.json" > "$output_dir/run_data_iter${iteration}.json"
                 fi
                 
-                local total_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null)
+                local total_samples=$(jq -r '.samples | length' "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null || echo "0")
                 local filtered_samples=$(jq -r '.sample_count // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
                 local samples_with_timing=$(jq -r '.samples_with_timing // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
                 local samples_idle=$(jq -r '.samples_idle // 0' "$output_dir/run_data_iter${iteration}.json" 2>/dev/null)
                 
                 log "$exp_dir" "  Filtered: $filtered_samples/$total_samples samples in experiment window"
-                log "$exp_dir" "    Active samples (with timing data): $samples_with_timing"
-                log "$exp_dir" "    Idle samples (no timing data): $samples_idle"
+                log "$exp_dir" "    Active samples (with requests): $samples_with_timing"
+                log "$exp_dir" "    Idle samples (no requests): $samples_idle"
             else
                 # No jq available, just copy raw file
                 log "$exp_dir" "  WARNING: jq not available, copying all samples without filtering"
@@ -1911,7 +1924,7 @@ run_iteration() {
     local iteration_start=$(date +%s)
     echo "$iteration_start" > "$exp_dir/metadata/iteration_${iteration}_start.txt"
     
-    # Start workload generation EARLY (at +5s instead of +15s)
+    # Start workload generation early (at +5s)
     log "$exp_dir" "Waiting 5s before starting workload generation..."
     sleep 5
     
@@ -1933,7 +1946,7 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Start burst schedule execution in background
+    # Start burst schedule execution
     log "$exp_dir" "Starting burst schedule execution"
     local burst_pids=$(execute_burst_schedule "$exp_dir" "$iteration" "$TARGET_NODE" "$NOISY_NEIGHBOR_TYPE" "$burst_schedule")
     
