@@ -76,11 +76,16 @@ generate_exp_id() {
 
 # Generate contention burst schedule for an iteration
 # Returns: array of burst specs "start_time:duration:intensity"
+# Special values: "none" or empty = no contention baseline
 generate_burst_schedule() {
     local exp_dir="$1"
     local iteration="$2"
     
-    if [[ -n "${CONTENTION_BURSTS:-}" ]]; then
+    if [[ "${CONTENTION_BURSTS:-}" == "none" ]]; then
+        # Explicit no-contention mode
+        log "$exp_dir" "No-contention baseline mode for iteration $iteration"
+        echo "none"
+    elif [[ -n "${CONTENTION_BURSTS:-}" ]]; then
         # User-defined burst schedule
         log "$exp_dir" "Using user-defined burst schedule for iteration $iteration"
         log "$exp_dir" "Burst schedule: $CONTENTION_BURSTS"
@@ -88,7 +93,13 @@ generate_burst_schedule() {
     elif [[ -n "${EXPERIMENT_DURATION:-}" ]]; then
         # Legacy single-duration model (backward compatibility)
         log "$exp_dir" "Using legacy single-duration model: ${EXPERIMENT_DURATION}s"
-        echo "0:${EXPERIMENT_DURATION}:${NOISY_NEIGHBOR_ARGS}"
+        if [[ -z "${NOISY_NEIGHBOR_ARGS:-}" || "${NOISY_NEIGHBOR_ARGS:-}" == "0" ]]; then
+            # No contention in legacy mode
+            log "$exp_dir" "No-contention baseline (NOISY_NEIGHBOR_ARGS empty or 0)"
+            echo "none"
+        else
+            echo "0:${EXPERIMENT_DURATION}:${NOISY_NEIGHBOR_ARGS}"
+        fi
     else
         log "$exp_dir" "ERROR: Must specify either CONTENTION_BURSTS or EXPERIMENT_DURATION"
         return 1
@@ -97,7 +108,17 @@ generate_burst_schedule() {
 
 # Calculate total iteration duration from burst schedule
 calculate_iteration_duration() {
-    local bursts=($1)
+    local burst_schedule="$1"
+    
+    # Handle no-contention mode
+    if [[ -z "$burst_schedule" || "$burst_schedule" == "none" ]]; then
+        # Use EXPERIMENT_DURATION if set, otherwise default to 60s
+        local duration="${EXPERIMENT_DURATION:-60}"
+        echo $((duration + 10))  # Add buffer
+        return
+    fi
+    
+    local bursts=($burst_schedule)
     local max_end_time=0
     
     for burst in "${bursts[@]}"; do
@@ -1843,6 +1864,13 @@ execute_burst_schedule() {
     local stress_type="$4"
     local burst_schedule="$5"
     
+    # Check for no-contention mode
+    if [[ -z "$burst_schedule" || "$burst_schedule" == "none" || "$burst_schedule" == "0" ]]; then
+        log "$exp_dir" "No-contention mode: skipping burst execution for iteration $iteration"
+        echo ""
+        return 0
+    fi
+    
     log "$exp_dir" "Executing burst schedule for iteration $iteration"
     
     local bursts=($burst_schedule)
@@ -1856,6 +1884,12 @@ execute_burst_schedule() {
     for burst_spec in "${bursts[@]}"; do
         IFS=':' read -r start_time duration intensity <<< "$burst_spec"
         ((burst_num++))
+        
+        # Skip bursts with zero intensity
+        if [[ "$intensity" == "0" || -z "$intensity" ]]; then
+            log "$exp_dir" "  Skipping burst $burst_num (intensity=0, no-contention)"
+            continue
+        fi
         
         local burst_id="iter${iteration}_burst${burst_num}"
         
