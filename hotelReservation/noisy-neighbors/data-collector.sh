@@ -133,7 +133,8 @@ calculate_iteration_duration() {
 
 # Parse intensity value for stress command
 # For CPU: returns number of workers
-# For MEM: returns memory size
+# For MEM/MEMORY: returns number of stream workers (uses --stream stressor)
+# For CACHE-FENCE/CACHE-FLUSH: returns number of cache workers
 parse_stress_intensity() {
     local stress_type="$1"
     local intensity="$2"
@@ -143,10 +144,13 @@ parse_stress_intensity() {
             echo "$intensity"  # Number of CPU workers
             ;;
         mem|memory)
-            echo "${intensity}M"  # Memory in MB
+            echo "$intensity"  # Number of stream workers (memory bandwidth stress)
             ;;
         io|iomix)
             echo "$intensity"  # Number of IO workers
+            ;;
+        cache-fence|cache-flush)
+            echo "$intensity"  # Number of cache workers
             ;;
         *)
             echo "$intensity"

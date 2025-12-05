@@ -93,6 +93,8 @@ my_stressng() {
             eval $cmd
             ;;
         memory)
+            # Uses --stream stressor for memory bandwidth stress
+            # First arg: number of stream workers (default: 1)
             local workers=${args[1]:-1}
             local duration=${args[2]:-60s}
             local cmd=$(create_kubectl_cmd "mem-stress" "$current_image" "--stream $workers --timeout $duration" "$node")
@@ -117,6 +119,18 @@ my_stressng() {
             local cmd=$(create_kubectl_cmd "io-stress" "$current_image" "--io $workers --timeout $duration" "$node")
             eval $cmd
             ;;
+        cache-fence)
+            local workers=${args[1]:-2}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "cache-fence-stress" "$current_image" "--cache-fence $workers --timeout $duration" "$node")
+            eval $cmd
+            ;;
+        cache-flush)
+            local workers=${args[1]:-2}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "cache-flush-stress" "$current_image" "--cache-flush $workers --timeout $duration" "$node")
+            eval $cmd
+            ;;
         network)
             local workers=${args[1]:-2}
             local duration=${args[2]:-60s}
@@ -129,12 +143,12 @@ my_stressng() {
             eval $cmd
             ;;
         cleanup)
-            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress udp-stress noisy-neighbor heavy-load 2>/dev/null || true
+            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress cache-fence-stress cache-flush-stress udp-stress noisy-neighbor heavy-load 2>/dev/null || true
             echo "Cleaned up stress test pods"
             ;;
         status)
             echo "Current stress test pods:"
-            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|udp-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
+            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|cache-fence-stress|cache-flush-stress|udp-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
             ;;
         nodes)
             echo "Available nodes:"
@@ -148,10 +162,12 @@ my_stressng() {
             echo ""
             echo "Commands:"
             echo "  cpu [workers] [duration] [--node <node>] [--image-tag <tag>]           # Default: 2 workers, 60s"
-            echo "  memory [workers] [duration] [--node <node>] [--image-tag <tag>]        # Default: 1 worker, 60s"
+            echo "  memory [stream-workers] [duration] [--node <node>] [--image-tag <tag>] # Default: 1 stream worker, 60s"
             echo "  vm [workers] [size] [duration] [--node <node>] [--image-tag <tag>]     # Default: 2 workers, 512M, 60s"
             echo "  pagefault [workers] [duration] [--node <node>] [--image-tag <tag>]     # Default: 1 worker, 60s"
             echo "  io [workers] [duration] [--node <node>] [--image-tag <tag>]            # Default: 2 workers, 60s"
+            echo "  cache-fence [workers] [duration] [--node <node>] [--image-tag <tag>]   # Default: 2 workers, 60s"
+            echo "  cache-flush [workers] [duration] [--node <node>] [--image-tag <tag>]   # Default: 2 workers, 60s"
             echo "  network [workers] [duration] [--node <node>] [--image-tag <tag>]       # Default: 2 workers, 60s"
             echo "  noisy [duration] [--node <node>] [--image-tag <tag>]                   # Combined load (default: infinite)"
             echo ""
