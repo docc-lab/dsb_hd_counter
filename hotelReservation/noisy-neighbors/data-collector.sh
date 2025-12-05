@@ -133,7 +133,9 @@ calculate_iteration_duration() {
 
 # Parse intensity value for stress command
 # For CPU: returns number of workers
-# For MEM/MEMORY: returns number of stream workers (uses --stream stressor)
+# For MEM/MEMORY: returns "workers l3_size" (uses --stream --stream-l3-size stressor)
+#   - Set MEMORY_L3_SIZE env var to override L3 size (default: 64M)
+#   - L3 size forces buffer allocation of 4x this size per worker
 # For CACHE-FENCE/CACHE-FLUSH: returns number of cache workers
 parse_stress_intensity() {
     local stress_type="$1"
@@ -144,13 +146,16 @@ parse_stress_intensity() {
             echo "$intensity"  # Number of CPU workers
             ;;
         mem|memory)
-            echo "$intensity"  # Number of stream workers (memory bandwidth stress)
+            # Memory stressor uses: workers l3_size
+            # Default L3 size is 64M to force main memory access (4x L3 = 256MB per worker)
+            local l3_size="${MEMORY_L3_SIZE:-64M}"
+            echo "$intensity $l3_size"  # Number of stream workers + L3 size override
             ;;
         io|iomix)
             echo "$intensity"  # Number of IO workers
             ;;
-        cache-fence|cache-flush)
-            echo "$intensity"  # Number of cache workers
+        cache|cache-fence|cache-flush)
+            echo "$intensity"  # Number of cache workers (uses --cache stressor)
             ;;
         *)
             echo "$intensity"
@@ -2525,7 +2530,9 @@ EXAMPLE_EOF
         echo "=== INTENSITY VALUES ==="
         echo ""
         echo "  cpu type: number of CPU workers (cores to stress)"
-        echo "  mem type: memory in MB to allocate"
+        echo "  mem type: number of stream workers (memory bandwidth stress)"
+        echo "            Set MEMORY_L3_SIZE env var to override L3 cache size (default: 64M)"
+        echo "            Buffer per worker = 4x L3 size (default: 256MB/worker)"
         echo "  io type:  number of IO workers"
         echo ""
         echo "=== SUPPORTED SERVICES ==="
