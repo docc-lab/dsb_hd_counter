@@ -154,8 +154,14 @@ parse_stress_intensity() {
         io|iomix)
             echo "$intensity"  # Number of IO workers
             ;;
-        cache|cache-fence|cache-flush)
+        cache|cache-fence|cache-flush|cache-l2)
             echo "$intensity"  # Number of cache workers (uses --cache stressor)
+            ;;
+        cache-llc)
+            # Cache LLC bandwidth stressor uses: workers l3_size
+            # Default L3 size is 8M (creates 32MB working set per worker to fit in typical L3)
+            local llc_l3_size="${CACHE_LLC_L3_SIZE:-8M}"
+            echo "$intensity $llc_l3_size"  # Number of stream workers + L3 size for LLC-fit working set
             ;;
         *)
             echo "$intensity"

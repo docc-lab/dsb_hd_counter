@@ -126,25 +126,49 @@ my_stressng() {
         cache)
             # Basic cache stressor - thrashes CPU cache with random read/writes
             # Workers should be close to number of CPU cores for max impact
+            # Uses --cache-level 3 explicitly for LLC targeting on non-inclusive architectures (Ice Lake+)
             local workers=${args[1]:-8}
             local duration=${args[2]:-60s}
-            local cmd=$(create_kubectl_cmd "cache-stress" "$current_image" "--cache $workers --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "cache-stress" "$current_image" "--cache $workers --cache-level 3 --timeout $duration" "$node")
             eval $cmd
             ;;
         cache-fence)
             # Cache stressor with write serialization (mfence on x86)
             # Forces memory barriers on each store - high cache coherency overhead
+            # NOTE: On non-inclusive caches (Ice Lake+), this primarily affects local L1/L2
+            # For real L3 contention, consider using cache-llc or stream stressors instead
             local workers=${args[1]:-8}
             local duration=${args[2]:-60s}
-            local cmd=$(create_kubectl_cmd "cache-fence-stress" "$current_image" "--cache $workers --cache-fence --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "cache-fence-stress" "$current_image" "--cache $workers --cache-fence --cache-level 3 --timeout $duration" "$node")
             eval $cmd
             ;;
         cache-flush)
             # Cache stressor with cache line flush (clflush on x86)
             # Forces cache eviction on each store - maximizes cache misses
+            # NOTE: On non-inclusive caches (Ice Lake+), clflush may not pollute L3
+            # This mode is more effective for local cache self-pollution
             local workers=${args[1]:-8}
             local duration=${args[2]:-60s}
-            local cmd=$(create_kubectl_cmd "cache-flush-stress" "$current_image" "--cache $workers --cache-flush --timeout $duration" "$node")
+            local cmd=$(create_kubectl_cmd "cache-flush-stress" "$current_image" "--cache $workers --cache-flush --cache-level 3 --timeout $duration" "$node")
+            eval $cmd
+            ;;
+        cache-llc)
+            # LLC bandwidth stressor for non-inclusive cache architectures (Ice Lake+)
+            # Uses --stream with L3-sized working set to create LLC bandwidth pressure
+            # Working set = 4 * l3_size per worker; set l3_size to ~1/4 of actual L3 to stay in cache
+            # Example: Ice Lake with 30MB L3 -> use 8M to get 32MB working set
+            local workers=${args[1]:-8}
+            local l3_size=${args[2]:-8M}  # Results in 32MB working set per worker (fits in typical L3)
+            local duration=${args[3]:-60s}
+            local cmd=$(create_kubectl_cmd "cache-llc-stress" "$current_image" "--stream $workers --stream-l3-size $l3_size --timeout $duration" "$node")
+            eval $cmd
+            ;;
+        cache-l2)
+            # L2-focused stressor - useful for testing L2 miss effects
+            # On non-inclusive caches, this creates L2 capacity pressure without LLC pollution
+            local workers=${args[1]:-8}
+            local duration=${args[2]:-60s}
+            local cmd=$(create_kubectl_cmd "cache-l2-stress" "$current_image" "--cache $workers --cache-level 2 --timeout $duration" "$node")
             eval $cmd
             ;;
         network)
@@ -159,12 +183,12 @@ my_stressng() {
             eval $cmd
             ;;
         cleanup)
-            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress cache-stress cache-fence-stress cache-flush-stress udp-stress noisy-neighbor heavy-load 2>/dev/null || true
+            kubectl delete pod cpu-stress mem-stress vm-stress page-fault io-stress cache-stress cache-fence-stress cache-flush-stress cache-llc-stress cache-l2-stress udp-stress noisy-neighbor heavy-load 2>/dev/null || true
             echo "Cleaned up stress test pods"
             ;;
         status)
             echo "Current stress test pods:"
-            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|cache-stress|cache-fence-stress|cache-flush-stress|udp-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
+            kubectl get pods -o wide | grep -E "(cpu-stress|mem-stress|vm-stress|page-fault|io-stress|cache-stress|cache-fence-stress|cache-flush-stress|cache-llc-stress|cache-l2-stress|udp-stress|noisy-neighbor|heavy-load)" || echo "No stress test pods running"
             ;;
         nodes)
             echo "Available nodes:"
@@ -182,9 +206,20 @@ my_stressng() {
             echo "  vm [workers] [size] [duration] [--node <node>] [--image-tag <tag>]     # Default: 2 workers, 512M, 60s"
             echo "  pagefault [workers] [duration] [--node <node>] [--image-tag <tag>]     # Default: 1 worker, 60s"
             echo "  io [workers] [duration] [--node <node>] [--image-tag <tag>]            # Default: 2 workers, 60s"
-            echo "  cache [workers] [duration] [--node <node>]                            # Default: 8 workers, 60s (cache thrashing)"
-            echo "  cache-fence [workers] [duration] [--node <node>]                      # Default: 8 workers, 60s (+ write serialization)"
-            echo "  cache-flush [workers] [duration] [--node <node>]                      # Default: 8 workers, 60s (+ cache line flush)"
+            echo "  cache [workers] [duration] [--node <node>]                            # Default: 8 workers, 60s (L3 random access, latency-bound)"
+            echo "  cache-fence [workers] [duration] [--node <node>]                      # Default: 8 workers, 60s (+ mfence serialization)"
+            echo "  cache-flush [workers] [duration] [--node <node>]                      # Default: 8 workers, 60s (+ clflush eviction)"
+            echo "  cache-llc [workers] [l3-size] [duration] [--node <node>]              # Default: 8 workers, 8M, 60s (LLC bandwidth-bound)"
+            echo "  cache-l2 [workers] [duration] [--node <node>]                         # Default: 8 workers, 60s (L2 random access)"
+            echo ""
+            echo "Contention Type Guide:"
+            echo "  BANDWIDTH-BOUND (sequential access, saturates bus):"
+            echo "    - memory: DRAM bandwidth (working set >> L3 size, default 256MB/worker)"
+            echo "    - cache-llc: L3 bandwidth (working set ~= L3 size, default 32MB/worker)"
+            echo "  LATENCY-BOUND (random access, causes cache misses):"
+            echo "    - cache: L3 random thrashing (--cache-level 3)"
+            echo "    - cache-l2: L2 random thrashing (--cache-level 2)"
+            echo "  NOTE: cache-fence/cache-flush have limited cross-core effect on Ice Lake+"
             echo "  network [workers] [duration] [--node <node>] [--image-tag <tag>]       # Default: 2 workers, 60s"
             echo "  noisy [duration] [--node <node>] [--image-tag <tag>]                   # Combined load (default: infinite)"
             echo ""
