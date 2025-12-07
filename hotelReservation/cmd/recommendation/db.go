@@ -12,8 +12,9 @@ import (
 )
 
 // Default number of hotels - can be overridden with HOTEL_COUNT env var
-// 50000 hotels ≈ 2.5-5 MB working set (fits in L3, not L2)
-const defaultHotelCount = 50000
+// 5000 hotels ≈ 250-500 KB working set (larger than L2, fits in L3)
+// Balance between cache contention sensitivity and request latency
+const defaultHotelCount = 5000
 
 type Hotel struct {
 	HId    string  `bson:"hotelId"`
