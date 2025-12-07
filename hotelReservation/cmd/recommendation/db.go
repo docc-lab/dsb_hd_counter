@@ -74,12 +74,12 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 		
 		// Keep original 6 hotels for compatibility
 		newHotels = append(newHotels,
-			Hotel{"1", 37.7867, -122.4112, 109.00, 150.00},
-			Hotel{"2", 37.7854, -122.4005, 139.00, 120.00},
-			Hotel{"3", 37.7834, -122.4071, 109.00, 190.00},
-			Hotel{"4", 37.7936, -122.3930, 129.00, 160.00},
-			Hotel{"5", 37.7831, -122.4181, 119.00, 140.00},
-			Hotel{"6", 37.7863, -122.4015, 149.00, 200.00},
+			Hotel{HId: "1", HLat: 37.7867, HLon: -122.4112, HRate: 109.00, HPrice: 150.00},
+			Hotel{HId: "2", HLat: 37.7854, HLon: -122.4005, HRate: 139.00, HPrice: 120.00},
+			Hotel{HId: "3", HLat: 37.7834, HLon: -122.4071, HRate: 109.00, HPrice: 190.00},
+			Hotel{HId: "4", HLat: 37.7936, HLon: -122.3930, HRate: 129.00, HPrice: 160.00},
+			Hotel{HId: "5", HLat: 37.7831, HLon: -122.4181, HRate: 119.00, HPrice: 140.00},
+			Hotel{HId: "6", HLat: 37.7863, HLon: -122.4015, HRate: 149.00, HPrice: 200.00},
 		)
 
 		for i := 7; i <= hotelCount; i++ {
@@ -112,7 +112,7 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 
 			newHotels = append(
 				newHotels,
-				Hotel{hotelID, lat, lon, rate, rateInc},
+				Hotel{HId: hotelID, HLat: lat, HLon: lon, HRate: rate, HPrice: rateInc},
 			)
 		}
 
