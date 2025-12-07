@@ -246,4 +246,9 @@ type Hotel struct {
 	HLon   float64 `bson:"lon"`
 	HRate  float64 `bson:"rate"`
 	HPrice float64 `bson:"price"`
+	
+	// Cache contention experiment: padding to increase memory footprint
+	// With 448 bytes of padding, each hotel = ~512 bytes in memory (power of 2)
+	// 20,000 hotels × 512 bytes = 10.24 MB working set (memory-bound)
+	CachePadding [448]byte `bson:"-"`
 }

@@ -12,9 +12,11 @@ import (
 )
 
 // Default number of hotels - can be overridden with HOTEL_COUNT env var
-// 5000 hotels ≈ 250-500 KB working set (larger than L2, fits in L3)
-// Balance between cache contention sensitivity and request latency
-const defaultHotelCount = 5000
+// Using padding to control working set size without increasing iteration complexity
+// Target: >10MB for memory-bound behavior (per Mark Hempstead's guidance)
+// 20000 hotels × ~512 bytes (with padding) ≈ 10.24 MB working set
+// Random map iteration creates cache misses even with working set < L3 size
+const defaultHotelCount = 20000
 
 type Hotel struct {
 	HId    string  `bson:"hotelId"`
@@ -22,6 +24,12 @@ type Hotel struct {
 	HLon   float64 `bson:"lon"`
 	HRate  float64 `bson:"rate"`
 	HPrice float64 `bson:"price"`
+	
+	// Cache contention experiment: padding to increase memory footprint
+	// This padding is NOT stored in MongoDB (bson:"-")
+	// With 448 bytes of padding, each hotel struct = ~512 bytes total (power of 2)
+	// 20,000 hotels × 512 bytes = 10.24 MB working set (memory-bound)
+	CachePadding [448]byte `bson:"-"`
 }
 
 func initializeDatabase(url string) (*mongo.Client, func()) {
@@ -56,8 +64,10 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 		log.Info().Msgf("Database already has %d hotels, skipping data insertion (target: %d)", existingCount, hotelCount)
 	} else {
 		// Only generate data if we need to insert
-		log.Info().Msgf("Database empty, generating %d hotels (working set: ~%.1f MB)...", 
-			hotelCount, float64(hotelCount)*100/1024/1024)
+		// Estimate: ~512 bytes per hotel (64 struct + 448 padding)
+		workingSetMB := float64(hotelCount) * 512 / 1024 / 1024
+		log.Info().Msgf("Database empty, generating %d hotels (estimated working set: ~%.1f MB)...", 
+			hotelCount, workingSetMB)
 
 		// Pre-allocate slice for efficiency
 		newHotels := make([]interface{}, 0, hotelCount)

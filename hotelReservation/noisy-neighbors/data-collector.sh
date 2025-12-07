@@ -946,6 +946,113 @@ check_and_untolerate_pods() {
     fi
 }
 
+# Reset non-victim services to default images
+# This ensures previous experiments don't contaminate the current one
+reset_non_victim_services() {
+    local victim_services="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Resetting non-victim services to default images..."
+    
+    # List of all hotel reservation services
+    local all_services=(
+        "frontend"
+        "search" 
+        "geo"
+        "profile"
+        "rate"
+        "recommendation"
+        "reservation"
+        "user"
+    )
+    
+    # Convert victim services string to array for comparison
+    local victim_array=($victim_services)
+    
+    # Reset each non-victim service to default image
+    local reset_count=0
+    for service in "${all_services[@]}"; do
+        # Check if this service is a victim
+        local is_victim=false
+        for victim in "${victim_array[@]}"; do
+            if [[ "$service" == "$victim" ]]; then
+                is_victim=true
+                break
+            fi
+        done
+        
+        # Skip if this is a victim service (will be handled by deploy_victim_services)
+        if [[ "$is_victim" == "true" ]]; then
+            log "$exp_dir" "  Skipping $service (victim service, will be deployed separately)"
+            continue
+        fi
+        
+        # Check if deployment exists
+        if ! kubectl get deployment "$service" &>/dev/null; then
+            log "$exp_dir" "  Skipping $service (deployment not found)"
+            continue
+        fi
+        
+        # Get current image
+        local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+        
+        if [[ -z "$current_image" ]]; then
+            log "$exp_dir" "  WARNING: Could not get current image for $service"
+            continue
+        fi
+        
+        # Check if currently using a windowed/timing image
+        if [[ "$current_image" == *"-windowed:"* ]] || [[ "$current_image" == *"/windowed"* ]]; then
+            # Default hotel-reservation image (standard for all services)
+            local default_image="deathstarbench/hotel-reservation:latest"
+            
+            log "$exp_dir" "  Resetting $service: $current_image -> $default_image"
+            local container_name=$(get_container_name "$service")
+            
+            if kubectl set image "deployment/$service" "$container_name=$default_image" 2>/dev/null; then
+                log "$exp_dir" "    Successfully reset $service to default image"
+                ((reset_count++))
+                
+                # Remove windowed sampling env vars if present
+                kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- ITERATION_ID- 2>/dev/null || true
+            else
+                log "$exp_dir" "    WARNING: Failed to reset image for $service"
+            fi
+        else
+            # Check if already using the correct default image
+            if [[ "$current_image" == "deathstarbench/hotel-reservation:latest" ]]; then
+                log "$exp_dir" "  $service already using default image"
+            else
+                log "$exp_dir" "  $service using non-standard image: $current_image (leaving as-is)"
+            fi
+        fi
+    done
+    
+    if [[ $reset_count -gt 0 ]]; then
+        log "$exp_dir" "Reset $reset_count non-victim services to default images. Waiting for rollouts..."
+        
+        # Wait for all rollouts to complete
+        for service in "${all_services[@]}"; do
+            local is_victim=false
+            for victim in "${victim_array[@]}"; do
+                if [[ "$service" == "$victim" ]]; then
+                    is_victim=true
+                    break
+                fi
+            done
+            
+            if [[ "$is_victim" == "false" ]] && kubectl get deployment "$service" &>/dev/null; then
+                kubectl rollout status deployment/"$service" --timeout=120s 2>/dev/null || \
+                    log "$exp_dir" "    WARNING: Rollout timeout for $service"
+            fi
+        done
+        
+        log "$exp_dir" "Non-victim services reset complete"
+    else
+        log "$exp_dir" "No non-victim services needed resetting"
+    fi
+}
+
 # Deploy victim services on target node
 deploy_victim_services() {
     local services="$1"
@@ -2363,6 +2470,10 @@ run_experiment() {
         export EXPERIMENT_DURATION=$((initial_duration - 10))  # Exclude buffer time
         log "$exp_dir" "Calculated EXPERIMENT_DURATION from burst schedule: ${EXPERIMENT_DURATION}s"
     fi
+    
+    # Reset non-victim services to default images BEFORE deploying victims
+    # This prevents contamination from previous experiments
+    reset_non_victim_services "$VICTIM_SERVICES" "$exp_dir"
     
     # Deploy victim services
     deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
