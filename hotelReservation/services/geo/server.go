@@ -170,11 +170,21 @@ func newGeoIndex(client *mongo.Client) *geoindex.ClusteringIndex {
 		log.Error().Msgf("Failed get geo data: ", err)
 	}
 
+	// Limit geo index size to minimize startup time and query overhead
+	// Only index the first 1000 points - queries return max 5 results anyway
+	const maxGeoIndexPoints = 1000
+	indexedCount := len(points)
+	if indexedCount > maxGeoIndexPoints {
+		indexedCount = maxGeoIndexPoints
+		log.Info().Msgf("Limiting geo index to %d points (total in DB: %d)", maxGeoIndexPoints, len(points))
+	}
+
 	// add points to index
 	index := geoindex.NewClusteringIndex()
-	for _, point := range points {
-		index.Add(point)
+	for i := 0; i < indexedCount; i++ {
+		index.Add(points[i])
 	}
+	log.Info().Msgf("Geo index built with %d points", indexedCount)
 
 	return index
 }
