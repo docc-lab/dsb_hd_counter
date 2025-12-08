@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/interceptor"
@@ -37,6 +38,11 @@ type PerfHandles struct {
 }
 
 const name = "srv-recommendation"
+
+// Max hotel ID to return to clients (for backward compatibility with downstream services)
+// We iterate through all hotels for cache contention, but only return IDs in this range
+// This prevents breaking profile/geo services that have fewer hotels
+const maxReturnedHotelID = 80
 
 // Server implements the recommendation service
 type Server struct {
@@ -144,6 +150,17 @@ func (s *Server) Shutdown() {
 	s.Registry.Deregister(s.uuid)
 }
 
+// isReturnableHotelID checks if a hotel ID should be returned to clients
+// We iterate through all hotels for cache work, but filter results for compatibility
+func isReturnableHotelID(hotelID string) bool {
+	// Parse hotel ID as integer
+	id, err := strconv.Atoi(hotelID)
+	if err != nil {
+		return true // If can't parse, return it anyway
+	}
+	return id <= maxReturnedHotelID
+}
+
 // GiveRecommendation returns recommendations within a given requirement.
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 
@@ -162,6 +179,7 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 			Plon: req.Lon,
 		}
 		min := math.MaxFloat64
+		// First pass: iterate through ALL hotels for cache work
 		for _, hotel := range s.hotels {
 			tmp := float64(geoindex.Distance(p1, &geoindex.GeoPoint{
 				Pid:  "",
@@ -172,37 +190,42 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 				min = tmp
 			}
 		}
+		// Second pass: collect matches, but filter to safe ID range
 		for _, hotel := range s.hotels {
 			tmp := float64(geoindex.Distance(p1, &geoindex.GeoPoint{
 				Pid:  "",
 				Plat: hotel.HLat,
 				Plon: hotel.HLon,
 			})) / 1000
-			if tmp == min {
+			if tmp == min && isReturnableHotelID(hotel.HId) {
 				res.HotelIds = append(res.HotelIds, hotel.HId)
 			}
 		}
 	} else if require == "rate" {
 		max := 0.0
+		// First pass: iterate through ALL hotels for cache work
 		for _, hotel := range s.hotels {
 			if hotel.HRate > max {
 				max = hotel.HRate
 			}
 		}
+		// Second pass: collect matches, but filter to safe ID range
 		for _, hotel := range s.hotels {
-			if hotel.HRate == max {
+			if hotel.HRate == max && isReturnableHotelID(hotel.HId) {
 				res.HotelIds = append(res.HotelIds, hotel.HId)
 			}
 		}
 	} else if require == "price" {
 		min := math.MaxFloat64
+		// First pass: iterate through ALL hotels for cache work
 		for _, hotel := range s.hotels {
 			if hotel.HPrice < min {
 				min = hotel.HPrice
 			}
 		}
+		// Second pass: collect matches, but filter to safe ID range
 		for _, hotel := range s.hotels {
-			if hotel.HPrice == min {
+			if hotel.HPrice == min && isReturnableHotelID(hotel.HId) {
 				res.HotelIds = append(res.HotelIds, hotel.HId)
 			}
 		}
