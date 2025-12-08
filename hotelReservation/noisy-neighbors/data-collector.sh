@@ -304,6 +304,11 @@ update_deployment_for_timing() {
         return 1
     fi
     
+    # Remove command override to allow windowed image ENTRYPOINT (with taskset) to execute
+    log "$exp_dir" "Removing command override to enable taskset CPU pinning"
+    kubectl patch deployment "$service" --type=json -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/command"}]' 2>/dev/null || \
+        log "$exp_dir" "  No command override to remove (already clean)"
+    
     # Set windowed sampling environment variables
     log "$exp_dir" "Setting windowed sampling environment variables for $service"
     
@@ -1015,6 +1020,11 @@ reset_non_victim_services() {
                 
                 # Remove windowed sampling env vars if present
                 kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- ITERATION_ID- 2>/dev/null || true
+                
+                # Restore command override (needed for default image which has no ENTRYPOINT)
+                log "$exp_dir" "    Restoring command override for default image"
+                kubectl patch deployment "$service" --type=json -p="[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"$service\"]}]" 2>/dev/null || \
+                    log "$exp_dir" "    WARNING: Failed to restore command override"
             else
                 log "$exp_dir" "    WARNING: Failed to reset image for $service"
             fi
