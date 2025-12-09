@@ -131,17 +131,12 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 		},
 	}
 
-	// Generate enough hotels for cache contention experiments (default 20,000)
-	// This creates a large in-memory working set in the profile service
-	const hotelCount = 20000
-	
-	for i := 7; i <= hotelCount; i++ {
+	for i := 7; i <= 80; i++ {
 		hotelID := strconv.Itoa(i)
-		phoneNumber := fmt.Sprintf("(415) 284-40%02d", i%100)  // Cycle phone numbers
+		phoneNumber := fmt.Sprintf("(415) 284-40%s", hotelID)
 
-		// Spread hotels across geographic area (match recommendation logic)
-		lat := 37.7835 + float32(i%1000)/500.0*3
-		lon := -122.41 + float32(i%1000)/500.0*4
+		lat := 37.7835 + float32(i)/500.0*3
+		lon := -122.41 + float32(i)/500.0*4
 
 		newProfiles = append(
 			newProfiles,
@@ -163,7 +158,6 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 			},
 		)
 	}
-	log.Info().Msgf("Generated %d hotel profiles (working set for cache experiments)", len(newProfiles))
 
 	uri := fmt.Sprintf("mongodb://%s", url)
 	log.Info().Msgf("Attempting connection to %v", uri)
@@ -176,23 +170,11 @@ func initializeDatabase(url string) (*mongo.Client, func()) {
 	log.Info().Msg("Successfully connected to MongoDB")
 
 	collection := client.Database("profile-db").Collection("hotels")
-	
-	// Insert in batches to avoid MongoDB bulk insert limits
-	log.Info().Msgf("Inserting %d hotels into MongoDB...", len(newProfiles))
-	batchSize := 10000
-	for i := 0; i < len(newProfiles); i += batchSize {
-		end := i + batchSize
-		if end > len(newProfiles) {
-			end = len(newProfiles)
-		}
-		batch := newProfiles[i:end]
-		_, err = collection.InsertMany(context.TODO(), batch)
-		if err != nil {
-			log.Fatal().Msgf("Failed to insert batch %d-%d: %v", i, end, err)
-		}
-		log.Info().Msgf("Inserted hotels %d-%d", i+1, end)
+	_, err = collection.InsertMany(context.TODO(), newProfiles)
+	if err != nil {
+		log.Fatal().Msg(err.Error())
 	}
-	log.Info().Msgf("Successfully inserted %d hotels into profile DB", len(newProfiles))
+	log.Info().Msg("Successfully inserted test data into profile DB")
 
 	return client, func() {
 		if err := client.Disconnect(context.TODO()); err != nil {
