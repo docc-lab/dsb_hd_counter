@@ -42,11 +42,12 @@ const name = "srv-profile"
 
 // Cache contention experiment configuration
 const (
-	maxReturnedHotelID = 80    // Only return IDs 1-80 to avoid breaking downstream services
-	defaultCacheSize   = 5000  // Default working set to access per request (configurable)
-	                           // 5000 hotels × 512 bytes = 2.56 MB > L2 per-core (1.25 MB)
-	defaultRepeatCount = 4     // Number of times to access working set
-	                           // Total accesses: 5000 × 4 = 20,000 accesses per request
+	defaultCacheSize   = 80    // Load all 80 hotels into L1 cache (original hotel count)
+	                           // With 64KB per hotel: 80 × 64 KB = 5.12 MB total memory footprint
+	                           // Bucket size: 8 hotels × 64KB = 512 KB per bucket
+	                           // Typical request: ~5 IDs → ~5 buckets × 512 KB = 2.56 MB > L2 (1.25 MB) ✓
+	defaultRepeatCount = 4     // Times to repeat lookup of requested IDs (keeps data in CPU L3)
+	                           // For N requested IDs: N × 4 lookups (all integrated into business logic)
 )
 
 // Server implements the profile service
@@ -55,11 +56,12 @@ type Server struct {
 
 	uuid string
 
-	// In-memory cache for cache contention experiments
-	// Maps hotel ID -> Hotel with padding for controlled working set size
-	hotelCache map[string]*CachedHotel
-	cacheSize  int
-	repeatAccess int
+	// L1 in-memory cache layer (for cache contention experiments)
+	// Provides fast O(1) lookups while creating controlled memory working set
+	// Multi-tier: L1 (in-memory) → L2 (memcached) → L3 (MongoDB)
+	hotelCache   map[string]*CachedHotel // Maps hotel ID → Hotel with padding
+	cacheSize    int                     // Max hotels in L1 cache (working set size)
+	repeatAccess int                     // Times to repeat each lookup (keeps data in CPU L3)
 
 	Tracer      opentracing.Tracer
 	Port        int
@@ -149,64 +151,89 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		cHandles = C.perf_start()
 	}
 
-	// ========================================
-	// CACHE AMPLIFICATION WORK (Cache Contention Experiment)
-	// ========================================
-	// Access working set multiple times to create cache pressure
-	// - Random map iteration ensures poor cache locality
-	// - Multiple accesses keep data warm in L3 (prevents early eviction)
-	// - Working set > L2 size guarantees L3 usage on non-inclusive caches
-	// - Minimal CPU work (just touching data, no computation)
-	if s.hotelCache != nil && len(s.hotelCache) > 0 {
-		accessCount := 0
-		targetAccesses := s.cacheSize
-		if targetAccesses > len(s.hotelCache) {
-			targetAccesses = len(s.hotelCache)
-		}
-		
-		for round := 0; round < s.repeatAccess; round++ {
-			accessCount = 0
-			for _, cached := range s.hotelCache {
-				// Touch the hotel data to load cache lines
-				// Access actual fields to prevent compiler optimization
-				_ = cached.Hotel.Id
-				_ = cached.Hotel.Name
-				if cached.Hotel.Address != nil {
-					_ = cached.Hotel.Address.Lat + cached.Hotel.Address.Lon
-				}
-				
-				accessCount++
-				if accessCount >= targetAccesses {
-					break
-				}
-			}
-		}
-		log.Trace().Msgf("Cache amplification: accessed %d hotels × %d times = %d total accesses", 
-			accessCount, s.repeatAccess, accessCount * s.repeatAccess)
-	}
-	// ========================================
-	// END CACHE AMPLIFICATION
-	// ========================================
-
-	var wg sync.WaitGroup
-	var mutex sync.Mutex
-
-	// one hotel should only have one profile
+	res := new(pb.Result)
+	hotels := make([]*pb.Hotel, 0)
+	
+	// Deduplicate requested IDs
 	hotelIds := make([]string, 0)
 	profileMap := make(map[string]struct{})
 	for _, hotelId := range req.HotelIds {
-		hotelIds = append(hotelIds, hotelId)
-		profileMap[hotelId] = struct{}{}
+		if _, exists := profileMap[hotelId]; !exists {
+			hotelIds = append(hotelIds, hotelId)
+			profileMap[hotelId] = struct{}{}
+		}
 	}
 
+	// ========================================
+	// L1 CACHE LAYER (In-Memory with Repeated Access)
+	// ========================================
+	// Multi-tier cache: L1 (in-memory) → L2 (memcached) → L3 (MongoDB)
+	// Repeat lookups to keep data warm in CPU L3 cache (prevent early eviction)
+	// Working set size controlled by amount of data in hotelCache (> L2 size)
+	l1Hits := make(map[string]*pb.Hotel)
+	
+	if s.hotelCache != nil && len(s.hotelCache) > 0 {
+		// Repeat lookups on requested IDs to keep them in CPU L3 cache
+		for round := 0; round < s.repeatAccess; round++ {
+			for _, hotelId := range hotelIds {
+				if cached := s.hotelCache[hotelId]; cached != nil {
+					// L1 cache hit - touch the data
+					// Access fields to load cache lines (prevent compiler optimization)
+					_ = cached.Hotel.Id
+					_ = cached.Hotel.Name
+					if cached.Hotel.Address != nil {
+						_ = cached.Hotel.Address.Lat + cached.Hotel.Address.Lon
+					}
+					
+					// Save result only on last iteration
+					if round == s.repeatAccess-1 {
+						l1Hits[hotelId] = cached.Hotel
+					}
+				}
+			}
+		}
+		
+		if len(l1Hits) > 0 {
+			log.Trace().Msgf("L1 cache: %d hits (accessed %d times each)", len(l1Hits), s.repeatAccess)
+		}
+	}
+	
+	// Collect L1 hits
+	for _, hotel := range l1Hits {
+		hotels = append(hotels, hotel)
+		delete(profileMap, hotel.Id)
+	}
+	// ========================================
+	// END L1 CACHE
+	// ========================================
 
+	// L1 misses - check L2 (memcached) and L3 (MongoDB)
+	if len(profileMap) == 0 {
+		// All hits from L1 cache, return immediately
+		res.Hotels = hotels
+		
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
+		
+		return res, nil
+	}
+
+	// Build list of IDs that missed L1
+	missedIds := make([]string, 0, len(profileMap))
+	for hotelId := range profileMap {
+		missedIds = append(missedIds, hotelId)
+	}
+
+	// L2: Check memcached for L1 misses
 	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_profile")
 	memSpan.SetTag("span.kind", "client")
-	resMap, err := s.MemcClient.GetMulti(hotelIds)
+	resMap, err := s.MemcClient.GetMulti(missedIds)
 	memSpan.Finish()
-
-	res := new(pb.Result)
-	hotels := make([]*pb.Hotel, 0)
+	
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
 
 	if err != nil && err != memcache.ErrCacheMiss {
 		log.Panic().Msgf("Tried to get hotelIds [%v], but got memmcached error = %s", hotelIds, err)
@@ -291,27 +318,22 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 type CachedHotel struct {
 	Hotel *pb.Hotel
 	// Padding to increase memory footprint for cache contention experiments
-	// With 448 bytes of padding, each cached hotel = ~512 bytes
-	// 20,000 hotels × 512 bytes = 10.24 MB working set (> L2 per-core size of 1.25 MB)
-	CachePadding [448]byte
+	// With 65472 bytes of padding, each cached hotel = 65536 bytes (64 KB)
+	// Bucket-aware design: 8 hotels per bucket × 64 KB = 512 KB per bucket
+	// Accessing ~5 IDs → ~5 buckets × 512 KB = 2.56 MB > L2 (1.25 MB) ✓
+	CachePadding [65472]byte
 }
 
-// loadHotelCache loads hotels from MongoDB into in-memory cache
-// Loads enough hotels to create working set > L2 size, but not all 20K
+// loadHotelCache loads hotels from MongoDB into in-memory L1 cache
+// Creates working set > L2 size for cache contention experiments
 func (s *Server) loadHotelCache() error {
-	log.Info().Msg("Loading hotel profiles into in-memory cache for cache contention experiments...")
-	
-	// Determine how many hotels to load
-	// Load 2x the access size to allow for variation but avoid loading all 20K
-	maxToLoad := s.cacheSize * 2
-	if maxToLoad > 20000 {
-		maxToLoad = 20000
-	}
+	log.Info().Msg("Loading hotel profiles into in-memory L1 cache...")
 	
 	collection := s.MongoClient.Database("profile-db").Collection("hotels")
 	
-	// Use find with limit to avoid loading all hotels
-	findOpts := options.Find().SetLimit(int64(maxToLoad))
+	// Load up to cacheSize hotels (typically 10,000)
+	// This creates the working set size for cache contention
+	findOpts := options.Find().SetLimit(int64(s.cacheSize))
 	curr, err := collection.Find(context.TODO(), bson.D{}, findOpts)
 	if err != nil {
 		return fmt.Errorf("failed to load hotels: %v", err)
@@ -327,9 +349,12 @@ func (s *Server) loadHotelCache() error {
 		s.hotelCache[hotel.Id] = &CachedHotel{Hotel: hotel}
 	}
 
-	workingSetMB := float64(len(s.hotelCache)) * 512 / 1024 / 1024
-	log.Info().Msgf("Loaded %d hotels into cache (working set: ~%.1f MB, will access %d per request)", 
-		len(s.hotelCache), workingSetMB, s.cacheSize)
+	workingSetMB := float64(len(s.hotelCache)) * 65536 / 1024 / 1024
+	log.Info().Msgf("Loaded %d hotels into L1 cache (total working set: ~%.1f MB)", 
+		len(s.hotelCache), workingSetMB)
+	log.Info().Msgf("Per request: ~5 IDs → ~5 buckets × 8 hotels × 64KB = ~2.56 MB > L2 (1.25 MB)")
+	log.Info().Msgf("Cache configuration: repeat=%d times per lookup (keeps data warm in CPU L3)", 
+		s.repeatAccess)
 	
 	return nil
 }
