@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,7 +83,11 @@ type DurationStats struct {
 	MaxNs  int64 `json:"max_ns"`
 	MeanNs int64 `json:"mean_ns"`
 	P50Ns  int64 `json:"p50_ns"`
-	P95Ns  int64 `json:"p95_ns"`
+	P60Ns  int64 `json:"p60_ns"`
+	P70Ns  int64 `json:"p70_ns"`
+	P75Ns  int64 `json:"p75_ns"`
+	P80Ns  int64 `json:"p80_ns"`
+	P90Ns  int64 `json:"p90_ns"`
 	P99Ns  int64 `json:"p99_ns"`
 	Count  int   `json:"count"`
 }
@@ -483,8 +488,7 @@ func (ws *windowedSampler) aggregateTimingStats() *DurationStats {
 		return &DurationStats{}
 	}
 	
-	// For simplicity, return stats based on processing time
-	// (In a full implementation, you'd compute percentiles properly)
+	// Calculate min, max, and mean
 	var sum int64
 	min := allProcessing[0]
 	max := allProcessing[0]
@@ -501,14 +505,75 @@ func (ws *windowedSampler) aggregateTimingStats() *DurationStats {
 	
 	mean := sum / int64(len(allProcessing))
 	
+	// Sort for percentile calculation
+	sortInt64Slice(allProcessing)
+	
 	return &DurationStats{
 		MinNs:  min,
 		MaxNs:  max,
 		MeanNs: mean,
-		P50Ns:  mean, // Simplified
-		P95Ns:  max,  // Simplified
-		P99Ns:  max,  // Simplified
+		P50Ns:  calculatePercentileInt64(allProcessing, 0.50),
+		P60Ns:  calculatePercentileInt64(allProcessing, 0.60),
+		P70Ns:  calculatePercentileInt64(allProcessing, 0.70),
+		P75Ns:  calculatePercentileInt64(allProcessing, 0.75),
+		P80Ns:  calculatePercentileInt64(allProcessing, 0.80),
+		P90Ns:  calculatePercentileInt64(allProcessing, 0.90),
+		P99Ns:  calculatePercentileInt64(allProcessing, 0.99),
 		Count:  len(allProcessing),
 	}
+}
+
+// sortInt64Slice sorts a slice of int64 values in-place
+// Uses insertion sort for small slices (<50), standard library sort for larger
+func sortInt64Slice(values []int64) {
+	n := len(values)
+	
+	// For small slices, insertion sort is faster due to better cache locality
+	if n < 50 {
+		for i := 1; i < n; i++ {
+			key := values[i]
+			j := i - 1
+			for j >= 0 && values[j] > key {
+				values[j+1] = values[j]
+				j--
+			}
+			values[j+1] = key
+		}
+		return
+	}
+	
+	// For larger slices, use Go's optimized pdqsort
+	sort.Slice(values, func(i, j int) bool {
+		return values[i] < values[j]
+	})
+}
+
+// calculatePercentileInt64 calculates the percentile value from a sorted int64 slice
+// Uses linear interpolation between closest ranks
+// Assumes values is already sorted
+func calculatePercentileInt64(sortedValues []int64, percentile float64) int64 {
+	if len(sortedValues) == 0 {
+		return 0
+	}
+	if len(sortedValues) == 1 {
+		return sortedValues[0]
+	}
+	
+	// Calculate the rank (position in the sorted array)
+	rank := percentile * float64(len(sortedValues)-1)
+	lowerIndex := int(rank)
+	upperIndex := lowerIndex + 1
+	
+	// Handle edge case where rank is exactly at the last index
+	if upperIndex >= len(sortedValues) {
+		return sortedValues[len(sortedValues)-1]
+	}
+	
+	// Linear interpolation between the two closest values
+	fraction := rank - float64(lowerIndex)
+	lower := sortedValues[lowerIndex]
+	upper := sortedValues[upperIndex]
+	
+	return lower + int64(float64(upper-lower)*fraction)
 }
 

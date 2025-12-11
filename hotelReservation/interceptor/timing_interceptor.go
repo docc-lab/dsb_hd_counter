@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,13 @@ type WindowDurationStats struct {
 	MinNs  int64 `json:"min_ns"`
 	MaxNs  int64 `json:"max_ns"`
 	MeanNs int64 `json:"mean_ns"`
+	P50Ns  int64 `json:"p50_ns"`
+	P60Ns  int64 `json:"p60_ns"`
+	P70Ns  int64 `json:"p70_ns"`
+	P75Ns  int64 `json:"p75_ns"`
+	P80Ns  int64 `json:"p80_ns"`
+	P90Ns  int64 `json:"p90_ns"`
+	P99Ns  int64 `json:"p99_ns"`
 	Count  int   `json:"count"`
 }
 
@@ -88,12 +96,81 @@ func calculateWindowDurationStats(durations []time.Duration) WindowDurationStats
 	
 	mean := sum / time.Duration(len(durations))
 	
+	// Calculate percentiles - need to sort the durations
+	// Make a copy to avoid modifying the original slice
+	sortedDurations := make([]time.Duration, len(durations))
+	copy(sortedDurations, durations)
+	sortDurations(sortedDurations)
+	
 	return WindowDurationStats{
 		MinNs:  min.Nanoseconds(),
 		MaxNs:  max.Nanoseconds(),
 		MeanNs: mean.Nanoseconds(),
+		P50Ns:  calculatePercentile(sortedDurations, 0.50).Nanoseconds(),
+		P60Ns:  calculatePercentile(sortedDurations, 0.60).Nanoseconds(),
+		P70Ns:  calculatePercentile(sortedDurations, 0.70).Nanoseconds(),
+		P75Ns:  calculatePercentile(sortedDurations, 0.75).Nanoseconds(),
+		P80Ns:  calculatePercentile(sortedDurations, 0.80).Nanoseconds(),
+		P90Ns:  calculatePercentile(sortedDurations, 0.90).Nanoseconds(),
+		P99Ns:  calculatePercentile(sortedDurations, 0.99).Nanoseconds(),
 		Count:  len(durations),
 	}
+}
+
+// sortDurations sorts a slice of durations in-place
+// Uses insertion sort for small slices (<50), standard library sort for larger
+func sortDurations(durations []time.Duration) {
+	n := len(durations)
+	
+	// For small slices, insertion sort is faster due to better cache locality
+	// and avoids the overhead of sort.Slice
+	if n < 50 {
+		for i := 1; i < n; i++ {
+			key := durations[i]
+			j := i - 1
+			for j >= 0 && durations[j] > key {
+				durations[j+1] = durations[j]
+				j--
+			}
+			durations[j+1] = key
+		}
+		return
+	}
+	
+	// For larger slices, use Go's optimized pdqsort (pattern-defeating quicksort)
+	sort.Slice(durations, func(i, j int) bool {
+		return durations[i] < durations[j]
+	})
+}
+
+// calculatePercentile calculates the percentile value from a sorted slice
+// Uses linear interpolation between closest ranks (standard method)
+// Assumes durations is already sorted
+func calculatePercentile(sortedDurations []time.Duration, percentile float64) time.Duration {
+	if len(sortedDurations) == 0 {
+		return 0
+	}
+	if len(sortedDurations) == 1 {
+		return sortedDurations[0]
+	}
+	
+	// Calculate the rank (position in the sorted array)
+	// rank = percentile * (n - 1) where n is the number of elements
+	rank := percentile * float64(len(sortedDurations)-1)
+	lowerIndex := int(rank)
+	upperIndex := lowerIndex + 1
+	
+	// Handle edge case where rank is exactly at the last index
+	if upperIndex >= len(sortedDurations) {
+		return sortedDurations[len(sortedDurations)-1]
+	}
+	
+	// Linear interpolation between the two closest values
+	fraction := rank - float64(lowerIndex)
+	lower := sortedDurations[lowerIndex]
+	upper := sortedDurations[upperIndex]
+	
+	return lower + time.Duration(float64(upper-lower)*fraction)
 }
 
 // contextKey is used for storing timing data in context
