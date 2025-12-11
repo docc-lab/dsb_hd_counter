@@ -645,6 +645,14 @@ update_iteration_id() {
                 fi
             fi
             
+            # Update PERF_EVENTS to ensure it matches current config (fixes issue where it might be unset)
+            if [[ -n "${PERF_EVENTS:-}" ]]; then
+                log "$exp_dir" "  Setting PERF_EVENTS for $service"
+                if ! kubectl set env "deployment/$service" "PERF_EVENTS=${PERF_EVENTS}"; then
+                    log "$exp_dir" "WARNING: Failed to set PERF_EVENTS for $service"
+                fi
+            fi
+            
             # Restart pods to pick up new iteration ID
             log "$exp_dir" "  Restarting $service pods for new iteration"
             kubectl rollout restart "deployment/$service" 2>/dev/null || true
