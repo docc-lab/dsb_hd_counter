@@ -2079,7 +2079,7 @@ run_iteration() {
     export EXPERIMENT_DURATION=$experiment_duration
     
     # Update iteration ID and duration for all victim services (only needed when windowed sampling is enabled)
-    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]] && [[ $iteration -gt 1 ]]; then
+    if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
         update_iteration_id "$exp_dir" "$iteration" "$VICTIM_SERVICES" "$experiment_duration"
     fi
     
