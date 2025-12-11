@@ -115,12 +115,15 @@ generate_timing_dockerfile() {
     # Determine environment variables based on mode
     local env_vars=""
     if [[ "$mode" == "windowed" ]]; then
+        # Note: PERF_EVENTS should NOT be hardcoded here!
+        # It defaults to 13 events in integration.go ParseWindowedSamplingConfig()
+        # and can be overridden by kubectl set env at deployment time
+        # Setting it here would bake it into the image and prevent dynamic configuration
         env_vars="ENV ENABLE_WINDOWED_SAMPLING=true
 ENV ITERATION_ID=1
 ENV EXPERIMENT_DURATION=30
 ENV WINDOW_INTERVAL_MS=100
 ENV CPU_SET=0,1,2
-ENV PERF_EVENTS=\"cycles,instructions,cache-misses\"
 ENV OUTPUT_DIR=/data"
     else
         env_vars="ENV ENABLE_TIMING=true"
@@ -150,16 +153,19 @@ COPY config.json config.json
 
 WORKDIR /workspace
 
-# Build perf_api static library for CGO
+# Build perf_api static library for CGO (legacy, for basic timing mode)
 RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && \\
     ar rcs services/perf/libperf_api.a services/perf/perf_api.o
 
-# Build perf_api_windowed static library for windowed sampling
+# Build perf_api_windowed static library for windowed sampling (supports dynamic events)
 RUN gcc -c services/perf/perf_api_windowed.c -o services/perf/perf_api_windowed.o && \\
     ar rcs services/perf/libperf_api_windowed.a services/perf/perf_api_windowed.o
 
 # Build the ${service} service (CGO enabled for perf counters)
+# CRITICAL: Link against libperf_api_windowed for windowed mode to support dynamic PERF_EVENTS
 ENV CGO_ENABLED=1
+ENV CGO_LDFLAGS="-L/workspace/services/perf -lperf_api_windowed"
+ENV CGO_CFLAGS="-I/workspace/services/perf"
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 
 # Runtime stage - use Debian for glibc compatibility with CGO binaries
