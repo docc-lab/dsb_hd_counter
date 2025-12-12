@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -205,47 +206,80 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	}
 
 	// ========================================
-	// L1 CACHE LAYER (In-Memory with Repeated Access)
+	// L1 CACHE LAYER (Aggressive Random Access for Cache Contention)
 	// ========================================
-	// Multi-tier cache: L1 (in-memory) → L2 (memcached) → L3 (MongoDB)
-	// Repeat lookups to keep data warm in CPU L3 cache (prevent early eviction)
-	// Working set size controlled by amount of data in hotelCache (> L2 size)
+	// Combined approach for maximum cache pressure:
+	// 1. Access random hotels from cache (defeats spatial locality)
+	// 2. Random padding access pattern (defeats hardware prefetcher)
+	// 3. Multiple repetitions (maximizes cache thrashing)
+	// 4. Then serve actual business logic
 	l1Hits := make(map[string]*pb.Hotel)
 	
 	if s.hotelCache != nil && len(s.hotelCache) > 0 {
-		// Repeat lookups on requested IDs to keep them in CPU L3 cache
+		// Build list of all hotel IDs for random access
+		allCacheIDs := make([]string, 0, len(s.hotelCache))
+		for id := range s.hotelCache {
+			allCacheIDs = append(allCacheIDs, id)
+		}
+		
+		// Determine how many hotels to access (default: all 80)
+		randomAccessCount := len(allCacheIDs)
+		if s.cacheSize > 0 && s.cacheSize < randomAccessCount {
+			randomAccessCount = s.cacheSize
+		}
+		
+		// Pre-generate random padding access indices (defeats prefetcher)
+		const cacheLinesPerHotel = 1024  // 64KB / 64 bytes per cache line
+		randomPaddingIndices := make([]int, cacheLinesPerHotel)
+		for i := 0; i < cacheLinesPerHotel; i++ {
+			randomPaddingIndices[i] = i * 64
+		}
+		rand.Shuffle(len(randomPaddingIndices), func(i, j int) {
+			randomPaddingIndices[i], randomPaddingIndices[j] = randomPaddingIndices[j], randomPaddingIndices[i]
+		})
+		
+		// Multi-round random access
+		sum := 0
 		for round := 0; round < s.repeatAccess; round++ {
-			for _, hotelId := range hotelIds {
-				if cached := s.hotelCache[hotelId]; cached != nil {
-					// L1 cache hit - touch the data
-					// Access fields to load cache lines (prevent compiler optimization)
-					_ = cached.Hotel.Id
-					_ = cached.Hotel.Name
-					if cached.Hotel.Address != nil {
-						_ = cached.Hotel.Address.Lat + cached.Hotel.Address.Lon
-					}
-					
-					// Access every 64 bytes (one cache line) to ensure full 64KB is loaded
-					// This makes cache misses actually affect performance
-					sum := 0
-					for i := 0; i < len(cached.CachePadding); i += 64 {
-						sum += int(cached.CachePadding[i])
-					}
-					// Use sum to prevent compiler from optimizing away the loop
-					if sum > 0x7FFFFFFF {  // Never true, but compiler doesn't know
-						log.Trace().Msgf("Padding accessed: %d", sum)
-					}
-					
-					// Save result only on last iteration
-					if round == s.repeatAccess-1 {
-						l1Hits[hotelId] = cached.Hotel
-					}
+			// Shuffle hotel order each round for maximum randomness
+			rand.Shuffle(len(allCacheIDs), func(i, j int) {
+				allCacheIDs[i], allCacheIDs[j] = allCacheIDs[j], allCacheIDs[i]
+			})
+			
+			// Access random subset of hotels
+			for i := 0; i < randomAccessCount; i++ {
+				hotelId := allCacheIDs[i]
+				cached := s.hotelCache[hotelId]
+				
+				// Touch hotel fields
+				_ = cached.Hotel.Id
+				_ = cached.Hotel.Name
+				if cached.Hotel.Address != nil {
+					_ = cached.Hotel.Address.Lat + cached.Hotel.Address.Lon
+				}
+				
+				// Random padding access (defeats prefetcher)
+				for _, idx := range randomPaddingIndices {
+					sum += int(cached.CachePadding[idx])
 				}
 			}
 		}
 		
+		// Prevent compiler optimization
+		if sum > 0x7FFFFFFF {
+			log.Trace().Msgf("Cache work: %d", sum)
+		}
+		
+		// Now serve actual business logic - lookup requested IDs
+		for _, hotelId := range hotelIds {
+			if cached := s.hotelCache[hotelId]; cached != nil {
+				l1Hits[hotelId] = cached.Hotel
+			}
+		}
+		
 		if len(l1Hits) > 0 {
-			log.Trace().Msgf("L1 cache: %d hits (accessed %d times each)", len(l1Hits), s.repeatAccess)
+			log.Trace().Msgf("L1 cache: %d hits (random access: %d hotels × %d repeats × 1024 cache lines)", 
+				len(l1Hits), randomAccessCount, s.repeatAccess)
 		}
 	}
 	
