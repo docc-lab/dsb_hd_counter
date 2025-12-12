@@ -225,6 +225,17 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 						_ = cached.Hotel.Address.Lat + cached.Hotel.Address.Lon
 					}
 					
+					// Access every 64 bytes (one cache line) to ensure full 64KB is loaded
+					// This makes cache misses actually affect performance
+					sum := 0
+					for i := 0; i < len(cached.CachePadding); i += 64 {
+						sum += int(cached.CachePadding[i])
+					}
+					// Use sum to prevent compiler from optimizing away the loop
+					if sum > 0x7FFFFFFF {  // Never true, but compiler doesn't know
+						log.Trace().Msgf("Padding accessed: %d", sum)
+					}
+					
 					// Save result only on last iteration
 					if round == s.repeatAccess-1 {
 						l1Hits[hotelId] = cached.Hotel
