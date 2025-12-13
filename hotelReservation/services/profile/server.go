@@ -206,13 +206,14 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	}
 
 	// ========================================
-	// L1 CACHE LAYER (Aggressive Random Access for Cache Contention)
+	// L1 CACHE LAYER (Balanced Random Access for Cache Contention)
 	// ========================================
-	// Combined approach for maximum cache pressure:
+	// Balanced approach for cache pressure without excessive overhead:
 	// 1. Access random hotels from cache (defeats spatial locality)
-	// 2. Random padding access pattern (defeats hardware prefetcher)
-	// 3. Multiple repetitions (maximizes cache thrashing)
+	// 2. Sample padding with random pattern (defeats prefetcher, reduces overhead)
+	// 3. Multiple repetitions (keeps data warm in CPU L3)
 	// 4. Then serve actual business logic
+	// Total: 80 hotels × 64 sampled cache lines × 4 repeats = 20,480 accesses (~3-5ms overhead)
 	l1Hits := make(map[string]*pb.Hotel)
 	
 	if s.hotelCache != nil && len(s.hotelCache) > 0 {
@@ -228,11 +229,13 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 			randomAccessCount = s.cacheSize
 		}
 		
-		// Pre-generate random padding access indices (defeats prefetcher)
-		const cacheLinesPerHotel = 1024  // 64KB / 64 bytes per cache line
-		randomPaddingIndices := make([]int, cacheLinesPerHotel)
-		for i := 0; i < cacheLinesPerHotel; i++ {
-			randomPaddingIndices[i] = i * 64
+		// Sample padding at reduced rate to avoid excessive overhead
+		// Access every Nth cache line instead of all 1024
+		const paddingSampleRate = 16  // Access 1024/16 = 64 cache lines per hotel
+		const sampledCacheLines = 64
+		randomPaddingIndices := make([]int, sampledCacheLines)
+		for i := 0; i < sampledCacheLines; i++ {
+			randomPaddingIndices[i] = i * 64 * paddingSampleRate  // 0, 1024, 2048, ...
 		}
 		rand.Shuffle(len(randomPaddingIndices), func(i, j int) {
 			randomPaddingIndices[i], randomPaddingIndices[j] = randomPaddingIndices[j], randomPaddingIndices[i]
@@ -278,7 +281,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		}
 		
 		if len(l1Hits) > 0 {
-			log.Trace().Msgf("L1 cache: %d hits (random access: %d hotels × %d repeats × 1024 cache lines)", 
+			log.Trace().Msgf("L1 cache: %d hits (random access: %d hotels × %d repeats × 64 sampled cache lines)", 
 				len(l1Hits), randomAccessCount, s.repeatAccess)
 		}
 	}
