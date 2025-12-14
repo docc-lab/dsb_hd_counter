@@ -259,7 +259,10 @@ func (ws *windowedSampler) takeSample() {
 		// Got timing data
 	default:
 		// No timing data yet, use empty stats
-		timingStats = &interceptor.WindowTimingStats{RequestCount: 0}
+		timingStats = &interceptor.WindowTimingStats{
+			ArrivalCount: 0,
+			RequestCount: 0,
+		}
 	}
 	
 	sample := Sample{

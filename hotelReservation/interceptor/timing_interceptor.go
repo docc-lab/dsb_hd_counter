@@ -38,6 +38,7 @@ type TimingConfig struct {
 type TimingData struct {
 	ServiceName    string        `json:"service_name"`
 	Method         string        `json:"method"`
+	IsArrival      bool          `json:"is_arrival"`         // true = arrival event, false = completion event
 	ArrivalTime    time.Time     `json:"arrival_time"`
 	ProcessingTime time.Duration `json:"processing_time_ns"` // Time spent in actual processing (excluding blocking calls)
 	TotalTime      time.Duration `json:"total_time_ns"`      // Total time including blocking calls
@@ -47,7 +48,8 @@ type TimingData struct {
 
 // WindowTimingStats captures timing data for requests in one window interval
 type WindowTimingStats struct {
-	RequestCount   int                 `json:"request_count"`
+	ArrivalCount   int                 `json:"arrival_count"`   // Requests that arrived in this window (sampled at window boundary)
+	RequestCount   int                 `json:"request_count"`   // Requests that completed in this window
 	ProcessingTime WindowDurationStats `json:"processing_time"`
 	TotalTime      WindowDurationStats `json:"total_time"`
 	BlockingTime   WindowDurationStats `json:"blocking_time"`
@@ -70,7 +72,8 @@ type WindowDurationStats struct {
 
 // TimingAggregator is the interface for timing data collection implementations
 type TimingAggregator interface {
-	AddTimingData(data TimingData)
+	RecordArrival()            // Increments arrival counter (sampled per window)
+	AddTimingData(data TimingData) // Records completed request timing
 	Stop()
 }
 
@@ -198,6 +201,10 @@ type timingContext struct {
 // Uses object pooling and deferred submission to eliminate request path overhead
 func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		// RECORD ARRIVAL: Increment arrival counter for this window
+		// This happens at request arrival, synchronized with window boundary sampling
+		aggregator.RecordArrival()
+		
 		// Get objects from pool (zero allocation in steady state)
 		timingData := timingDataPool.Get().(*TimingData)
 		timingCtx := timingContextPool.Get().(*timingContext)
@@ -208,6 +215,7 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 		// Initialize timing data (reuse pooled object)
 		timingData.ServiceName = serviceName
 		timingData.Method = info.FullMethod
+		timingData.IsArrival = false // This is a completion event
 		timingData.ArrivalTime = arrivalTime
 		timingData.Timestamp = arrivalTime
 		

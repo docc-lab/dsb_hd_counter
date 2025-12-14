@@ -17,7 +17,9 @@ type RingBufferTimingAggregator struct {
 	windowInterval     time.Duration
 	windowStatsChannel chan *WindowTimingStats
 	
-	// Input channel for timing data (non-blocking writes)
+	// Input channel for timing data (both arrivals and completions)
+	// Arrival events: IsArrival=true, minimal data
+	// Completion events: IsArrival=false, full timing data
 	timingDataChan     chan TimingData
 	
 	// Flush control
@@ -121,6 +123,21 @@ func parseFlushThreshold(thresholdStr string, defaultPct int) int {
 	return threshold
 }
 
+// RecordArrival records an arrival event to the ring buffer
+// Called by server interceptor at request start (arrival)
+// Pushes a minimal event (IsArrival=true) through the same channel as completions
+func (rba *RingBufferTimingAggregator) RecordArrival() {
+	// Create minimal arrival event
+	arrivalEvent := TimingData{
+		IsArrival: true,
+		Timestamp: time.Now(),
+	}
+	
+	// Push through the same channel as completions
+	// Non-blocking send with same huge buffer (100k capacity)
+	rba.timingDataChan <- arrivalEvent
+}
+
 // AddTimingData adds timing data via buffered channel (BLOCKING but fast!)
 // This is called by MANY concurrent gRPC requests
 // Uses blocking send to huge channel - faster than select/default
@@ -180,24 +197,39 @@ func (rba *RingBufferTimingAggregator) windowedFlushLoop() {
 
 // flushWindow is called at END OF WINDOW INTERVAL
 // It reads all data accumulated since last window and advances tail pointer
+// Separates arrival events from completion events by checking IsArrival flag
 func (rba *RingBufferTimingAggregator) flushWindow() {
-	// Pop all data accumulated in this window (advances tail pointer)
-	// This is the ONLY place we read from the ring buffer
+	// Pop all events (both arrivals and completions) from ring buffer
 	windowData := rba.ringBuffer.PopAll()
 	
 	if len(windowData) == 0 {
-		// No data in this window, send empty stats
+		// No activity in this window, send empty stats
 		if rba.windowStatsChannel != nil {
 			select {
-			case rba.windowStatsChannel <- &WindowTimingStats{RequestCount: 0}:
+			case rba.windowStatsChannel <- &WindowTimingStats{
+				ArrivalCount: 0,
+				RequestCount: 0,
+			}:
 			default:
 			}
 		}
 		return
 	}
 	
-	// Calculate aggregated window statistics directly from ring buffer data
-	stats := rba.calculateWindowStats(windowData)
+	// Separate arrivals from completions
+	arrivalCount := 0
+	completions := make([]TimingData, 0, len(windowData))
+	
+	for _, event := range windowData {
+		if event.IsArrival {
+			arrivalCount++
+		} else {
+			completions = append(completions, event)
+		}
+	}
+	
+	// Calculate aggregated window statistics from completion data
+	stats := rba.calculateWindowStats(completions, arrivalCount)
 	
 	// Send aggregated stats to windowed sampler (non-blocking)
 	if rba.windowStatsChannel != nil {
@@ -207,16 +239,23 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 		default:
 			log.Warn().
 				Str("service", rba.serviceName).
-				Int("request_count", stats.RequestCount).
+				Int("arrival_count", stats.ArrivalCount).
+				Int("completion_count", stats.RequestCount).
 				Msg("Window stats channel full, dropping window stats")
 		}
 	}
 }
 
 // calculateWindowStats calculates statistics for one window
-func (rba *RingBufferTimingAggregator) calculateWindowStats(data []TimingData) *WindowTimingStats {
+// arrivalCount: number of requests that arrived (started) in this window
+// data: timing data for requests that completed in this window
+func (rba *RingBufferTimingAggregator) calculateWindowStats(data []TimingData, arrivalCount int) *WindowTimingStats {
 	if len(data) == 0 {
-		return &WindowTimingStats{RequestCount: 0}
+		// No completions, but may have arrivals (requests still in flight)
+		return &WindowTimingStats{
+			ArrivalCount: arrivalCount,
+			RequestCount: 0,
+		}
 	}
 	
 	processingTimes := make([]time.Duration, len(data))
@@ -230,6 +269,7 @@ func (rba *RingBufferTimingAggregator) calculateWindowStats(data []TimingData) *
 	}
 	
 	return &WindowTimingStats{
+		ArrivalCount:   arrivalCount,
 		RequestCount:   len(data),
 		ProcessingTime: calculateWindowDurationStats(processingTimes),
 		TotalTime:      calculateWindowDurationStats(totalTimes),
