@@ -69,6 +69,129 @@ STRESS_SCRIPT="$SCRIPTS_DIR/stress-ng/stress-ng-helpers.sh"
 TAINT_SCRIPT="$SCRIPTS_DIR/node-taint.sh"
 SHAPES_SCRIPT="$SCRIPTS_DIR/contention-shapes.sh"
 
+# CPU cycle counter configuration
+CYCLE_COUNTER_SOURCE="$SCRIPTS_DIR/cycle_counter.c"
+CYCLE_COUNTER_BIN="$SCRIPTS_DIR/cycle_counter"
+CYCLE_COUNTER_CPU="${CYCLE_COUNTER_CPU:-0}"  # Pin to CPU 0 by default
+
+# Compile cycle counter
+compile_cycle_counter() {
+    local exp_dir="$1"
+    
+    if [[ ! -f "$CYCLE_COUNTER_SOURCE" ]]; then
+        log "$exp_dir" "WARNING: Cycle counter source not found at $CYCLE_COUNTER_SOURCE"
+        return 1
+    fi
+    
+    log "$exp_dir" "Compiling CPU cycle counter..."
+    if gcc -O2 -o "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_SOURCE" -pthread 2>&1 | tee -a "$exp_dir/experiment.log"; then
+        log "$exp_dir" "Cycle counter compiled successfully: $CYCLE_COUNTER_BIN"
+        return 0
+    else
+        log "$exp_dir" "ERROR: Failed to compile cycle counter"
+        return 1
+    fi
+}
+
+# Start cycle measurement
+start_cycle_measurement() {
+    local exp_dir="$1"
+    local iteration="$2"
+    
+    if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
+        log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
+        return 1
+    fi
+    
+    local start_file="$exp_dir/metadata/cycles_start_iter${iteration}.txt"
+    log "$exp_dir" "Starting cycle measurement for iteration $iteration (pinned to CPU $CYCLE_COUNTER_CPU)"
+    
+    if "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_CPU" "$start_file" >> "$exp_dir/experiment.log" 2>&1; then
+        if [[ -f "$start_file" ]]; then
+            local cycles=$(cut -d',' -f1 "$start_file")
+            local freq=$(cut -d',' -f2 "$start_file")
+            log "$exp_dir" "  Start cycles: $cycles (CPU freq: ${freq} MHz)"
+            return 0
+        fi
+    fi
+    
+    log "$exp_dir" "WARNING: Failed to record start cycles"
+    return 1
+}
+
+# End cycle measurement and calculate results
+end_cycle_measurement() {
+    local exp_dir="$1"
+    local iteration="$2"
+    local duration_sec="$3"  # Actual duration in seconds
+    
+    if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
+        log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
+        return 1
+    fi
+    
+    local start_file="$exp_dir/metadata/cycles_start_iter${iteration}.txt"
+    local end_file="$exp_dir/metadata/cycles_end_iter${iteration}.txt"
+    local result_file="$exp_dir/metadata/cycles_result_iter${iteration}.txt"
+    
+    if [[ ! -f "$start_file" ]]; then
+        log "$exp_dir" "WARNING: Start cycles file not found for iteration $iteration"
+        return 1
+    fi
+    
+    log "$exp_dir" "Ending cycle measurement for iteration $iteration"
+    
+    if "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_CPU" "$end_file" >> "$exp_dir/experiment.log" 2>&1; then
+        if [[ -f "$end_file" ]]; then
+            # Parse start and end measurements
+            local start_cycles=$(cut -d',' -f1 "$start_file")
+            local start_freq=$(cut -d',' -f2 "$start_file")
+            local start_overhead=$(cut -d',' -f3 "$start_file")
+            
+            local end_cycles=$(cut -d',' -f1 "$end_file")
+            local end_freq=$(cut -d',' -f2 "$end_file")
+            local end_overhead=$(cut -d',' -f3 "$end_file")
+            
+            # Calculate total cycles (subtracting overhead)
+            local total_overhead=$((start_overhead + end_overhead))
+            local raw_cycles=$((end_cycles - start_cycles))
+            local net_cycles=$((raw_cycles - total_overhead))
+            
+            # Calculate cycles per second using average frequency
+            local avg_freq=$(awk "BEGIN {printf \"%.2f\", ($start_freq + $end_freq) / 2}")
+            local cycles_per_sec=$(awk "BEGIN {printf \"%.0f\", $net_cycles / $duration_sec}")
+            
+            # Write results
+            {
+                echo "=== CPU CYCLE MEASUREMENT - ITERATION $iteration ==="
+                echo "Duration: ${duration_sec}s"
+                echo ""
+                echo "Start cycles: $start_cycles"
+                echo "End cycles: $end_cycles"
+                echo "Raw cycle delta: $raw_cycles"
+                echo "Measurement overhead: $total_overhead cycles"
+                echo "Net cycles: $net_cycles"
+                echo ""
+                echo "Average CPU frequency: ${avg_freq} MHz"
+                echo "Cycles per second: $cycles_per_sec"
+                echo ""
+                echo "Note: RDTSC counts at nominal CPU frequency (~${avg_freq} MHz)"
+                echo "      Measurement pinned to CPU $CYCLE_COUNTER_CPU"
+            } > "$result_file"
+            
+            log "$exp_dir" "  End cycles: $end_cycles"
+            log "$exp_dir" "  Total cycles: $net_cycles"
+            log "$exp_dir" "  Cycles per second: $cycles_per_sec"
+            log "$exp_dir" "  Results saved to: $result_file"
+            
+            return 0
+        fi
+    fi
+    
+    log "$exp_dir" "WARNING: Failed to record end cycles"
+    return 1
+}
+
 # Generate unique experiment ID
 generate_exp_id() {
     echo "exp_$(date +%Y%m%d_%H%M%S)_$(uuidgen | cut -d'-' -f1)"
@@ -2098,6 +2221,9 @@ run_iteration() {
     local iteration_start=$(date +%s)
     echo "$iteration_start" > "$exp_dir/metadata/iteration_${iteration}_start.txt"
     
+    # Start CPU cycle measurement
+    start_cycle_measurement "$exp_dir" "$iteration"
+    
     # Start workload generation early (at +5s)
     log "$exp_dir" "Waiting 5s before starting workload generation..."
     sleep 5
@@ -2158,6 +2284,9 @@ run_iteration() {
     # Calculate actual duration
     local actual_duration=$((iteration_end - iteration_start))
     log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
+    
+    # End CPU cycle measurement and calculate results
+    end_cycle_measurement "$exp_dir" "$iteration" "$actual_duration"
     
     # Wait a bit more for data to be written to disk
     log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
@@ -2410,6 +2539,65 @@ aggregate_data() {
         } > "$exp_dir/processed/latency_summary.txt"
     fi
     
+    # Aggregate CPU cycle measurements
+    if ls "$exp_dir/metadata/cycles_result_iter"*.txt 1> /dev/null 2>&1; then
+        {
+            echo "=== AGGREGATED CPU CYCLE MEASUREMENTS ==="
+            echo "Generated: $(date -Iseconds)"
+            echo ""
+            echo "Measurement pinned to CPU $CYCLE_COUNTER_CPU"
+            echo "Using RDTSC (Read Time-Stamp Counter) with serialization"
+            echo ""
+            
+            for i in $(seq 1 $total_iterations); do
+                local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
+                if [[ -f "$result_file" ]]; then
+                    cat "$result_file"
+                    echo ""
+                    echo "────────────────────────────────────────────────────────────"
+                    echo ""
+                fi
+            done
+            
+            # Calculate summary statistics
+            echo "=== SUMMARY STATISTICS ==="
+            echo ""
+            
+            local total_cycles=0
+            local total_duration=0
+            local count=0
+            
+            for i in $(seq 1 $total_iterations); do
+                local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
+                if [[ -f "$result_file" ]]; then
+                    local cycles=$(grep "^Net cycles:" "$result_file" | awk '{print $3}')
+                    local duration=$(grep "^Duration:" "$result_file" | awk '{print $2}' | sed 's/s//')
+                    
+                    if [[ -n "$cycles" && -n "$duration" ]]; then
+                        total_cycles=$((total_cycles + cycles))
+                        total_duration=$((total_duration + duration))
+                        count=$((count + 1))
+                    fi
+                fi
+            done
+            
+            if [[ $count -gt 0 ]]; then
+                local avg_cycles=$((total_cycles / count))
+                local avg_cycles_per_sec=$((total_cycles / total_duration))
+                
+                echo "Total iterations measured: $count"
+                echo "Total cycles across all iterations: $total_cycles"
+                echo "Total duration across all iterations: ${total_duration}s"
+                echo "Average cycles per iteration: $avg_cycles"
+                echo "Average cycles per second: $avg_cycles_per_sec"
+            else
+                echo "No cycle measurements found"
+            fi
+        } > "$exp_dir/processed/cycles_summary.txt"
+        
+        log "$exp_dir" "CPU cycle summary: $exp_dir/processed/cycles_summary.txt"
+    fi
+    
     # Create experiment summary
     {
         echo "=== EXPERIMENT SUMMARY ==="
@@ -2433,6 +2621,21 @@ aggregate_data() {
             echo "  Perf events: ${PERF_EVENTS}"
             local windowed_services=$(ls -d "$exp_dir/raw/windowed/"*/ 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
             echo "  Services with windowed data: $windowed_services"
+        fi
+        
+        # Check if cycle measurements were collected
+        local cycle_measurements_count=0
+        if ls "$exp_dir/metadata/cycles_result_iter"*.txt 1> /dev/null 2>&1; then
+            cycle_measurements_count=$(ls "$exp_dir/metadata/cycles_result_iter"*.txt 2>/dev/null | wc -l)
+        fi
+        
+        echo ""
+        echo "CPU Cycle Measurements: $([[ $cycle_measurements_count -gt 0 ]] && echo "enabled" || echo "disabled")"
+        if [[ $cycle_measurements_count -gt 0 ]]; then
+            echo "  Iterations measured: $cycle_measurements_count"
+            echo "  Method: RDTSC (Read Time-Stamp Counter)"
+            echo "  CPU pinning: CPU $CYCLE_COUNTER_CPU"
+            echo "  Summary: processed/cycles_summary.txt"
         fi
         
         echo ""
@@ -2707,6 +2910,9 @@ EXAMPLE_EOF
     # Create experiment directory
     local exp_dir=$(create_exp_directory "$exp_id")
     echo "Experiment directory: $exp_dir"
+    
+    # Compile cycle counter
+    compile_cycle_counter "$exp_dir" || echo "WARNING: Cycle counter compilation failed, will skip cycle measurements"
     
     # Generate metadata
     generate_metadata "$config_file" "$exp_dir" "$exp_id"
