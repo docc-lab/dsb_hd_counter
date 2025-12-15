@@ -74,52 +74,48 @@ CYCLE_COUNTER_SOURCE="$SCRIPTS_DIR/cycle_counter.c"
 CYCLE_COUNTER_BIN="$SCRIPTS_DIR/cycle_counter"
 CYCLE_COUNTER_CPUS=""  # Will be auto-detected from victim service CPU affinity
 
-# Detect CPU affinity of victim service pod using taskset
+# Calculate CPU allocation for victim service using same logic as deployment
 # Returns: space-separated list of CPU IDs (e.g., "0 1 2")
-detect_victim_cpu_affinity() {
+calculate_victim_cpu_allocation() {
     local exp_dir="$1"
     local service="$2"
     
-    log "$exp_dir" "Detecting CPU affinity for $service..."
+    log "$exp_dir" "Calculating CPU allocation for $service..."
     
-    # Get pod name
-    local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    # Find service index in VALID_TIMING_SERVICES
+    local service_index=-1
+    for idx in "${!VALID_TIMING_SERVICES[@]}"; do
+        if [[ "${VALID_TIMING_SERVICES[$idx]}" == "$service" ]]; then
+            service_index=$idx
+            break
+        fi
+    done
     
-    if [[ -z "$pod_name" ]]; then
-        log "$exp_dir" "WARNING: No pod found for service $service"
+    if [[ $service_index -eq -1 ]]; then
+        log "$exp_dir" "WARNING: Service $service not found in VALID_TIMING_SERVICES"
         return 1
     fi
     
-    # Get CPU affinity using taskset
-    local affinity=$(kubectl exec "$pod_name" -- taskset -p 1 2>/dev/null | grep "current affinity mask" | awk '{print $NF}')
+    # Calculate CPU range using same logic as deployment
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
     
-    if [[ -z "$affinity" ]]; then
-        log "$exp_dir" "WARNING: Could not detect CPU affinity for $service"
-        return 1
-    fi
+    # Build space-separated CPU list
+    local cpu_list=""
+    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
+        if [[ -z "$cpu_list" ]]; then
+            cpu_list="$cpu"
+        else
+            cpu_list="$cpu_list $cpu"
+        fi
+    done
     
-    log "$exp_dir" "  Raw affinity mask: $affinity"
+    log "$exp_dir" "  Service index: $service_index"
+    log "$exp_dir" "  CPU range: $cpu_start-$cpu_end"
+    log "$exp_dir" "  CPU list: $cpu_list"
     
-    # Convert hex mask to CPU list
-    local cpu_list=$(python3 -c "
-mask = int('$affinity', 16) if '$affinity'.startswith('0x') else int('$affinity', 16)
-cpus = [str(i) for i in range(64) if mask & (1 << i)]
-print(' '.join(cpus))
-" 2>/dev/null)
-    
-    if [[ -z "$cpu_list" ]]; then
-        # Fallback: try parsing affinity list format
-        cpu_list=$(kubectl exec "$pod_name" -- taskset -cp 1 2>/dev/null | grep "current affinity list" | awk -F': ' '{print $2}' | tr ',' ' ')
-    fi
-    
-    if [[ -n "$cpu_list" ]]; then
-        log "$exp_dir" "  Detected CPUs: $cpu_list"
-        echo "$cpu_list"
-        return 0
-    else
-        log "$exp_dir" "WARNING: Failed to parse CPU affinity"
-        return 1
-    fi
+    echo "$cpu_list"
+    return 0
 }
 
 # Compile cycle counter
@@ -2319,18 +2315,18 @@ run_iteration() {
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
-    # Detect CPU affinity of victim service for cycle measurement
+    # Calculate CPU allocation for victim service (for cycle measurement)
     local victim_cpus=""
     if [[ -n "$VICTIM_SERVICES" ]]; then
         # Get first (and only) victim service
         local victim_service=$(echo "$VICTIM_SERVICES" | awk '{print $1}')
-        victim_cpus=$(detect_victim_cpu_affinity "$exp_dir" "$victim_service")
+        victim_cpus=$(calculate_victim_cpu_allocation "$exp_dir" "$victim_service")
         
         if [[ -n "$victim_cpus" ]]; then
             log "$exp_dir" "Will measure cycles on victim service CPUs: $victim_cpus"
             echo "$victim_cpus" > "$exp_dir/metadata/cycle_measurement_cpus_iter${iteration}.txt"
         else
-            log "$exp_dir" "WARNING: Could not detect victim service CPU affinity, skipping cycle measurements"
+            log "$exp_dir" "WARNING: Could not calculate victim service CPU allocation, skipping cycle measurements"
         fi
     fi
     
