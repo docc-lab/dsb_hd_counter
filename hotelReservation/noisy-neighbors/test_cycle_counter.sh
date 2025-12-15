@@ -64,7 +64,11 @@ echo "  End cycles: $END_CYCLES (freq: ${END_FREQ} MHz)"
 DELTA=$((END_CYCLES - START_CYCLES))
 AVG_FREQ=$(awk "BEGIN {printf \"%.2f\", ($START_FREQ + $END_FREQ) / 2}")
 EXPECTED_CYCLES=$(awk "BEGIN {printf \"%.0f\", $AVG_FREQ * 1000000 * 2}")  # 2 seconds
-DEVIATION=$(awk "BEGIN {printf \"%.1f\", abs(($DELTA - $EXPECTED_CYCLES) / $EXPECTED_CYCLES * 100)}")
+# Calculate absolute deviation (awk may not have abs function)
+DEVIATION=$(awk "BEGIN {
+    diff = ($DELTA - $EXPECTED_CYCLES) / $EXPECTED_CYCLES * 100;
+    printf \"%.1f\", (diff < 0) ? -diff : diff
+}")
 
 echo ""
 echo "Results:"
