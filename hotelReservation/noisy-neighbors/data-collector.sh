@@ -72,7 +72,55 @@ SHAPES_SCRIPT="$SCRIPTS_DIR/contention-shapes.sh"
 # CPU cycle counter configuration
 CYCLE_COUNTER_SOURCE="$SCRIPTS_DIR/cycle_counter.c"
 CYCLE_COUNTER_BIN="$SCRIPTS_DIR/cycle_counter"
-CYCLE_COUNTER_CPU="${CYCLE_COUNTER_CPU:-0}"  # Pin to CPU 0 by default
+CYCLE_COUNTER_CPUS=""  # Will be auto-detected from victim service CPU affinity
+
+# Detect CPU affinity of victim service pod using taskset
+# Returns: space-separated list of CPU IDs (e.g., "0 1 2")
+detect_victim_cpu_affinity() {
+    local exp_dir="$1"
+    local service="$2"
+    
+    log "$exp_dir" "Detecting CPU affinity for $service..."
+    
+    # Get pod name
+    local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    
+    if [[ -z "$pod_name" ]]; then
+        log "$exp_dir" "WARNING: No pod found for service $service"
+        return 1
+    fi
+    
+    # Get CPU affinity using taskset
+    local affinity=$(kubectl exec "$pod_name" -- taskset -p 1 2>/dev/null | grep "current affinity mask" | awk '{print $NF}')
+    
+    if [[ -z "$affinity" ]]; then
+        log "$exp_dir" "WARNING: Could not detect CPU affinity for $service"
+        return 1
+    fi
+    
+    log "$exp_dir" "  Raw affinity mask: $affinity"
+    
+    # Convert hex mask to CPU list
+    local cpu_list=$(python3 -c "
+mask = int('$affinity', 16) if '$affinity'.startswith('0x') else int('$affinity', 16)
+cpus = [str(i) for i in range(64) if mask & (1 << i)]
+print(' '.join(cpus))
+" 2>/dev/null)
+    
+    if [[ -z "$cpu_list" ]]; then
+        # Fallback: try parsing affinity list format
+        cpu_list=$(kubectl exec "$pod_name" -- taskset -cp 1 2>/dev/null | grep "current affinity list" | awk -F': ' '{print $2}' | tr ',' ' ')
+    fi
+    
+    if [[ -n "$cpu_list" ]]; then
+        log "$exp_dir" "  Detected CPUs: $cpu_list"
+        echo "$cpu_list"
+        return 0
+    else
+        log "$exp_dir" "WARNING: Failed to parse CPU affinity"
+        return 1
+    fi
+}
 
 # Compile cycle counter
 compile_cycle_counter() {
@@ -93,30 +141,47 @@ compile_cycle_counter() {
     fi
 }
 
-# Start cycle measurement
+# Start cycle measurement (multi-core)
 start_cycle_measurement() {
     local exp_dir="$1"
     local iteration="$2"
+    local cpu_list="$3"  # Space-separated list of CPUs
     
     if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
         log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
         return 1
     fi
     
-    local start_file="$exp_dir/metadata/cycles_start_iter${iteration}.txt"
-    log "$exp_dir" "Starting cycle measurement for iteration $iteration (pinned to CPU $CYCLE_COUNTER_CPU)"
-    
-    if "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_CPU" "$start_file" >> "$exp_dir/experiment.log" 2>&1; then
-        if [[ -f "$start_file" ]]; then
-            local cycles=$(cut -d',' -f1 "$start_file")
-            local freq=$(cut -d',' -f2 "$start_file")
-            log "$exp_dir" "  Start cycles: $cycles (CPU freq: ${freq} MHz)"
-            return 0
-        fi
+    if [[ -z "$cpu_list" ]]; then
+        log "$exp_dir" "WARNING: No CPU list provided for cycle measurement"
+        return 1
     fi
     
-    log "$exp_dir" "WARNING: Failed to record start cycles"
-    return 1
+    log "$exp_dir" "Starting cycle measurement for iteration $iteration"
+    log "$exp_dir" "  Monitoring CPUs: $cpu_list"
+    
+    local success=0
+    for cpu in $cpu_list; do
+        local start_file="$exp_dir/metadata/cycles_start_iter${iteration}_cpu${cpu}.txt"
+        
+        if "$CYCLE_COUNTER_BIN" "$cpu" "$start_file" >> "$exp_dir/experiment.log" 2>&1; then
+            if [[ -f "$start_file" ]]; then
+                local cycles=$(cut -d',' -f1 "$start_file")
+                local freq=$(cut -d',' -f2 "$start_file")
+                log "$exp_dir" "  CPU $cpu start cycles: $cycles (freq: ${freq} MHz)"
+                success=1
+            fi
+        else
+            log "$exp_dir" "  WARNING: Failed to record start cycles for CPU $cpu"
+        fi
+    done
+    
+    if [[ $success -eq 1 ]]; then
+        return 0
+    else
+        log "$exp_dir" "WARNING: Failed to record start cycles for any CPU"
+        return 1
+    fi
 }
 
 # End cycle measurement and calculate results (multi-core)
