@@ -119,77 +119,114 @@ start_cycle_measurement() {
     return 1
 }
 
-# End cycle measurement and calculate results
+# End cycle measurement and calculate results (multi-core)
 end_cycle_measurement() {
     local exp_dir="$1"
     local iteration="$2"
     local duration_sec="$3"  # Actual duration in seconds
+    local cpu_list="$4"  # Space-separated list of CPUs
     
     if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
         log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
         return 1
     fi
     
-    local start_file="$exp_dir/metadata/cycles_start_iter${iteration}.txt"
-    local end_file="$exp_dir/metadata/cycles_end_iter${iteration}.txt"
-    local result_file="$exp_dir/metadata/cycles_result_iter${iteration}.txt"
-    
-    if [[ ! -f "$start_file" ]]; then
-        log "$exp_dir" "WARNING: Start cycles file not found for iteration $iteration"
+    if [[ -z "$cpu_list" ]]; then
+        log "$exp_dir" "WARNING: No CPU list provided for cycle measurement"
         return 1
     fi
     
     log "$exp_dir" "Ending cycle measurement for iteration $iteration"
     
-    if "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_CPU" "$end_file" >> "$exp_dir/experiment.log" 2>&1; then
-        if [[ -f "$end_file" ]]; then
-            # Parse start and end measurements
-            local start_cycles=$(cut -d',' -f1 "$start_file")
-            local start_freq=$(cut -d',' -f2 "$start_file")
-            local start_overhead=$(cut -d',' -f3 "$start_file")
-            
-            local end_cycles=$(cut -d',' -f1 "$end_file")
-            local end_freq=$(cut -d',' -f2 "$end_file")
-            local end_overhead=$(cut -d',' -f3 "$end_file")
-            
-            # Calculate total cycles (subtracting overhead)
-            local total_overhead=$((start_overhead + end_overhead))
-            local raw_cycles=$((end_cycles - start_cycles))
-            local net_cycles=$((raw_cycles - total_overhead))
-            
-            # Calculate cycles per second using average frequency
-            local avg_freq=$(awk "BEGIN {printf \"%.2f\", ($start_freq + $end_freq) / 2}")
-            local cycles_per_sec=$(awk "BEGIN {printf \"%.0f\", $net_cycles / $duration_sec}")
-            
-            # Write results
-            {
-                echo "=== CPU CYCLE MEASUREMENT - ITERATION $iteration ==="
-                echo "Duration: ${duration_sec}s"
-                echo ""
-                echo "Start cycles: $start_cycles"
-                echo "End cycles: $end_cycles"
-                echo "Raw cycle delta: $raw_cycles"
-                echo "Measurement overhead: $total_overhead cycles"
-                echo "Net cycles: $net_cycles"
-                echo ""
-                echo "Average CPU frequency: ${avg_freq} MHz"
-                echo "Cycles per second: $cycles_per_sec"
-                echo ""
-                echo "Note: RDTSC counts at nominal CPU frequency (~${avg_freq} MHz)"
-                echo "      Measurement pinned to CPU $CYCLE_COUNTER_CPU"
-            } > "$result_file"
-            
-            log "$exp_dir" "  End cycles: $end_cycles"
-            log "$exp_dir" "  Total cycles: $net_cycles"
-            log "$exp_dir" "  Cycles per second: $cycles_per_sec"
-            log "$exp_dir" "  Results saved to: $result_file"
-            
-            return 0
-        fi
-    fi
+    local result_file="$exp_dir/metadata/cycles_result_iter${iteration}.txt"
     
-    log "$exp_dir" "WARNING: Failed to record end cycles"
-    return 1
+    # Initialize result file
+    {
+        echo "=== CPU CYCLE MEASUREMENT - ITERATION $iteration ==="
+        echo "Duration: ${duration_sec}s"
+        echo "Monitored CPUs: $cpu_list"
+        echo ""
+    } > "$result_file"
+    
+    local success=0
+    local cpu_count=0
+    
+    # Process each CPU
+    for cpu in $cpu_list; do
+        local start_file="$exp_dir/metadata/cycles_start_iter${iteration}_cpu${cpu}.txt"
+        local end_file="$exp_dir/metadata/cycles_end_iter${iteration}_cpu${cpu}.txt"
+        
+        if [[ ! -f "$start_file" ]]; then
+            log "$exp_dir" "  WARNING: Start cycles file not found for CPU $cpu"
+            echo "CPU $cpu: Start measurement missing" >> "$result_file"
+            continue
+        fi
+        
+        # Take end measurement
+        if "$CYCLE_COUNTER_BIN" "$cpu" "$end_file" >> "$exp_dir/experiment.log" 2>&1; then
+            if [[ -f "$end_file" ]]; then
+                # Parse start and end measurements
+                local start_cycles=$(cut -d',' -f1 "$start_file")
+                local start_freq=$(cut -d',' -f2 "$start_file")
+                local start_overhead=$(cut -d',' -f3 "$start_file")
+                
+                local end_cycles=$(cut -d',' -f1 "$end_file")
+                local end_freq=$(cut -d',' -f2 "$end_file")
+                local end_overhead=$(cut -d',' -f3 "$end_file")
+                
+                # Calculate total cycles (subtracting overhead)
+                local total_overhead=$((start_overhead + end_overhead))
+                local raw_cycles=$((end_cycles - start_cycles))
+                local net_cycles=$((raw_cycles - total_overhead))
+                
+                # Calculate cycles per second using average frequency
+                local avg_freq=$(awk "BEGIN {printf \"%.2f\", ($start_freq + $end_freq) / 2}")
+                local cycles_per_sec=$(awk "BEGIN {printf \"%.0f\", $net_cycles / $duration_sec}")
+                
+                # Write per-core results
+                {
+                    echo "────────────────────────────────────────────────────────────"
+                    echo "CPU $cpu"
+                    echo "────────────────────────────────────────────────────────────"
+                    echo "  Start cycles:        $start_cycles"
+                    echo "  End cycles:          $end_cycles"
+                    echo "  Raw cycle delta:     $raw_cycles"
+                    echo "  Measurement overhead: $total_overhead cycles"
+                    echo "  Net cycles:          $net_cycles"
+                    echo "  Average frequency:   ${avg_freq} MHz"
+                    echo "  Cycles per second:   $cycles_per_sec"
+                    echo ""
+                } >> "$result_file"
+                
+                log "$exp_dir" "  CPU $cpu: $net_cycles cycles ($cycles_per_sec cycles/sec)"
+                success=1
+                cpu_count=$((cpu_count + 1))
+            fi
+        else
+            log "$exp_dir" "  WARNING: Failed to record end cycles for CPU $cpu"
+            echo "CPU $cpu: End measurement failed" >> "$result_file"
+        fi
+    done
+    
+    # Add summary note
+    {
+        echo "════════════════════════════════════════════════════════════"
+        echo "NOTES"
+        echo "════════════════════════════════════════════════════════════"
+        echo "• RDTSC measures wall-clock cycles (not CPU-busy cycles)"
+        echo "• Each CPU core counted independently"
+        echo "• All cores should show similar cycles/sec ≈ CPU frequency"
+        echo "• Variations may indicate frequency scaling or migration issues"
+        echo "• Successfully measured: $cpu_count CPUs"
+    } >> "$result_file"
+    
+    if [[ $success -eq 1 ]]; then
+        log "$exp_dir" "  Results saved to: $result_file"
+        return 0
+    else
+        log "$exp_dir" "WARNING: Failed to record end cycles for any CPU"
+        return 1
+    fi
 }
 
 # Generate unique experiment ID
@@ -2217,12 +2254,29 @@ run_iteration() {
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
+    # Detect CPU affinity of victim service for cycle measurement
+    local victim_cpus=""
+    if [[ -n "$VICTIM_SERVICES" ]]; then
+        # Get first (and only) victim service
+        local victim_service=$(echo "$VICTIM_SERVICES" | awk '{print $1}')
+        victim_cpus=$(detect_victim_cpu_affinity "$exp_dir" "$victim_service")
+        
+        if [[ -n "$victim_cpus" ]]; then
+            log "$exp_dir" "Will measure cycles on victim service CPUs: $victim_cpus"
+            echo "$victim_cpus" > "$exp_dir/metadata/cycle_measurement_cpus_iter${iteration}.txt"
+        else
+            log "$exp_dir" "WARNING: Could not detect victim service CPU affinity, skipping cycle measurements"
+        fi
+    fi
+    
     # Record iteration start time
     local iteration_start=$(date +%s)
     echo "$iteration_start" > "$exp_dir/metadata/iteration_${iteration}_start.txt"
     
-    # Start CPU cycle measurement
-    start_cycle_measurement "$exp_dir" "$iteration"
+    # Start CPU cycle measurement (if CPUs detected)
+    if [[ -n "$victim_cpus" ]]; then
+        start_cycle_measurement "$exp_dir" "$iteration" "$victim_cpus"
+    fi
     
     # Start workload generation early (at +5s)
     log "$exp_dir" "Waiting 5s before starting workload generation..."
@@ -2285,8 +2339,10 @@ run_iteration() {
     local actual_duration=$((iteration_end - iteration_start))
     log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
     
-    # End CPU cycle measurement and calculate results
-    end_cycle_measurement "$exp_dir" "$iteration" "$actual_duration"
+    # End CPU cycle measurement and calculate results (if CPUs were detected)
+    if [[ -n "$victim_cpus" ]]; then
+        end_cycle_measurement "$exp_dir" "$iteration" "$actual_duration" "$victim_cpus"
+    fi
     
     # Wait a bit more for data to be written to disk
     log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
@@ -2539,59 +2595,100 @@ aggregate_data() {
         } > "$exp_dir/processed/latency_summary.txt"
     fi
     
-    # Aggregate CPU cycle measurements
+    # Aggregate CPU cycle measurements (multi-core)
     if ls "$exp_dir/metadata/cycles_result_iter"*.txt 1> /dev/null 2>&1; then
         {
-            echo "=== AGGREGATED CPU CYCLE MEASUREMENTS ==="
+            echo "=== AGGREGATED CPU CYCLE MEASUREMENTS (MULTI-CORE) ==="
             echo "Generated: $(date -Iseconds)"
             echo ""
-            echo "Measurement pinned to CPU $CYCLE_COUNTER_CPU"
             echo "Using RDTSC (Read Time-Stamp Counter) with serialization"
+            echo "Per-core measurements from victim service CPUs"
             echo ""
             
+            # Show all per-iteration results
             for i in $(seq 1 $total_iterations); do
                 local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
                 if [[ -f "$result_file" ]]; then
                     cat "$result_file"
                     echo ""
-                    echo "────────────────────────────────────────────────────────────"
+                    echo "════════════════════════════════════════════════════════════"
                     echo ""
                 fi
             done
             
-            # Calculate summary statistics
-            echo "=== SUMMARY STATISTICS ==="
+            # Calculate per-CPU summary statistics
+            echo "=== SUMMARY STATISTICS (PER-CPU) ==="
             echo ""
             
-            local total_cycles=0
-            local total_duration=0
-            local count=0
-            
-            for i in $(seq 1 $total_iterations); do
+            # Collect all unique CPUs across iterations
+            local all_cpus=$(for i in $(seq 1 $total_iterations); do
                 local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
                 if [[ -f "$result_file" ]]; then
-                    local cycles=$(grep "^Net cycles:" "$result_file" | awk '{print $3}')
-                    local duration=$(grep "^Duration:" "$result_file" | awk '{print $2}' | sed 's/s//')
-                    
-                    if [[ -n "$cycles" && -n "$duration" ]]; then
-                        total_cycles=$((total_cycles + cycles))
-                        total_duration=$((total_duration + duration))
-                        count=$((count + 1))
-                    fi
+                    grep "^CPU [0-9]" "$result_file" | awk '{print $2}'
                 fi
-            done
+            done | sort -n | uniq)
             
-            if [[ $count -gt 0 ]]; then
-                local avg_cycles=$((total_cycles / count))
-                local avg_cycles_per_sec=$((total_cycles / total_duration))
-                
-                echo "Total iterations measured: $count"
-                echo "Total cycles across all iterations: $total_cycles"
-                echo "Total duration across all iterations: ${total_duration}s"
-                echo "Average cycles per iteration: $avg_cycles"
-                echo "Average cycles per second: $avg_cycles_per_sec"
-            else
+            if [[ -z "$all_cpus" ]]; then
                 echo "No cycle measurements found"
+            else
+                echo "Monitored CPUs: $all_cpus"
+                echo ""
+                
+                # Statistics per CPU
+                for cpu in $all_cpus; do
+                    echo "────────────────────────────────────────────────────────────"
+                    echo "CPU $cpu Summary"
+                    echo "────────────────────────────────────────────────────────────"
+                    
+                    local cpu_total_cycles=0
+                    local cpu_total_duration=0
+                    local cpu_count=0
+                    local cpu_total_cycles_per_sec=0
+                    
+                    for i in $(seq 1 $total_iterations); do
+                        local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
+                        if [[ -f "$result_file" ]]; then
+                            # Extract data for this CPU from this iteration
+                            local net_cycles=$(grep -A 10 "^CPU $cpu\$" "$result_file" | grep "Net cycles:" | awk '{print $3}')
+                            local cycles_per_sec=$(grep -A 10 "^CPU $cpu\$" "$result_file" | grep "Cycles per second:" | awk '{print $4}')
+                            local duration=$(grep "^Duration:" "$result_file" | awk '{print $2}' | sed 's/s//')
+                            
+                            if [[ -n "$net_cycles" && -n "$duration" && -n "$cycles_per_sec" ]]; then
+                                cpu_total_cycles=$((cpu_total_cycles + net_cycles))
+                                cpu_total_duration=$((cpu_total_duration + duration))
+                                cpu_total_cycles_per_sec=$((cpu_total_cycles_per_sec + cycles_per_sec))
+                                cpu_count=$((cpu_count + 1))
+                            fi
+                        fi
+                    done
+                    
+                    if [[ $cpu_count -gt 0 ]]; then
+                        local avg_cycles=$((cpu_total_cycles / cpu_count))
+                        local avg_cycles_per_sec=$((cpu_total_cycles_per_sec / cpu_count))
+                        
+                        echo "  Iterations measured: $cpu_count"
+                        echo "  Total cycles: $cpu_total_cycles"
+                        echo "  Total duration: ${cpu_total_duration}s"
+                        echo "  Average cycles per iteration: $avg_cycles"
+                        echo "  Average cycles/sec: $avg_cycles_per_sec"
+                        echo ""
+                    else
+                        echo "  No measurements for this CPU"
+                        echo ""
+                    fi
+                done
+                
+                # Overall summary
+                echo "════════════════════════════════════════════════════════════"
+                echo "OVERALL SUMMARY"
+                echo "════════════════════════════════════════════════════════════"
+                local num_cpus=$(echo "$all_cpus" | wc -w)
+                echo "Number of CPUs monitored: $num_cpus"
+                echo "Total iterations: $total_iterations"
+                echo ""
+                echo "Note: Each CPU core measured independently"
+                echo "      All cores should show similar cycles/sec ≈ CPU frequency"
+                echo "      Variations indicate frequency scaling or migration"
             fi
         } > "$exp_dir/processed/cycles_summary.txt"
         
@@ -2634,7 +2731,16 @@ aggregate_data() {
         if [[ $cycle_measurements_count -gt 0 ]]; then
             echo "  Iterations measured: $cycle_measurements_count"
             echo "  Method: RDTSC (Read Time-Stamp Counter)"
-            echo "  CPU pinning: CPU $CYCLE_COUNTER_CPU"
+            
+            # Show which CPUs were monitored
+            local monitored_cpus=$(cat "$exp_dir/metadata/cycle_measurement_cpus_iter"*.txt 2>/dev/null | head -1)
+            if [[ -n "$monitored_cpus" ]]; then
+                echo "  Monitored CPUs: $monitored_cpus (victim service cores)"
+                echo "  Per-core measurements: Yes"
+            else
+                echo "  CPU detection: Failed (see experiment.log)"
+            fi
+            
             echo "  Summary: processed/cycles_summary.txt"
         fi
         
