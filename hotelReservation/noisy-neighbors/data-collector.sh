@@ -74,7 +74,7 @@ CYCLE_COUNTER_SOURCE="$SCRIPTS_DIR/cycle_counter.c"
 CYCLE_COUNTER_BIN="$SCRIPTS_DIR/cycle_counter"
 CYCLE_COUNTER_CPUS=""  # Will be auto-detected from victim service CPU affinity
 
-# Calculate CPU allocation for victim service using same logic as deployment
+# Calculate and verify CPU allocation for victim service
 # Returns: space-separated list of CPU IDs (e.g., "0 1 2")
 calculate_victim_cpu_allocation() {
     local exp_dir="$1"
@@ -111,8 +111,40 @@ calculate_victim_cpu_allocation() {
     done
     
     log "$exp_dir" "  Service index: $service_index"
-    log "$exp_dir" "  CPU range: $cpu_start-$cpu_end"
-    log "$exp_dir" "  CPU list: $cpu_list"
+    log "$exp_dir" "  Expected CPU range: $cpu_start-$cpu_end"
+    log "$exp_dir" "  Expected CPU list: $cpu_list"
+    
+    # Verify actual pinning by checking taskset in the pod
+    local pod_name=$(kubectl get pods -l io.kompose.service="$service" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    
+    if [[ -n "$pod_name" ]]; then
+        log "$exp_dir" "  Verifying actual CPU pinning for pod: $pod_name"
+        
+        # Get actual CPU affinity
+        local actual_affinity=$(kubectl exec "$pod_name" -- taskset -pc 1 2>/dev/null | grep "current affinity list" | awk -F': ' '{print $2}')
+        
+        if [[ -n "$actual_affinity" ]]; then
+            # Convert comma-separated to space-separated for comparison
+            local actual_list=$(echo "$actual_affinity" | tr ',' ' ')
+            log "$exp_dir" "  Actual CPU pinning: $actual_list"
+            
+            # Compare expected vs actual
+            if [[ "$cpu_list" == "$actual_list" ]]; then
+                log "$exp_dir" "  ✓ CPU pinning verified: service is correctly pinned to CPUs $cpu_list"
+            else
+                log "$exp_dir" "  ⚠️  WARNING: CPU pinning mismatch!"
+                log "$exp_dir" "     Expected: $cpu_list"
+                log "$exp_dir" "     Actual: $actual_list"
+                log "$exp_dir" "     Using expected CPUs for measurement, but results may be inaccurate"
+            fi
+        else
+            log "$exp_dir" "  ⚠️  WARNING: Could not verify CPU pinning (taskset failed)"
+            log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
+        fi
+    else
+        log "$exp_dir" "  ⚠️  WARNING: Could not find pod for verification"
+        log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
+    fi
     
     echo "$cpu_list"
     return 0
