@@ -17,6 +17,7 @@ WINDOWED_IMAGE_SUFFIX="windowed"
 # CPU allocation configuration
 CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
 STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
+ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning for all deployments (including no-instrumentation)
 
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -132,22 +133,82 @@ calculate_victim_cpu_allocation() {
             if [[ "$cpu_list" == "$actual_list" ]]; then
                 log "$exp_dir" "  ✓ CPU pinning verified: service is correctly pinned to CPUs $cpu_list"
             else
-                log "$exp_dir" "  ⚠️  WARNING: CPU pinning mismatch!"
+                log "$exp_dir" "    WARNING: CPU pinning mismatch!"
                 log "$exp_dir" "     Expected: $cpu_list"
                 log "$exp_dir" "     Actual: $actual_list"
                 log "$exp_dir" "     Using expected CPUs for measurement, but results may be inaccurate"
             fi
         else
-            log "$exp_dir" "  ⚠️  WARNING: Could not verify CPU pinning (taskset failed)"
+            log "$exp_dir" "    WARNING: Could not verify CPU pinning (taskset failed)"
             log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
         fi
     else
-        log "$exp_dir" "  ⚠️  WARNING: Could not find pod for verification"
+        log "$exp_dir" "    WARNING: Could not find pod for verification"
         log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
     fi
     
     echo "$cpu_list"
     return 0
+}
+
+# Apply CPU pinning (taskset) to a regular deployment
+# This enables CPU pinning for no-instrumentation cases
+apply_cpu_pinning_to_deployment() {
+    local service="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Applying CPU pinning to $service deployment..."
+    
+    # Find service index in VALID_TIMING_SERVICES
+    local service_index=-1
+    for idx in "${!VALID_TIMING_SERVICES[@]}"; do
+        if [[ "${VALID_TIMING_SERVICES[$idx]}" == "$service" ]]; then
+            service_index=$idx
+            break
+        fi
+    done
+    
+    if [[ $service_index -eq -1 ]]; then
+        log "$exp_dir" "  WARNING: Service $service not found in VALID_TIMING_SERVICES, skipping CPU pinning"
+        return 1
+    fi
+    
+    # Calculate CPU range using same logic as instrumented deployment
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
+    local cpu_set=""
+    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
+        if [[ -z "$cpu_set" ]]; then
+            cpu_set="$cpu"
+        else
+            cpu_set="$cpu_set,$cpu"
+        fi
+    done
+    
+    log "$exp_dir" "  Service index: $service_index"
+    log "$exp_dir" "  CPU set: $cpu_set"
+    
+    # Patch the deployment command to use taskset
+    # The service binary is typically just the service name (e.g., "frontend", "user")
+    log "$exp_dir" "  Patching deployment command with taskset..."
+    
+    if kubectl patch deployment "$service" --type=json -p="[
+        {\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"sh\", \"-c\", \"exec taskset -c $cpu_set $service\"]}
+    ]" 2>/dev/null; then
+        log "$exp_dir" "  ✓ CPU pinning applied: $service pinned to CPUs $cpu_set"
+        return 0
+    else
+        # If replace fails, try add (command might not exist)
+        if kubectl patch deployment "$service" --type=json -p="[
+            {\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"sh\", \"-c\", \"exec taskset -c $cpu_set $service\"]}
+        ]" 2>/dev/null; then
+            log "$exp_dir" "  ✓ CPU pinning applied: $service pinned to CPUs $cpu_set"
+            return 0
+        else
+            log "$exp_dir" "    WARNING: Failed to apply CPU pinning to $service"
+            return 1
+        fi
+    fi
 }
 
 # Compile cycle counter
@@ -1349,7 +1410,8 @@ deploy_victim_services() {
         else
             # Deploy regular service (either windowed sampling is disabled or service doesn't support it)
             if validate_timing_service "$service" && [[ "${ENABLE_WINDOWED_SAMPLING:-true}" != "true" ]]; then
-                log "$exp_dir" "Deploying regular $service (windowed sampling disabled)"
+                local pinning_status="CPU pinning: ${ENABLE_CPU_PINNING:-true}"
+                log "$exp_dir" "Deploying regular $service (windowed sampling disabled, $pinning_status)"
             else
                 log "$exp_dir" "Deploying regular $service"
             fi
@@ -1382,6 +1444,11 @@ deploy_regular_service() {
         
         # Add toleration and node selector to the deployment
         "$TAINT_SCRIPT" "$target_node" "$service"
+        
+        # Apply CPU pinning if enabled and service supports timing (victim services)
+        if [[ "${ENABLE_CPU_PINNING:-true}" == "true" ]] && validate_timing_service "$service"; then
+            apply_cpu_pinning_to_deployment "$service" "$exp_dir"
+        fi
         
         # Wait for deployment to be ready
         kubectl rollout status deployment "$service" --timeout=120s
@@ -2525,6 +2592,12 @@ generate_metadata() {
             "data_collection": "Full timeline from workload start to iteration end, including idle periods",
             "rationale": "Captures development of contention and performance changes when approaching/leaving contention"
         },
+        "cpu_pinning": {
+            "enabled": ${ENABLE_CPU_PINNING:-true},
+            "cpus_per_service": ${CPUS_PER_SERVICE:-3},
+            "starting_cpu": ${STARTING_CPU:-0},
+            "description": "When enabled, all victim services are pinned to specific CPUs via taskset (works for both instrumented and no-instrumentation cases)"
+        },
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
             "args": "${NOISY_NEIGHBOR_ARGS:-}",
@@ -3017,6 +3090,12 @@ ENABLE_WINDOWED_SAMPLING=true
 WINDOW_INTERVAL_MS=100
 PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
+
+# CPU pinning (taskset) - applies to all victim services
+# When ENABLE_WINDOWED_SAMPLING=false (no-instrumentation), this ensures consistent CPU pinning
+ENABLE_CPU_PINNING=true
+CPUS_PER_SERVICE=3    # Each service gets 3 CPUs
+STARTING_CPU=0        # Start allocating from CPU 0
 
 # Jaeger tracing
 JAEGER_SAMPLE_RATIO=0.01  # 1% sampling, set to 0 to disable
