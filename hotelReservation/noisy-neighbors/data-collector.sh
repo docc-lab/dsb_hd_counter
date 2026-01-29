@@ -17,7 +17,7 @@ WINDOWED_IMAGE_SUFFIX="windowed"
 # CPU allocation configuration
 CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
 STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
-ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning for all deployments (including no-instrumentation)
+ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning for no-instrumentation deployments (instrumented always pins via image ENTRYPOINT)
 
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -151,8 +151,8 @@ calculate_victim_cpu_allocation() {
     return 0
 }
 
-# Apply CPU pinning (taskset) to a regular deployment
-# This enables CPU pinning for no-instrumentation cases
+# Apply CPU pinning (taskset) to a regular (no-instrumentation) deployment
+# Note: Instrumented deployments use CPU pinning via the windowed image ENTRYPOINT instead
 apply_cpu_pinning_to_deployment() {
     local service="$1"
     local exp_dir="$2"
@@ -2596,7 +2596,7 @@ generate_metadata() {
             "enabled": ${ENABLE_CPU_PINNING:-true},
             "cpus_per_service": ${CPUS_PER_SERVICE:-3},
             "starting_cpu": ${STARTING_CPU:-0},
-            "description": "When enabled, all victim services are pinned to specific CPUs via taskset (works for both instrumented and no-instrumentation cases)"
+            "description": "Controls CPU pinning for no-instrumentation case only (instrumented case always pins via image ENTRYPOINT)"
         },
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
@@ -3091,8 +3091,8 @@ WINDOW_INTERVAL_MS=100
 PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
 
-# CPU pinning (taskset) - applies to all victim services
-# When ENABLE_WINDOWED_SAMPLING=false (no-instrumentation), this ensures consistent CPU pinning
+# CPU pinning (taskset) for no-instrumentation case only
+# (instrumented case always uses CPU pinning via windowed image ENTRYPOINT)
 ENABLE_CPU_PINNING=true
 CPUS_PER_SERVICE=3    # Each service gets 3 CPUs
 STARTING_CPU=0        # Start allocating from CPU 0
