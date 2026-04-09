@@ -14,7 +14,8 @@ WRK2_GILTENE_DIR="${WRK2_GILTENE_DIR:-../../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
-TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
+TIMING_REGISTRY="${TIMING_REGISTRY:-docclabgroup}"
+WINDOWED_IMAGE_TAG="${WINDOWED_IMAGE_TAG:-windowed-arrivalrate}"
 WINDOWED_IMAGE_SUFFIX="windowed"
 
 # CPU allocation configuration
@@ -25,41 +26,13 @@ ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning f
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
-# Get current image for a service from deployment
+# Get the windowed image name for a service.
+# Uses TIMING_REGISTRY / WINDOWED_IMAGE_TAG (set in config or defaults above).
+# Pattern: <TIMING_REGISTRY>/<service>-windowed:<WINDOWED_IMAGE_TAG>
+# e.g.  docclabgroup/search-windowed:windowed-arrivalrate
 get_current_windowed_image() {
     local service="$1"
-    
-    # Get current image from deployment
-    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
-    
-    if [[ -z "$current_image" ]]; then
-        echo ""
-        return 1
-    fi
-    
-    # If already using a windowed image, return it as-is
-    if [[ "$current_image" == *"-windowed:"* ]]; then
-        echo "$current_image"
-        return 0
-    fi
-    
-    # If not a windowed image, construct windowed version with same tag
-    # Extract registry, image name, and tag
-    # Format could be: registry/image:tag or just image:tag
-    if [[ "$current_image" =~ ^([^/]+)/([^:]+):(.+)$ ]]; then
-        # Has registry: registry/image:tag
-        local registry="${BASH_REMATCH[1]}"
-        local image="${BASH_REMATCH[2]}"
-        local tag="${BASH_REMATCH[3]}"
-        echo "${registry}/${service}-windowed:${tag}"
-    elif [[ "$current_image" =~ ^([^:]+):(.+)$ ]]; then
-        # No registry: image:tag
-        local tag="${BASH_REMATCH[2]}"
-        echo "${TIMING_REGISTRY}/${service}-windowed:${tag}"
-    else
-        # Fallback: use default registry and latest tag
-        echo "${TIMING_REGISTRY}/${service}-windowed:latest"
-    fi
+    echo "${TIMING_REGISTRY}/${service}-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_IMAGE_TAG}"
 }
 
 # Timing images are determined dynamically based on current deployment
@@ -560,39 +533,27 @@ ensure_timing_image_exists() {
     local service="$1"
     local exp_dir="$2"
     
-    # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
-    
-    if [[ -z "$timing_image" ]]; then
-        log "$exp_dir" "ERROR: Could not determine windowed image for $service"
-        return 1
-    fi
-    
     log "$exp_dir" "Checking if windowed image exists: $timing_image"
-    
-    # Check if image exists in registry (try to pull)
-    if docker pull "$timing_image" &>/dev/null; then
-        log "$exp_dir" "Timing image already exists: $timing_image"
+
+    # Try to pull from registry first (covers Docker Hub / private registries)
+    if docker pull "$timing_image" 2>>"$exp_dir/logs/collector.log"; then
+        log "$exp_dir" "Timing image pulled successfully: $timing_image"
         return 0
     fi
-    
-    log "$exp_dir" "Timing image not found, building: $timing_image"
-    
-    # Check if build script exists
-    if [[ ! -f "$TIMING_BUILD_SCRIPT" ]]; then
-        log "$exp_dir" "ERROR: Timing build script not found: $TIMING_BUILD_SCRIPT"
-        return 1
+
+    # Image not in registry — try local build as fallback
+    log "$exp_dir" "Timing image not in registry, attempting local build: $timing_image"
+    if [[ -f "$TIMING_BUILD_SCRIPT" ]]; then
+        log "$exp_dir" "Building timing image for $service using $TIMING_BUILD_SCRIPT"
+        if "$TIMING_BUILD_SCRIPT" "$service" "$TIMING_TAG" >> "$exp_dir/logs/collector.log" 2>&1; then
+            log "$exp_dir" "Successfully built timing image: $timing_image"
+            return 0
+        fi
     fi
-    
-    # Build the timing image
-    log "$exp_dir" "Building timing image for $service using $TIMING_BUILD_SCRIPT"
-    if "$TIMING_BUILD_SCRIPT" "$service" "$TIMING_TAG" >> "$exp_dir/logs/collector.log" 2>&1; then
-        log "$exp_dir" "Successfully built timing image: $timing_image"
-        return 0
-    else
-        log "$exp_dir" "ERROR: Failed to build timing image for $service"
-        return 1
-    fi
+
+    log "$exp_dir" "ERROR: Could not pull or build timing image: $timing_image"
+    return 1
 }
 
 # Update deployment to use timing-enabled image and environment (with windowed sampling)
@@ -603,14 +564,7 @@ update_deployment_for_timing() {
     
     log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
-    # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
-    
-    if [[ -z "$timing_image" ]]; then
-        log "$exp_dir" "ERROR: Could not determine windowed image for service $service"
-        return 1
-    fi
-    
     log "$exp_dir" "Will use windowed image: $timing_image"
     local container_name=$(get_container_name "$service")
     
@@ -1056,6 +1010,7 @@ validate_config() {
 	
 	echo ""
 	echo "Windowed Sampling Configuration:"
+	echo "  Timing Image: ${TIMING_REGISTRY}/<service>-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_IMAGE_TAG}"
 	echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
 	echo "  Perf Events: ${PERF_EVENTS}"
 	if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
@@ -3124,8 +3079,10 @@ CONTENTION_BURSTS=$(repeat_burst 0 30 10 5 4)
 ITERATIONS=3
 ITERATION_DELAY=60
 
-# Windowed sampling
+# Windowed sampling (instrumented images: <TIMING_REGISTRY>/<service>-windowed:<WINDOWED_IMAGE_TAG>)
 ENABLE_WINDOWED_SAMPLING=true
+TIMING_REGISTRY='docclabgroup'                    # Docker Hub org/user that hosts the windowed images
+WINDOWED_IMAGE_TAG='windowed-arrivalrate'         # Tag for windowed images (e.g. docker pull docclabgroup/search-windowed:windowed-arrivalrate)
 WINDOW_INTERVAL_MS=100
 PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
