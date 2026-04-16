@@ -8,54 +8,31 @@ set -e
 DATA_DIR="${DATA_DIR:-./experiment_data}"
 HOTEL_MANIFESTS_DIR="${HOTEL_MANIFESTS_DIR:-./hotelReservation}"
 WRK2_DIR="${WRK2_DIR:-../../wrk2}"
+# giltene/wrk2 (https://github.com/giltene/wrk2): used when WRK2_RATE is 1 (1 RPS baseline).
+# Default ../../../wrk2 is from hotelReservation/noisy-neighbors/ on layouts where wrk2 sits above the repo root; override with WRK2_GILTENE_DIR or point at the same tree as WRK2_DIR if yours is ../../wrk2.
+WRK2_GILTENE_DIR="${WRK2_GILTENE_DIR:-../../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
-TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
+TIMING_REGISTRY="${TIMING_REGISTRY:-docclabgroup}"
+WINDOWED_IMAGE_TAG="${WINDOWED_IMAGE_TAG:-windowed-arrivalrate}"
 WINDOWED_IMAGE_SUFFIX="windowed"
 
 # CPU allocation configuration
 CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
 STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
+ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning for no-instrumentation deployments (instrumented always pins via image ENTRYPOINT)
 
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
-# Get current image for a service from deployment
+# Get the windowed image name for a service.
+# Uses TIMING_REGISTRY / WINDOWED_IMAGE_TAG (set in config or defaults above).
+# Pattern: <TIMING_REGISTRY>/<service>-windowed:<WINDOWED_IMAGE_TAG>
+# e.g.  docclabgroup/search-windowed:windowed-arrivalrate
 get_current_windowed_image() {
     local service="$1"
-    
-    # Get current image from deployment
-    local current_image=$(kubectl get deployment "$service" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
-    
-    if [[ -z "$current_image" ]]; then
-        echo ""
-        return 1
-    fi
-    
-    # If already using a windowed image, return it as-is
-    if [[ "$current_image" == *"-windowed:"* ]]; then
-        echo "$current_image"
-        return 0
-    fi
-    
-    # If not a windowed image, construct windowed version with same tag
-    # Extract registry, image name, and tag
-    # Format could be: registry/image:tag or just image:tag
-    if [[ "$current_image" =~ ^([^/]+)/([^:]+):(.+)$ ]]; then
-        # Has registry: registry/image:tag
-        local registry="${BASH_REMATCH[1]}"
-        local image="${BASH_REMATCH[2]}"
-        local tag="${BASH_REMATCH[3]}"
-        echo "${registry}/${service}-windowed:${tag}"
-    elif [[ "$current_image" =~ ^([^:]+):(.+)$ ]]; then
-        # No registry: image:tag
-        local tag="${BASH_REMATCH[2]}"
-        echo "${TIMING_REGISTRY}/${service}-windowed:${tag}"
-    else
-        # Fallback: use default registry and latest tag
-        echo "${TIMING_REGISTRY}/${service}-windowed:latest"
-    fi
+    echo "${TIMING_REGISTRY}/${service}-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_IMAGE_TAG}"
 }
 
 # Timing images are determined dynamically based on current deployment
@@ -132,22 +109,82 @@ calculate_victim_cpu_allocation() {
             if [[ "$cpu_list" == "$actual_list" ]]; then
                 log "$exp_dir" "  ✓ CPU pinning verified: service is correctly pinned to CPUs $cpu_list"
             else
-                log "$exp_dir" "  ⚠️  WARNING: CPU pinning mismatch!"
+                log "$exp_dir" "    WARNING: CPU pinning mismatch!"
                 log "$exp_dir" "     Expected: $cpu_list"
                 log "$exp_dir" "     Actual: $actual_list"
                 log "$exp_dir" "     Using expected CPUs for measurement, but results may be inaccurate"
             fi
         else
-            log "$exp_dir" "  ⚠️  WARNING: Could not verify CPU pinning (taskset failed)"
+            log "$exp_dir" "    WARNING: Could not verify CPU pinning (taskset failed)"
             log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
         fi
     else
-        log "$exp_dir" "  ⚠️  WARNING: Could not find pod for verification"
+        log "$exp_dir" "    WARNING: Could not find pod for verification"
         log "$exp_dir" "     Assuming CPUs $cpu_list based on configuration"
     fi
     
     echo "$cpu_list"
     return 0
+}
+
+# Apply CPU pinning (taskset) to a regular (no-instrumentation) deployment
+# Note: Instrumented deployments use CPU pinning via the windowed image ENTRYPOINT instead
+apply_cpu_pinning_to_deployment() {
+    local service="$1"
+    local exp_dir="$2"
+    
+    log "$exp_dir" "Applying CPU pinning to $service deployment..."
+    
+    # Find service index in VALID_TIMING_SERVICES
+    local service_index=-1
+    for idx in "${!VALID_TIMING_SERVICES[@]}"; do
+        if [[ "${VALID_TIMING_SERVICES[$idx]}" == "$service" ]]; then
+            service_index=$idx
+            break
+        fi
+    done
+    
+    if [[ $service_index -eq -1 ]]; then
+        log "$exp_dir" "  WARNING: Service $service not found in VALID_TIMING_SERVICES, skipping CPU pinning"
+        return 1
+    fi
+    
+    # Calculate CPU range using same logic as instrumented deployment
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
+    local cpu_set=""
+    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
+        if [[ -z "$cpu_set" ]]; then
+            cpu_set="$cpu"
+        else
+            cpu_set="$cpu_set,$cpu"
+        fi
+    done
+    
+    log "$exp_dir" "  Service index: $service_index"
+    log "$exp_dir" "  CPU set: $cpu_set"
+    
+    # Patch the deployment command to use taskset
+    # The service binary is typically just the service name (e.g., "frontend", "user")
+    log "$exp_dir" "  Patching deployment command with taskset..."
+    
+    if kubectl patch deployment "$service" --type=json -p="[
+        {\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"sh\", \"-c\", \"exec taskset -c $cpu_set $service\"]}
+    ]" 2>/dev/null; then
+        log "$exp_dir" "  ✓ CPU pinning applied: $service pinned to CPUs $cpu_set"
+        return 0
+    else
+        # If replace fails, try add (command might not exist)
+        if kubectl patch deployment "$service" --type=json -p="[
+            {\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"sh\", \"-c\", \"exec taskset -c $cpu_set $service\"]}
+        ]" 2>/dev/null; then
+            log "$exp_dir" "  ✓ CPU pinning applied: $service pinned to CPUs $cpu_set"
+            return 0
+        else
+            log "$exp_dir" "    WARNING: Failed to apply CPU pinning to $service"
+            return 1
+        fi
+    fi
 }
 
 # Compile cycle counter
@@ -496,39 +533,27 @@ ensure_timing_image_exists() {
     local service="$1"
     local exp_dir="$2"
     
-    # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
-    
-    if [[ -z "$timing_image" ]]; then
-        log "$exp_dir" "ERROR: Could not determine windowed image for $service"
-        return 1
-    fi
-    
     log "$exp_dir" "Checking if windowed image exists: $timing_image"
-    
-    # Check if image exists in registry (try to pull)
-    if docker pull "$timing_image" &>/dev/null; then
-        log "$exp_dir" "Timing image already exists: $timing_image"
+
+    # Try to pull from registry first (covers Docker Hub / private registries)
+    if docker pull "$timing_image" 2>>"$exp_dir/logs/collector.log"; then
+        log "$exp_dir" "Timing image pulled successfully: $timing_image"
         return 0
     fi
-    
-    log "$exp_dir" "Timing image not found, building: $timing_image"
-    
-    # Check if build script exists
-    if [[ ! -f "$TIMING_BUILD_SCRIPT" ]]; then
-        log "$exp_dir" "ERROR: Timing build script not found: $TIMING_BUILD_SCRIPT"
-        return 1
+
+    # Image not in registry — try local build as fallback
+    log "$exp_dir" "Timing image not in registry, attempting local build: $timing_image"
+    if [[ -f "$TIMING_BUILD_SCRIPT" ]]; then
+        log "$exp_dir" "Building timing image for $service using $TIMING_BUILD_SCRIPT"
+        if "$TIMING_BUILD_SCRIPT" "$service" "$TIMING_TAG" >> "$exp_dir/logs/collector.log" 2>&1; then
+            log "$exp_dir" "Successfully built timing image: $timing_image"
+            return 0
+        fi
     fi
-    
-    # Build the timing image
-    log "$exp_dir" "Building timing image for $service using $TIMING_BUILD_SCRIPT"
-    if "$TIMING_BUILD_SCRIPT" "$service" "$TIMING_TAG" >> "$exp_dir/logs/collector.log" 2>&1; then
-        log "$exp_dir" "Successfully built timing image: $timing_image"
-        return 0
-    else
-        log "$exp_dir" "ERROR: Failed to build timing image for $service"
-        return 1
-    fi
+
+    log "$exp_dir" "ERROR: Could not pull or build timing image: $timing_image"
+    return 1
 }
 
 # Update deployment to use timing-enabled image and environment (with windowed sampling)
@@ -539,14 +564,7 @@ update_deployment_for_timing() {
     
     log "$exp_dir" "Updating deployment for $service with windowed sampling configuration (iteration $iteration)"
     
-    # Get windowed image name dynamically from current deployment
     local timing_image=$(get_current_windowed_image "$service")
-    
-    if [[ -z "$timing_image" ]]; then
-        log "$exp_dir" "ERROR: Could not determine windowed image for service $service"
-        return 1
-    fi
-    
     log "$exp_dir" "Will use windowed image: $timing_image"
     local container_name=$(get_container_name "$service")
     
@@ -992,6 +1010,7 @@ validate_config() {
 	
 	echo ""
 	echo "Windowed Sampling Configuration:"
+	echo "  Timing Image: ${TIMING_REGISTRY}/<service>-${WINDOWED_IMAGE_SUFFIX}:${WINDOWED_IMAGE_TAG}"
 	echo "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
 	echo "  Perf Events: ${PERF_EVENTS}"
 	if [[ -n "${CONTENTION_SHAPE:-}" ]]; then
@@ -1008,9 +1027,17 @@ validate_config() {
         exit 1
     fi
     
-    # Check if wrk2 exists
-    if [[ -n "${WRK2_TARGET_SERVICE:-}" && ! -f "$WRK2_DIR/wrk" ]]; then
-        echo "WARNING: wrk2 not found at: $WRK2_DIR/wrk (will skip workload generation)"
+    # Check if wrk2 exists (giltene tree when WRK2_RATE=1, else DSB/custom fork under WRK2_DIR)
+    if [[ -n "${WRK2_TARGET_SERVICE:-}" ]]; then
+        local _wrk_rate="${WRK2_RATE:-200}"
+        if [[ "$_wrk_rate" =~ ^[0-9]+$ ]] && (( 10#_wrk_rate == 1 )); then
+            if [[ ! -f "$WRK2_GILTENE_DIR/wrk" ]]; then
+                echo "WARNING: giltene wrk2 (1 RPS baseline) not found at: $WRK2_GILTENE_DIR/wrk (will skip workload generation)"
+                echo "         Build from https://github.com/giltene/wrk2 or set WRK2_GILTENE_DIR to the directory containing the wrk binary."
+            fi
+        elif [[ ! -f "$WRK2_DIR/wrk" ]]; then
+            echo "WARNING: wrk2 not found at: $WRK2_DIR/wrk (will skip workload generation)"
+        fi
     fi
     
     # Check Docker access for timing image building (if needed)
@@ -1349,7 +1376,8 @@ deploy_victim_services() {
         else
             # Deploy regular service (either windowed sampling is disabled or service doesn't support it)
             if validate_timing_service "$service" && [[ "${ENABLE_WINDOWED_SAMPLING:-true}" != "true" ]]; then
-                log "$exp_dir" "Deploying regular $service (windowed sampling disabled)"
+                local pinning_status="CPU pinning: ${ENABLE_CPU_PINNING:-true}"
+                log "$exp_dir" "Deploying regular $service (windowed sampling disabled, $pinning_status)"
             else
                 log "$exp_dir" "Deploying regular $service"
             fi
@@ -1382,6 +1410,11 @@ deploy_regular_service() {
         
         # Add toleration and node selector to the deployment
         "$TAINT_SCRIPT" "$target_node" "$service"
+        
+        # Apply CPU pinning if enabled and service supports timing (victim services)
+        if [[ "${ENABLE_CPU_PINNING:-true}" == "true" ]] && validate_timing_service "$service"; then
+            apply_cpu_pinning_to_deployment "$service" "$exp_dir"
+        fi
         
         # Wait for deployment to be ready
         kubectl rollout status deployment "$service" --timeout=120s
@@ -2136,12 +2169,19 @@ start_workload_and_latency() {
         return
     fi
     
+    local wrk2_binary="$WRK2_DIR/wrk"
+    local use_giltene_baseline=false
+    if [[ "$rate" =~ ^[0-9]+$ ]] && (( 10#rate == 1 )); then
+        use_giltene_baseline=true
+        wrk2_binary="$WRK2_GILTENE_DIR/wrk"
+    fi
+
     # Skip if wrk2 not available
-    if [[ ! -f "$WRK2_DIR/wrk" ]]; then
-        log "$exp_dir" "wrk2 not found, skipping workload generation"
+    if [[ ! -f "$wrk2_binary" ]]; then
+        log "$exp_dir" "wrk2 not found at: $wrk2_binary (giltene baseline uses WRK2_GILTENE_DIR when rate=1), skipping workload generation"
         return
     fi
-    
+
     log "$exp_dir" "Starting wrk2 workload generation for $target_service"
     
     # Get service endpoint - try different methods
@@ -2162,9 +2202,20 @@ start_workload_and_latency() {
     log "$exp_dir" "Target URL: $target_url"
     log "$exp_dir" "Workload script: ${workload_script:-none}"
     log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $connections, Duration: ${duration}s"
-    
-    # Construct wrk2 command
-    local wrk2_cmd="$WRK2_DIR/wrk -D exp -t $threads -c $connections -d ${duration}s -L -R $rate"
+
+    local wrk2_cmd=""
+    if [[ "$use_giltene_baseline" == true ]]; then
+        log "$exp_dir" "wrk2 mode: giltene/wrk2 baseline (1 RPS) — binary: $wrk2_binary"
+        if [[ "$duration" =~ ^[0-9]+$ ]] && (( duration < 20 )); then
+            log "$exp_dir" "NOTE: giltene/wrk2 uses a long calibration window; runs under ~10–20s may show limited percentile detail (duration=${duration}s)."
+        fi
+        # giltene/wrk2: constant throughput via -R/--rate; detailed HdrHistogram output via --latency (not -D exp / -L).
+        # giltene README examples use no-space flag style: -t2 -c100 -d30s -R2000
+        wrk2_cmd="$wrk2_binary -t${threads} -c${connections} -d${duration}s -R1 --latency"
+        [[ -n "${WRK2_GILTENE_EXTRA_ARGS:-}" ]] && wrk2_cmd="$wrk2_cmd $WRK2_GILTENE_EXTRA_ARGS"
+    else
+        wrk2_cmd="$wrk2_binary -D exp -t $threads -c $connections -d ${duration}s -L -R $rate"
+    fi
     
     if [[ -n "$workload_script" && -f "$workload_script" ]]; then
         wrk2_cmd="$wrk2_cmd -s $workload_script"
@@ -2508,6 +2559,12 @@ generate_metadata() {
             }
         }"
     fi
+
+    local wrk2_mode="dsb_wrk2_fork"
+    local _meta_wrk_rate="${WRK2_RATE:-200}"
+    if [[ "$_meta_wrk_rate" =~ ^[0-9]+$ ]] && (( 10#_meta_wrk_rate == 1 )); then
+        wrk2_mode="giltene_1rps_baseline"
+    fi
     
     cat > "$exp_dir/metadata/experiment.json" << EOF
 {
@@ -2525,6 +2582,12 @@ generate_metadata() {
             "data_collection": "Full timeline from workload start to iteration end, including idle periods",
             "rationale": "Captures development of contention and performance changes when approaching/leaving contention"
         },
+        "cpu_pinning": {
+            "enabled": ${ENABLE_CPU_PINNING:-true},
+            "cpus_per_service": ${CPUS_PER_SERVICE:-3},
+            "starting_cpu": ${STARTING_CPU:-0},
+            "description": "Controls CPU pinning for no-instrumentation case only (instrumented case always pins via image ENTRYPOINT)"
+        },
         "noisy_neighbor": {
             "type": "$NOISY_NEIGHBOR_TYPE",
             "args": "${NOISY_NEIGHBOR_ARGS:-}",
@@ -2540,7 +2603,11 @@ generate_metadata() {
             "rate": ${WRK2_RATE:-200},
             "threads": ${WRK2_THREADS:-2},
             "connections": ${WRK2_CONNECTIONS:-2},
-            "start_timing": "5s after iteration start (early start)"
+            "start_timing": "5s after iteration start (early start)",
+            "mode": "$wrk2_mode",
+            "wrk2_dir": "${WRK2_DIR}",
+            "wrk2_giltene_dir": "${WRK2_GILTENE_DIR}",
+            "giltene_command_note": "When mode is giltene_1rps_baseline: wrk -t T -c C -d Ds -R 1 --latency [WRK2_GILTENE_EXTRA_ARGS] [-s script] URL"
         }
     },
     "system_info": {
@@ -3012,16 +3079,24 @@ CONTENTION_BURSTS=$(repeat_burst 0 30 10 5 4)
 ITERATIONS=3
 ITERATION_DELAY=60
 
-# Windowed sampling
+# Windowed sampling (instrumented images: <TIMING_REGISTRY>/<service>-windowed:<WINDOWED_IMAGE_TAG>)
 ENABLE_WINDOWED_SAMPLING=true
+TIMING_REGISTRY='docclabgroup'                    # Docker Hub org/user that hosts the windowed images
+WINDOWED_IMAGE_TAG='windowed-arrivalrate'         # Tag for windowed images (e.g. docker pull docclabgroup/search-windowed:windowed-arrivalrate)
 WINDOW_INTERVAL_MS=100
 PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
 
+# CPU pinning (taskset) for no-instrumentation case only
+# (instrumented case always uses CPU pinning via windowed image ENTRYPOINT)
+ENABLE_CPU_PINNING=true
+CPUS_PER_SERVICE=3    # Each service gets 3 CPUs
+STARTING_CPU=0        # Start allocating from CPU 0
+
 # Jaeger tracing
 JAEGER_SAMPLE_RATIO=0.01  # 1% sampling, set to 0 to disable
 
-# wrk2 workload
+# wrk2 workload (WRK2_RATE=1 uses giltene/wrk2 from WRK2_GILTENE_DIR with -R 1 --latency; other rates use WRK2_DIR with -D exp -L)
 WRK2_TARGET_SERVICE='frontend'
 WRK2_TARGET_IP='192.168.1.100'  # CHANGE TO YOUR IP
 WRK2_TARGET_PORT=5000
@@ -3029,6 +3104,8 @@ WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
 WRK2_RATE=200
 WRK2_THREADS=3
 WRK2_CONNECTIONS=3
+# WRK2_GILTENE_DIR='../../../wrk2'   # default; set to ../../wrk2 if wrk2 lives next to your repo root
+# WRK2_GILTENE_EXTRA_ARGS=''       # e.g. --u_latency for giltene-only histograms
 
 # Timeline (per iteration):
 #   0-30s:   Burst 1 (4 CPUs) - active samples
