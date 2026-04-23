@@ -3,10 +3,13 @@
 # Step 1: Workload Characterization Without Stressor
 # Part of Hardware Counter Justification Plan
 #
+# Characterizes services under vanilla (unmodified) deployment — no
+# interceptor, no in-process perf sampling, no stressors.
+#
 # Two stages:
 #   Stage 1 — Saturation Test: sweep RPS to find the knee point
 #   Stage 2 — Characterization: run at 90% knee-point RPS, collect
-#             perf counters (in-process), CPU/mem/net (external), latency
+#             perf counters (external via perf stat), CPU/mem/net, latency
 #
 # Usage: ./step1-characterize.sh <config-file>
 # ===========================================================================
@@ -16,8 +19,7 @@ set -o pipefail
 
 STEP1_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source data-collector.sh for shared utility functions
-# (deploy_victim_services, validate_system_readiness, etc.)
+# Source data-collector.sh for shared deployment utility functions
 source "$STEP1_SCRIPTS_DIR/data-collector.sh"
 
 # ===========================================================================
@@ -30,13 +32,15 @@ SATURATION_STEP_RPS="${SATURATION_STEP_RPS:-50}"
 SATURATION_MAX_RPS="${SATURATION_MAX_RPS:-2000}"
 SATURATION_DURATION="${SATURATION_DURATION:-30}"
 SATURATION_WARMUP="${SATURATION_WARMUP:-10}"
-# Knee-point declared when p99 >= this multiplier of the baseline p99
 SATURATION_P99_THRESHOLD="${SATURATION_P99_THRESHOLD:-2.0}"
 
 # Characterization
 CHARACTERIZE_DURATION="${CHARACTERIZE_DURATION:-300}"   # 5 min
 CHARACTERIZE_RUNS="${CHARACTERIZE_RUNS:-5}"
 CHARACTERIZE_KNEE_FRACTION="${CHARACTERIZE_KNEE_FRACTION:-0.9}"  # 90 %
+
+# External perf stat
+PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,context-switches,cpu-migrations,page-faults}"
 
 # ===========================================================================
 # Logging
@@ -72,13 +76,6 @@ step1_parse_wrk2_p50() {
         else if (v ~ /us$/) { gsub(/us$/, "", v); printf "%.2f", v/1000 }
         else if (v ~ /s$/)  { gsub(/s$/,  "", v); printf "%.2f", v*1000 }
         else                 { printf "%.2f", v }
-    }'
-}
-
-step1_parse_wrk2_mean() {
-    local file="$1"
-    grep -E '^\s+#\[Mean' "$file" 2>/dev/null | head -1 | awk -F'[=,]' '{
-        gsub(/ /, "", $2); printf "%.2f", $2/1000
     }'
 }
 
@@ -143,7 +140,7 @@ step1_saturation_sweep() {
         step1_log "$exp_dir" "--- Level $level: ${rps} RPS ---"
         step1_run_wrk2 "$exp_dir" "$rps" "$SATURATION_DURATION" "$out"
 
-        local p99  p50  actual errors p99_ratio
+        local p99 p50 actual errors p99_ratio
         p99=$(step1_parse_wrk2_p99 "$out")
         p50=$(step1_parse_wrk2_p50 "$out")
         actual=$(step1_parse_wrk2_actual_rps "$out")
@@ -225,8 +222,8 @@ EOJSON
 #
 # Runs a lightweight polling loop *inside* each observed-service pod via
 # kubectl exec.  Reads /proc/1/stat, /proc/1/status, /proc/net/dev once
-# per second and writes a CSV to /data/system_metrics_run<N>/metrics.csv
-# in the pod.  Returns the background kubectl-exec PID.
+# per second and writes a CSV in the pod.
+# Returns the background kubectl-exec PID.
 # ===========================================================================
 
 step1_start_pod_monitor() {
@@ -245,7 +242,6 @@ step1_start_pod_monitor() {
         END=$(( $(date +%s) + DUR + 5 ))
         while [ "$(date +%s)" -lt "$END" ]; do
             TS=$(date +%s%N)
-            # /proc/1/stat: strip comm field (in parens), then parse
             RAW=$(sed "s/.*) //" /proc/1/stat)
             UTIME=$(echo  "$RAW" | awk "{print \$12}")
             STIME=$(echo  "$RAW" | awk "{print \$13}")
@@ -265,19 +261,120 @@ step1_start_pod_monitor() {
     echo "$pid"
 }
 
-step1_stop_pod_monitor() {
-    local pid="$1" exp_dir="$2"
+step1_wait_background_pid() {
+    local pid="$1" exp_dir="$2" label="$3"
     if kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null || true
     fi
-    step1_log "$exp_dir" "  Monitor PID $pid finished"
+    step1_log "$exp_dir" "  $label PID $pid finished"
 }
 
 # ===========================================================================
-# Retrieve data from an observed-service pod after a characterization run
+# External perf stat collection (via SSH to node)
+#
+# Resolves the container PID on the host, then runs
+#   sudo perf stat -e <events> -p <PID> sleep <duration>
+# Output is saved to a file for later parsing.
 # ===========================================================================
 
-step1_retrieve_run_data() {
+step1_start_perf_stat() {
+    local service="$1" run_num="$2" duration="$3" exp_dir="$4"
+    local output_file="$exp_dir/runs/run_${run_num}/perf/${service}_perf_stat.txt"
+    mkdir -p "$(dirname "$output_file")"
+
+    # Resolve pod → node + container ID
+    local pod_name
+    pod_name=$(kubectl get pods -l io.kompose.service="$service" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod_name" ]]; then
+        step1_log "$exp_dir" "  WARNING: no pod for $service, skipping perf stat"
+        echo ""
+        return
+    fi
+
+    local node_name
+    node_name=$(kubectl get pod "$pod_name" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    local container_id
+    container_id=$(kubectl get pod "$pod_name" \
+        -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null | sed 's|.*://||')
+
+    if [[ -z "$node_name" || -z "$container_id" ]]; then
+        step1_log "$exp_dir" "  WARNING: could not resolve node/container for $service"
+        echo ""
+        return
+    fi
+
+    step1_log "$exp_dir" "  Starting perf stat on $node_name for $service (container $container_id)"
+
+    local events="$PERF_EVENTS"
+
+    # SSH to the node, find host PID, run perf stat
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$node_name" "
+        # Try docker first, then crictl
+        PID=\$(docker inspect $container_id --format '{{.State.Pid}}' 2>/dev/null)
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
+            PID=\$(crictl inspect --output go-template --template '{{.info.pid}}' $container_id 2>/dev/null)
+        fi
+
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
+            echo 'ERROR: could not resolve container PID'
+            exit 1
+        fi
+
+        echo \"host_pid=\$PID\"
+        echo \"node=$node_name\"
+        echo \"service=$service\"
+        echo \"container_id=$container_id\"
+        echo \"events=$events\"
+        echo \"duration=${duration}s\"
+        echo '---'
+        sudo perf stat -e $events -p \$PID sleep $duration 2>&1
+    " > "$output_file" 2>&1 &
+
+    local pid=$!
+    step1_log "$exp_dir" "  perf stat PID $pid (ssh background)"
+    echo "$pid"
+}
+
+step1_parse_perf_stat_file() {
+    local perf_file="$1"
+
+    if [[ ! -s "$perf_file" ]] || grep -q 'ERROR:' "$perf_file" 2>/dev/null; then
+        echo "{}"
+        return
+    fi
+
+    # Parse "   1,234,567      event-name" lines from perf stat output
+    python3 -c "
+import sys, re, json
+
+data = open(sys.argv[1]).read()
+counters = {}
+for line in data.splitlines():
+    m = re.match(r'^\s+([\d,]+)\s+(\S+)', line)
+    if m:
+        val = int(m.group(1).replace(',', ''))
+        name = m.group(2)
+        counters[name] = val
+
+result = dict(counters)
+cyc = counters.get('cycles', 0)
+ins = counters.get('instructions', 0)
+cref = counters.get('cache-references', 0)
+cmiss = counters.get('cache-misses', 0)
+if cyc > 0:
+    result['ipc'] = round(ins / cyc, 4)
+if cref > 0:
+    result['cache_miss_rate'] = round(cmiss / cref, 6)
+print(json.dumps(result))
+" "$perf_file" 2>/dev/null || echo "{}"
+}
+
+# ===========================================================================
+# Retrieve system metrics from a pod after a characterization run
+# ===========================================================================
+
+step1_retrieve_system_metrics() {
     local service="$1" run_num="$2" run_dir="$3" exp_dir="$4"
 
     local pod_name
@@ -288,37 +385,6 @@ step1_retrieve_run_data() {
         return 1
     fi
 
-    # --- Windowed perf + timing JSON ---
-    mkdir -p "$run_dir/windowed"
-    local iter_id=$run_num
-    local remote_file="/data/run_data_${service}_iter${iter_id}.json"
-
-    if kubectl exec "$pod_name" -- test -f "$remote_file" 2>/dev/null; then
-        kubectl exec "$pod_name" -- cat "$remote_file" \
-            > "$run_dir/windowed/${service}_raw.json" 2>/dev/null
-        step1_log "$exp_dir" "  Retrieved windowed data for $service"
-
-        if command -v jq >/dev/null 2>&1 && [[ -s "$run_dir/windowed/${service}_raw.json" ]]; then
-            jq '{
-                service_name, iteration_id, run_start, run_end,
-                run_duration_ms, window_interval_ms, perf_events,
-                sample_count, aggregates,
-                samples: [.samples[] | {
-                    sample_id, timestamp, offset_ms,
-                    perf_counters, perf_deltas,
-                    timing_window
-                }]
-            }' "$run_dir/windowed/${service}_raw.json" \
-                > "$run_dir/windowed/${service}.json" 2>/dev/null || \
-                cp "$run_dir/windowed/${service}_raw.json" "$run_dir/windowed/${service}.json"
-        fi
-    else
-        step1_log "$exp_dir" "  WARNING: windowed data file not found for $service"
-        kubectl exec "$pod_name" -- ls -la /data/ 2>/dev/null | \
-            while read -r line; do step1_log "$exp_dir" "    $line"; done
-    fi
-
-    # --- System metrics CSV ---
     mkdir -p "$run_dir/system"
     local remote_csv="/data/system_metrics_run${run_num}/metrics.csv"
 
@@ -335,31 +401,26 @@ step1_retrieve_run_data() {
 
 # ===========================================================================
 # Stage 2 — Characterization Runs
+#
+# Each run: restart pods (clean state) → start monitors + perf stat →
+#           run wrk2 → collect data.
 # ===========================================================================
 
-step1_prepare_iteration() {
+step1_prepare_run() {
     local exp_dir="$1" run_num="$2" observed_services="$3"
 
-    step1_log "$exp_dir" "Preparing run $run_num — updating ITERATION_ID and restarting pods ..."
+    step1_log "$exp_dir" "Preparing run $run_num — restarting pods for clean process state ..."
 
     for service in $observed_services; do
-        if validate_timing_service "$service"; then
-            kubectl set env "deployment/$service" \
-                "ITERATION_ID=${run_num}" \
-                "EXPERIMENT_DURATION=${CHARACTERIZE_DURATION}" 2>/dev/null
+        # Set ITERATION_ID for tracking (visible in kubectl describe)
+        kubectl set env "deployment/$service" "ITERATION_ID=${run_num}" 2>/dev/null || true
 
-            if [[ -n "${PERF_EVENTS:-}" ]]; then
-                kubectl set env "deployment/$service" \
-                    "PERF_EVENTS=${PERF_EVENTS}" 2>/dev/null
-            fi
-
-            kubectl rollout restart "deployment/$service" 2>/dev/null || true
-            kubectl rollout status  "deployment/$service" --timeout=120s 2>/dev/null || \
-                step1_log "$exp_dir" "WARNING: timeout waiting for $service restart"
-        fi
+        kubectl rollout restart "deployment/$service" 2>/dev/null || true
+        kubectl rollout status  "deployment/$service" --timeout=120s 2>/dev/null || \
+            step1_log "$exp_dir" "WARNING: timeout waiting for $service restart"
     done
 
-    step1_log "$exp_dir" "Waiting 25s for services to stabilize and start sampling ..."
+    step1_log "$exp_dir" "Waiting 25s for services to stabilize ..."
     sleep 25
 }
 
@@ -367,17 +428,17 @@ step1_run_single_characterization() {
     local exp_dir="$1" run_num="$2" char_rps="$3" observed_services="$4"
 
     local run_dir="$exp_dir/runs/run_${run_num}"
-    mkdir -p "$run_dir"/{latency,windowed,system}
+    mkdir -p "$run_dir"/{latency,perf,system}
 
     step1_log "$exp_dir" "------------------------------------------"
     step1_log "$exp_dir" " Characterization Run $run_num / $CHARACTERIZE_RUNS"
     step1_log "$exp_dir" " RPS=${char_rps}  Duration=${CHARACTERIZE_DURATION}s"
     step1_log "$exp_dir" "------------------------------------------"
 
-    # 1. Prepare pods (new ITERATION_ID, restart, wait)
-    step1_prepare_iteration "$exp_dir" "$run_num" "$observed_services"
+    # 0. Restart pods for clean process state
+    step1_prepare_run "$exp_dir" "$run_num" "$observed_services"
 
-    # 2. Start pod monitors for every observed service
+    # 1. Start pod monitors (CPU / memory / network via /proc)
     local monitor_pids=()
     for service in $observed_services; do
         local pod
@@ -388,6 +449,14 @@ step1_run_single_characterization() {
             mpid=$(step1_start_pod_monitor "$pod" "$run_num" "$CHARACTERIZE_DURATION" "$exp_dir")
             monitor_pids+=("$mpid")
         fi
+    done
+
+    # 2. Start external perf stat (IPC, cache miss rate via SSH + perf)
+    local perf_pids=()
+    for service in $observed_services; do
+        local ppid
+        ppid=$(step1_start_perf_stat "$service" "$run_num" "$CHARACTERIZE_DURATION" "$exp_dir")
+        [[ -n "$ppid" ]] && perf_pids+=("$ppid")
     done
 
     # 3. Brief settle before load
@@ -420,19 +489,30 @@ step1_run_single_characterization() {
     errors=$(step1_parse_wrk2_errors "$run_dir/latency/wrk2_output.txt")
     step1_log "$exp_dir" "  Latency: p50=${p50}ms  p99=${p99}ms  actual_rps=${actual_rps}  errors=${errors}"
 
-    # 8. Let data flush inside pods
-    step1_log "$exp_dir" "  Waiting 10s for in-pod data flush ..."
-    sleep 10
-
-    # 9. Stop monitors
+    # 8. Wait for monitors and perf stat to finish
+    step1_log "$exp_dir" "  Waiting for background collectors ..."
     for mpid in "${monitor_pids[@]}"; do
-        step1_stop_pod_monitor "$mpid" "$exp_dir"
+        step1_wait_background_pid "$mpid" "$exp_dir" "Monitor"
+    done
+    for ppid in "${perf_pids[@]}"; do
+        step1_wait_background_pid "$ppid" "$exp_dir" "perf stat"
     done
 
-    # 10. Retrieve all data from pods
-    step1_log "$exp_dir" "  Retrieving run data from pods ..."
+    # 9. Retrieve system metrics from pods
+    step1_log "$exp_dir" "  Retrieving data from pods ..."
     for service in $observed_services; do
-        step1_retrieve_run_data "$service" "$run_num" "$run_dir" "$exp_dir"
+        step1_retrieve_system_metrics "$service" "$run_num" "$run_dir" "$exp_dir"
+    done
+
+    # 10. Parse perf stat results
+    for service in $observed_services; do
+        local pf="$run_dir/perf/${service}_perf_stat.txt"
+        if [[ -s "$pf" ]]; then
+            local parsed
+            parsed=$(step1_parse_perf_stat_file "$pf")
+            echo "$parsed" > "$run_dir/perf/${service}_perf_parsed.json"
+            step1_log "$exp_dir" "  perf stat for $service: $parsed"
+        fi
     done
 
     # 11. Write per-run summary
@@ -463,6 +543,9 @@ step1_characterize() {
     step1_log "$exp_dir" " Observed services: $observed_services"
     step1_log "$exp_dir" "=========================================="
 
+    # Verify SSH + perf availability before starting runs
+    step1_verify_perf_access "$exp_dir" "$observed_services"
+
     for run_num in $(seq 1 "$CHARACTERIZE_RUNS"); do
         step1_run_single_characterization "$exp_dir" "$run_num" "$char_rps" "$observed_services"
 
@@ -475,24 +558,49 @@ step1_characterize() {
     step1_log "$exp_dir" "All $CHARACTERIZE_RUNS characterization runs complete"
 }
 
+step1_verify_perf_access() {
+    local exp_dir="$1" observed_services="$2"
+
+    step1_log "$exp_dir" "Verifying SSH + perf access for external counter collection ..."
+
+    for service in $observed_services; do
+        local pod_name node_name
+        pod_name=$(kubectl get pods -l io.kompose.service="$service" \
+                      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        node_name=$(kubectl get pod "$pod_name" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+
+        if [[ -z "$node_name" ]]; then
+            step1_log "$exp_dir" "  WARNING: cannot resolve node for $service"
+            continue
+        fi
+
+        if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$node_name" \
+                "command -v perf >/dev/null 2>&1 && echo 'perf OK'" 2>/dev/null | grep -q 'perf OK'; then
+            step1_log "$exp_dir" "  $service ($node_name): SSH + perf OK"
+        else
+            step1_log "$exp_dir" "  WARNING: SSH or perf not available on $node_name for $service"
+            step1_log "$exp_dir" "           IPC / cache-miss-rate will not be collected for this service"
+        fi
+    done
+}
+
 # ===========================================================================
 # Aggregation — produces final summary across all runs
 # ===========================================================================
 
 step1_aggregate() {
-    local exp_dir="$1" victim_services="$2"
+    local exp_dir="$1" observed_services="$2"
     local summary_dir="$exp_dir/summary"
     mkdir -p "$summary_dir"
 
     step1_log "$exp_dir" "Aggregating results ..."
 
-    # Requires Python 3 for the heavy lifting
     if ! command -v python3 >/dev/null 2>&1; then
         step1_log "$exp_dir" "WARNING: python3 not found, skipping aggregation"
         return 1
     fi
 
-    python3 - "$exp_dir" "$victim_services" "$CHARACTERIZE_RUNS" <<'PYEOF'
+    python3 - "$exp_dir" "$observed_services" "$CHARACTERIZE_RUNS" <<'PYEOF'
 import sys, os, json, csv, math
 from pathlib import Path
 
@@ -539,57 +647,18 @@ for run_num in range(1, total_runs + 1):
     for svc in services:
         svc_info = {}
 
-        # --- Windowed perf data ---
-        wfile = run_dir / "windowed" / f"{svc}.json"
-        if wfile.exists():
-            with open(wfile) as f:
-                wdata = json.load(f)
+        # --- perf stat data (external, via SSH) ---
+        perf_file = run_dir / "perf" / f"{svc}_perf_parsed.json"
+        if perf_file.exists():
+            with open(perf_file) as f:
+                try:
+                    perf_data = json.load(f)
+                except json.JSONDecodeError:
+                    perf_data = {}
+            if perf_data:
+                svc_info["perf"] = perf_data
 
-            samples = wdata.get("samples", [])
-            active_samples = [s for s in samples
-                              if s.get("timing_window", {}).get("request_count", 0) > 0]
-
-            total_cycles = sum(s.get("perf_deltas", {}).get("cycles", 0) for s in active_samples)
-            total_instr  = sum(s.get("perf_deltas", {}).get("instructions", 0) for s in active_samples)
-            total_cache_ref  = sum(s.get("perf_deltas", {}).get("cache-references", 0) for s in active_samples)
-            total_cache_miss = sum(s.get("perf_deltas", {}).get("cache-misses", 0) for s in active_samples)
-
-            ipc = total_instr / total_cycles if total_cycles > 0 else 0
-            cache_miss_rate = total_cache_miss / total_cache_ref if total_cache_ref > 0 else 0
-
-            per_sample_ipc = []
-            for s in active_samples:
-                cyc = s.get("perf_deltas", {}).get("cycles", 0)
-                ins = s.get("perf_deltas", {}).get("instructions", 0)
-                if cyc > 0:
-                    per_sample_ipc.append(ins / cyc)
-
-            svc_info["perf"] = {
-                "ipc": round(ipc, 4),
-                "ipc_stddev": round(stddev(per_sample_ipc), 4),
-                "cache_miss_rate": round(cache_miss_rate, 6),
-                "total_cycles": total_cycles,
-                "total_instructions": total_instr,
-                "total_cache_references": total_cache_ref,
-                "total_cache_misses": total_cache_miss,
-                "active_samples": len(active_samples),
-                "total_samples": len(samples),
-            }
-
-            # Collect all perf delta totals
-            all_events = {}
-            for s in active_samples:
-                for evt, val in s.get("perf_deltas", {}).items():
-                    all_events[evt] = all_events.get(evt, 0) + val
-            svc_info["perf"]["event_totals"] = all_events
-
-            # Timing stats from aggregates
-            agg = wdata.get("aggregates", {})
-            svc_info["perf"]["total_requests"] = agg.get("total_requests", 0)
-            if agg.get("timing_overall"):
-                svc_info["perf"]["timing_overall_ns"] = agg["timing_overall"]
-
-        # --- System metrics (CPU / memory / network) ---
+        # --- System metrics (CPU / memory / network from /proc) ---
         csv_file = run_dir / "system" / f"{svc}_metrics.csv"
         if csv_file.exists():
             rows = []
@@ -599,17 +668,7 @@ for run_num in range(1, total_runs + 1):
                     rows.append(row)
 
             if len(rows) >= 2:
-                # CPU: delta(utime+stime) / delta(wallclock) / CLK_TCK * 100
                 cpu_pcts = []
-                for i in range(1, len(rows)):
-                    dt_ns = safe_float(rows[i]["ts_epoch_ns"]) - safe_float(rows[i-1]["ts_epoch_ns"])
-                    dt_s = dt_ns / 1e9 if dt_ns > 0 else 1
-                    d_utime = safe_float(rows[i]["utime"]) - safe_float(rows[i-1]["utime"])
-                    d_stime = safe_float(rows[i]["stime"]) - safe_float(rows[i-1]["stime"])
-                    cpu_pct = ((d_utime + d_stime) / CLK_TCK) / dt_s * 100
-                    cpu_pcts.append(cpu_pct)
-
-                    # individual usr/sys
                 usr_pcts = []
                 sys_pcts = []
                 for i in range(1, len(rows)):
@@ -619,10 +678,10 @@ for run_num in range(1, total_runs + 1):
                     d_s = safe_float(rows[i]["stime"]) - safe_float(rows[i-1]["stime"])
                     usr_pcts.append((d_u / CLK_TCK) / dt_s * 100)
                     sys_pcts.append((d_s / CLK_TCK) / dt_s * 100)
+                    cpu_pcts.append(((d_u + d_s) / CLK_TCK) / dt_s * 100)
 
                 vmrss_vals = [safe_float(r["vmrss_kb"]) for r in rows if r.get("vmrss_kb")]
 
-                # Network throughput
                 first_rx = safe_float(rows[0].get("rx_bytes", 0))
                 last_rx  = safe_float(rows[-1].get("rx_bytes", 0))
                 first_tx = safe_float(rows[0].get("tx_bytes", 0))
@@ -638,7 +697,7 @@ for run_num in range(1, total_runs + 1):
                     "cpu_sys_mean":  round(mean(sys_pcts), 2),
                     "vmrss_kb_mean": round(mean(vmrss_vals), 0),
                     "vmrss_kb_max":  round(max(vmrss_vals) if vmrss_vals else 0, 0),
-                    "vmrss_mb_mean": round(mean(vmrss_vals) / 1024, 2),
+                    "vmrss_mb_mean": round(mean(vmrss_vals) / 1024, 2) if vmrss_vals else 0,
                     "net_rx_bytes_sec": round((last_rx - first_rx) / wall_s, 0),
                     "net_tx_bytes_sec": round((last_tx - first_tx) / wall_s, 0),
                     "net_rx_mbps": round((last_rx - first_rx) / wall_s * 8 / 1e6, 3),
@@ -660,21 +719,21 @@ for svc in services:
 
     for rd in runs_data:
         si = rd.get("services", {}).get(svc, {})
-        perf_d  = si.get("perf", {})
-        sys_d   = si.get("system", {})
-        lat_d   = rd.get("latency", {})
+        perf_d = si.get("perf", {})
+        sys_d  = si.get("system", {})
+        lat_d  = rd.get("latency", {})
 
-        if perf_d.get("ipc"):       svc_agg["ipc"].append(perf_d["ipc"])
+        if perf_d.get("ipc"):             svc_agg["ipc"].append(perf_d["ipc"])
         if perf_d.get("cache_miss_rate"): svc_agg["cache_miss_rate"].append(perf_d["cache_miss_rate"])
-        if sys_d.get("cpu_pct_mean"):  svc_agg["cpu_pct"].append(sys_d["cpu_pct_mean"])
-        if sys_d.get("cpu_usr_mean"):  svc_agg["cpu_usr"].append(sys_d["cpu_usr_mean"])
-        if sys_d.get("cpu_sys_mean"):  svc_agg["cpu_sys"].append(sys_d["cpu_sys_mean"])
-        if sys_d.get("vmrss_kb_mean"): svc_agg["vmrss_kb"].append(sys_d["vmrss_kb_mean"])
-        if sys_d.get("net_rx_mbps"):   svc_agg["net_rx_mbps"].append(sys_d["net_rx_mbps"])
-        if sys_d.get("net_tx_mbps"):   svc_agg["net_tx_mbps"].append(sys_d["net_tx_mbps"])
-        if lat_d.get("p99_ms"):   svc_agg["p99_ms"].append(safe_float(lat_d["p99_ms"]))
-        if lat_d.get("p50_ms"):   svc_agg["p50_ms"].append(safe_float(lat_d["p50_ms"]))
-        if lat_d.get("actual_rps"): svc_agg["actual_rps"].append(safe_float(lat_d["actual_rps"]))
+        if sys_d.get("cpu_pct_mean"):     svc_agg["cpu_pct"].append(sys_d["cpu_pct_mean"])
+        if sys_d.get("cpu_usr_mean"):     svc_agg["cpu_usr"].append(sys_d["cpu_usr_mean"])
+        if sys_d.get("cpu_sys_mean"):     svc_agg["cpu_sys"].append(sys_d["cpu_sys_mean"])
+        if sys_d.get("vmrss_kb_mean"):    svc_agg["vmrss_kb"].append(sys_d["vmrss_kb_mean"])
+        if sys_d.get("net_rx_mbps"):      svc_agg["net_rx_mbps"].append(sys_d["net_rx_mbps"])
+        if sys_d.get("net_tx_mbps"):      svc_agg["net_tx_mbps"].append(sys_d["net_tx_mbps"])
+        if lat_d.get("p99_ms"):           svc_agg["p99_ms"].append(safe_float(lat_d["p99_ms"]))
+        if lat_d.get("p50_ms"):           svc_agg["p50_ms"].append(safe_float(lat_d["p50_ms"]))
+        if lat_d.get("actual_rps"):       svc_agg["actual_rps"].append(safe_float(lat_d["actual_rps"]))
 
     cross_run[svc] = {}
     for metric, vals in svc_agg.items():
@@ -697,10 +756,9 @@ with open(summary_dir / "cross_run.json", "w") as f:
 # ---- Human-readable report ----
 with open(summary_dir / "report.txt", "w") as f:
     f.write("=" * 70 + "\n")
-    f.write("  STEP 1 — WORKLOAD CHARACTERIZATION REPORT\n")
+    f.write("  STEP 1 — WORKLOAD CHARACTERIZATION REPORT (VANILLA)\n")
     f.write("=" * 70 + "\n\n")
 
-    # Load sweep summary
     sweep_file = Path(exp_dir) / "saturation" / "sweep_summary.json"
     if sweep_file.exists():
         with open(sweep_file) as sf:
@@ -722,23 +780,23 @@ with open(summary_dir / "report.txt", "w") as f:
             return (f"  {d['mean']*mult:.4f} +/- {d['stddev']*mult:.4f} {unit}"
                     f"  (min={d['min']*mult:.4f}  max={d['max']*mult:.4f}  n={d['n']})")
 
-        f.write(f"\n  [Perf Counters]\n")
+        f.write(f"\n  [Perf Counters — external perf stat]\n")
         f.write(f"    IPC               :{fmt('ipc')}\n")
         f.write(f"    Cache miss rate   :{fmt('cache_miss_rate')}\n")
 
-        f.write(f"\n  [CPU]\n")
+        f.write(f"\n  [CPU — /proc/1/stat]\n")
         f.write(f"    Total CPU %%       :{fmt('cpu_pct', '%')}\n")
         f.write(f"    User  CPU %%       :{fmt('cpu_usr', '%')}\n")
         f.write(f"    Sys   CPU %%       :{fmt('cpu_sys', '%')}\n")
 
-        f.write(f"\n  [Memory]\n")
+        f.write(f"\n  [Memory — /proc/1/status]\n")
         f.write(f"    VmRSS (KB)        :{fmt('vmrss_kb', 'KB')}\n")
 
-        f.write(f"\n  [Network]\n")
+        f.write(f"\n  [Network — /proc/net/dev]\n")
         f.write(f"    RX throughput      :{fmt('net_rx_mbps', 'Mbps')}\n")
         f.write(f"    TX throughput      :{fmt('net_tx_mbps', 'Mbps')}\n")
 
-        f.write(f"\n  [End-to-end Latency]\n")
+        f.write(f"\n  [End-to-end Latency — wrk2]\n")
         f.write(f"    p50               :{fmt('p50_ms', 'ms')}\n")
         f.write(f"    p99               :{fmt('p99_ms', 'ms')}\n")
         f.write(f"    Actual RPS        :{fmt('actual_rps', 'rps')}\n")
@@ -753,7 +811,6 @@ PYEOF
 
     step1_log "$exp_dir" "Aggregation complete — see $summary_dir/"
 
-    # Print report to terminal
     if [[ -f "$summary_dir/report.txt" ]]; then
         step1_log "$exp_dir" ""
         cat "$summary_dir/report.txt" >&2
@@ -786,13 +843,11 @@ step1_validate_config() {
     # Alias for data-collector.sh functions that reference VICTIM_SERVICES
     VICTIM_SERVICES="$OBSERVED_SERVICES"
 
-    # Defaults for variables referenced by data-collector.sh deploy functions
+    # Vanilla deployment — no interceptor, no windowed sampling
+    ENABLE_WINDOWED_SAMPLING="false"
+
+    # Defaults for data-collector.sh deploy function compatibility
     NOISY_NEIGHBOR_TYPE="${NOISY_NEIGHBOR_TYPE:-cpu}"
-    ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
-    WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
-    PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dTLB-load-misses,iTLB-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
-    TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-16384}"
-    TIMING_FLUSH_THRESHOLD="${TIMING_FLUSH_THRESHOLD:-80}"
     EXPERIMENT_DURATION="${EXPERIMENT_DURATION:-$CHARACTERIZE_DURATION}"
     JAEGER_SAMPLE_RATIO="${JAEGER_SAMPLE_RATIO:-0}"
     CONTENTION_BURSTS="none"
@@ -811,18 +866,17 @@ step1_setup() {
     mkdir -p "$exp_dir"/{logs,metadata,saturation,runs,summary}
 
     step1_log "$exp_dir" "=========================================="
-    step1_log "$exp_dir" " Step 1: Workload Characterization"
+    step1_log "$exp_dir" " Step 1: Workload Characterization (vanilla)"
     step1_log "$exp_dir" " Experiment: $EXPERIMENT_NAME"
     step1_log "$exp_dir" " ID: $exp_id"
     step1_log "$exp_dir" " Directory: $exp_dir"
     step1_log "$exp_dir" "=========================================="
 
-    # Write metadata
     cat > "$exp_dir/metadata/experiment.json" <<-EOJSON
 {
     "experiment_id": "$exp_id",
     "experiment_name": "$EXPERIMENT_NAME",
-    "experiment_type": "step1_characterization",
+    "experiment_type": "step1_characterization_vanilla",
     "target_node": "$TARGET_NODE",
     "observed_services": "$(echo $OBSERVED_SERVICES)",
     "config_file": "$(basename "$config_file")",
@@ -839,8 +893,9 @@ step1_setup() {
         "knee_fraction": $CHARACTERIZE_KNEE_FRACTION
     },
     "instrumentation": {
-        "windowed_sampling": "$ENABLE_WINDOWED_SAMPLING",
-        "window_interval_ms": $WINDOW_INTERVAL_MS,
+        "interceptor": false,
+        "windowed_sampling": false,
+        "perf_stat_external": true,
         "perf_events": "$PERF_EVENTS",
         "system_metrics": "proc_stat+proc_status+proc_net_dev@1Hz",
         "latency": "wrk2_hdr_histogram"
@@ -855,33 +910,35 @@ EOJSON
 step1_deploy() {
     local exp_dir="$1"
 
-    step1_log "$exp_dir" "Deploying observed services: $OBSERVED_SERVICES"
+    step1_log "$exp_dir" "Deploying observed services (vanilla images): $OBSERVED_SERVICES"
 
     # Remove anti-affinity from all deployments to allow placement
     local all_deps
-    all_deps=$(kubectl get deployments -n default -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null)
+    all_deps=$(kubectl get deployments -n default \
+        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null)
     if [[ -n "$all_deps" ]]; then
         remove_anti_affinity "$all_deps" "$exp_dir"
         sleep 5
     fi
 
-    # Reset other services to default images (function name from data-collector.sh)
-    reset_non_victim_services "$OBSERVED_SERVICES" "$exp_dir"
+    # Reset ALL services to default images (ensures vanilla deployment)
+    reset_non_victim_services "" "$exp_dir"
 
-    # Deploy observed services with timing images on target node
+    # Deploy observed services on target node using vanilla images
+    # ENABLE_WINDOWED_SAMPLING=false causes deploy_victim_services to use
+    # deploy_regular_service (standard image, no interceptor)
     deploy_victim_services "$OBSERVED_SERVICES" "$TARGET_NODE" "$exp_dir"
 
-    # Stabilisation
     step1_log "$exp_dir" "Waiting 45s for services to stabilize ..."
     sleep 45
 
-    # Configure Jaeger (disabled by default for characterization to reduce overhead)
+    # Configure Jaeger (disabled by default to avoid overhead)
     configure_jaeger_tracing "$exp_dir"
 
-    # Validate
+    # Validate system readiness
     step1_log "$exp_dir" "Validating system readiness ..."
     if ! validate_system_readiness "$exp_dir"; then
-        step1_log "$exp_dir" "WARNING: validation failed — attempting manual registration ..."
+        step1_log "$exp_dir" "WARNING: validation failed — attempting recovery ..."
         manual_register_all_services "$exp_dir" 2>/dev/null || true
         sleep 15
         if ! validate_system_readiness "$exp_dir"; then
@@ -901,7 +958,11 @@ step1_main() {
         cat <<'USAGE'
 Usage: ./step1-characterize.sh <config-file>
 
-Step 1 — Workload Characterization Without Stressor
+Step 1 — Workload Characterization Without Stressor (Vanilla)
+
+Deploys services with standard (unmodified) images — no interceptor,
+no in-process perf sampling.  Perf counters are collected externally
+via SSH + perf stat on the target node.
 
 Two stages:
   Stage 1  Saturation sweep — ramp RPS to find knee point
@@ -910,7 +971,7 @@ Two stages:
 Required config variables:
   EXPERIMENT_NAME       Descriptive name
   TARGET_NODE           Kubernetes node to pin observed services to
-  OBSERVED_SERVICES       Space-separated list (e.g. 'search profile')
+  OBSERVED_SERVICES     Space-separated list (e.g. 'search profile')
   WRK2_TARGET_IP        IP reachable from wrk2 client
   WRK2_TARGET_PORT      Port (usually 5000)
 
@@ -929,40 +990,24 @@ Optional:
   CHARACTERIZE_RUNS     Number of runs          (default: 5)
   CHARACTERIZE_KNEE_FRACTION  Fraction of knee  (default: 0.9)
 
-  ENABLE_WINDOWED_SAMPLING  true/false  (default: true)
-  WINDOW_INTERVAL_MS        Sampling window     (default: 100)
-  PERF_EVENTS               Comma-separated     (sensible default)
-  JAEGER_SAMPLE_RATIO       0 to disable tracing overhead (default: 0)
+  PERF_EVENTS           perf stat events (sensible default)
+  JAEGER_SAMPLE_RATIO   0 to disable tracing overhead (default: 0)
 
-Example config:
-
-  EXPERIMENT_NAME='Step1 Hotel Reservation Characterization'
-  TARGET_NODE='node-1'
-  OBSERVED_SERVICES='search profile'
-  WRK2_TARGET_IP='192.168.1.100'
-  WRK2_TARGET_PORT=5000
-  WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
-  WRK2_THREADS=3
-  WRK2_CONNECTIONS=3
-  SATURATION_START_RPS=100
-  SATURATION_STEP_RPS=100
-  SATURATION_MAX_RPS=3000
-  CHARACTERIZE_DURATION=300
-  CHARACTERIZE_RUNS=5
+Prerequisites:
+  - SSH access from wrk2 client to TARGET_NODE (for perf stat)
+  - perf installed on TARGET_NODE
+  - sudo access for perf stat on TARGET_NODE
 USAGE
         exit 1
     fi
 
     local config_file="$1"
 
-    # Setup
     local exp_dir
     exp_dir=$(step1_setup "$config_file")
 
-    # Deploy
     step1_deploy "$exp_dir"
 
-    # Stage 1 — Saturation sweep
     local char_rps
     char_rps=$(step1_saturation_sweep "$exp_dir")
 
@@ -971,14 +1016,11 @@ USAGE
         exit 1
     fi
 
-    # Brief cool-down between stages
     step1_log "$exp_dir" "Cool-down 30s between stages ..."
     sleep 30
 
-    # Stage 2 — Characterization runs
     step1_characterize "$exp_dir" "$char_rps" "$OBSERVED_SERVICES"
 
-    # Aggregate
     step1_aggregate "$exp_dir" "$OBSERVED_SERVICES"
 
     step1_log "$exp_dir" ""
