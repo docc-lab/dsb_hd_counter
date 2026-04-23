@@ -853,14 +853,7 @@ step1_validate_config() {
     CONTENTION_BURSTS="none"
 }
 
-step1_setup() {
-    local config_file="$1"
-
-    # Source contention-shapes.sh (needed by data-collector.sh internals)
-    [[ -f "$SHAPES_SCRIPT" ]] && source "$SHAPES_SCRIPT"
-
-    step1_validate_config "$config_file"
-
+step1_create_exp_dir() {
     local exp_id="step1_$(date +%Y%m%d_%H%M%S)_$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ')"
     local exp_dir="${STEP1_DATA_DIR:-./step1_data}/$exp_id"
     mkdir -p "$exp_dir"/{logs,metadata,saturation,runs,summary}
@@ -1003,8 +996,16 @@ USAGE
 
     local config_file="$1"
 
+    # Source contention-shapes.sh (needed by data-collector.sh internals)
+    [[ -f "$SHAPES_SCRIPT" ]] && source "$SHAPES_SCRIPT"
+
+    # Load and validate config in the current shell (NOT a subshell)
+    # so that all variables (OBSERVED_SERVICES, WRK2_TARGET_IP, etc.) persist
+    step1_validate_config "$config_file"
+
+    # Create experiment directory (runs in subshell to capture path)
     local exp_dir
-    exp_dir=$(step1_setup "$config_file")
+    exp_dir=$(step1_create_exp_dir)
 
     step1_deploy "$exp_dir"
 
