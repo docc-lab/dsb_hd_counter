@@ -32,7 +32,10 @@ SATURATION_STEP_RPS="${SATURATION_STEP_RPS:-50}"
 SATURATION_MAX_RPS="${SATURATION_MAX_RPS:-2000}"
 SATURATION_DURATION="${SATURATION_DURATION:-30}"
 SATURATION_WARMUP="${SATURATION_WARMUP:-10}"
-SATURATION_P99_THRESHOLD="${SATURATION_P99_THRESHOLD:-2.0}"
+SATURATION_P99_THRESHOLD="${SATURATION_P99_THRESHOLD:-4.0}"
+# After first saturation, keep running this many extra levels at the same
+# step to verify saturation holds and to better localize the knee.
+SATURATION_EXTRA_LEVELS="${SATURATION_EXTRA_LEVELS:-4}"
 
 # Characterization
 CHARACTERIZE_DURATION="${CHARACTERIZE_DURATION:-300}"   # 5 min
@@ -111,91 +114,164 @@ step1_run_wrk2() {
     eval "$cmd" > "$output" 2>&1 || true
 }
 
+# Evaluate one sweep level.
+# Args: exp_dir rps duration out_file baseline_p99 label csv_file phase
+# Echoes: "saturated|p99|p50|actual|errors|p99_ratio"
+# Appends a CSV row to csv_file.
+step1_eval_sweep_level() {
+    local exp_dir="$1" rps="$2" duration="$3" out="$4"
+    local baseline_p99="$5" label="$6" csv_file="$7" phase="$8"
+
+    step1_log "$exp_dir" "--- $label: ${rps} RPS ---"
+    step1_run_wrk2 "$exp_dir" "$rps" "$duration" "$out"
+
+    local p99 p50 actual errors
+    p99=$(step1_parse_wrk2_p99 "$out")
+    p50=$(step1_parse_wrk2_p50 "$out")
+    actual=$(step1_parse_wrk2_actual_rps "$out")
+    errors=$(step1_parse_wrk2_errors "$out")
+
+    if [[ -z "$p99" || "$p99" == "0" || "$p99" == "0.00" ]]; then
+        step1_log "$exp_dir" "  WARNING: could not parse p99 — treating as saturated"
+        echo "$label,$phase,$rps,0,0,0,0,0" >> "$csv_file"
+        echo "true|0|0|0|0|0"
+        return
+    fi
+
+    local p99_ratio="1.00"
+    if [[ -n "$baseline_p99" && "$baseline_p99" != "0" ]]; then
+        p99_ratio=$(awk "BEGIN {printf \"%.2f\", $p99 / $baseline_p99}")
+    fi
+
+    step1_log "$exp_dir" "  p99=${p99}ms  p50=${p50}ms  actual_rps=${actual}  errors=${errors}  p99_ratio=${p99_ratio}x"
+    echo "$label,$phase,$rps,${actual:-0},$p99,$p50,$p99_ratio,${errors:-0}" >> "$csv_file"
+
+    # ---- Saturation checks ----
+    local saturated=false
+    local reasons=""
+
+    if [[ -n "$baseline_p99" ]] && \
+       awk "BEGIN {exit !($p99_ratio >= $SATURATION_P99_THRESHOLD)}" 2>/dev/null; then
+        reasons="p99_ratio=${p99_ratio}x"
+        saturated=true
+    fi
+    if [[ "${errors:-0}" -gt 0 ]]; then
+        reasons="${reasons:+$reasons, }errors=${errors}"
+        saturated=true
+    fi
+    if [[ -n "$actual" ]] && awk "BEGIN {exit !($actual < $rps * 0.85)}" 2>/dev/null; then
+        reasons="${reasons:+$reasons, }rps_shortfall(${actual}<${rps})"
+        saturated=true
+    fi
+
+    [[ "$saturated" == "true" ]] && step1_log "$exp_dir" "  SATURATED: $reasons"
+
+    echo "${saturated}|${p99}|${p50}|${actual}|${errors}|${p99_ratio}"
+}
+
 step1_saturation_sweep() {
     local exp_dir="$1"
     local sweep_dir="$exp_dir/saturation"
     mkdir -p "$sweep_dir"
+
+    local csv_file="$sweep_dir/sweep_results.csv"
+    echo "level,phase,target_rps,actual_rps,p99_ms,p50_ms,p99_ratio,errors,saturated" > "$csv_file"
 
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" " STAGE 1: SATURATION SWEEP"
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" "RPS range: ${SATURATION_START_RPS}–${SATURATION_MAX_RPS}  step=${SATURATION_STEP_RPS}"
     step1_log "$exp_dir" "Duration per level: ${SATURATION_DURATION}s   p99 threshold: ${SATURATION_P99_THRESHOLD}x"
-
-    local baseline_p99="" knee_rps="" prev_rps="" prev_p99=""
-    local rps=$SATURATION_START_RPS level=0
-
-    echo "level,target_rps,actual_rps,p99_ms,p50_ms,p99_ratio,errors" \
-        > "$sweep_dir/sweep_results.csv"
+    step1_log "$exp_dir" "Extra levels past first saturation: ${SATURATION_EXTRA_LEVELS}"
 
     # Warmup
-    step1_log "$exp_dir" "Warmup at ${rps} RPS for ${SATURATION_WARMUP}s ..."
-    step1_run_wrk2 "$exp_dir" "$rps" "$SATURATION_WARMUP" "$sweep_dir/warmup.txt"
+    step1_log "$exp_dir" "Warmup at ${SATURATION_START_RPS} RPS for ${SATURATION_WARMUP}s ..."
+    step1_run_wrk2 "$exp_dir" "$SATURATION_START_RPS" "$SATURATION_WARMUP" "$sweep_dir/warmup.txt"
     sleep 5
+
+    # Sweep strategy:
+    #   Run at increasing RPS using a fixed coarse step.
+    #   On first saturation, record first_saturated_rps, then continue for
+    #   SATURATION_EXTRA_LEVELS more levels to verify saturation / collect
+    #   more post-knee data.  Knee = highest RPS across all levels that did
+    #   not saturate.
+    local baseline_p99=""
+    local last_healthy_rps=""
+    local first_saturated_rps=""
+    local rps=$SATURATION_START_RPS
+    local level=0
+    local extra_done=0
 
     while [[ $rps -le $SATURATION_MAX_RPS ]]; do
         ((level++))
-        local out="$sweep_dir/level_${level}_rps${rps}.txt"
+        local phase="pre_sat"
+        [[ -n "$first_saturated_rps" ]] && phase="post_sat"
 
-        step1_log "$exp_dir" "--- Level $level: ${rps} RPS ---"
-        step1_run_wrk2 "$exp_dir" "$rps" "$SATURATION_DURATION" "$out"
+        local out="$sweep_dir/L${level}_rps${rps}.txt"
 
-        local p99 p50 actual errors p99_ratio
-        p99=$(step1_parse_wrk2_p99 "$out")
-        p50=$(step1_parse_wrk2_p50 "$out")
-        actual=$(step1_parse_wrk2_actual_rps "$out")
-        errors=$(step1_parse_wrk2_errors "$out")
+        local result
+        result=$(step1_eval_sweep_level "$exp_dir" "$rps" "$SATURATION_DURATION" \
+                    "$out" "$baseline_p99" "L$level ($phase)" "$csv_file" "$phase")
 
-        if [[ -z "$p99" || "$p99" == "0" || "$p99" == "0.00" ]]; then
-            step1_log "$exp_dir" "  WARNING: could not parse p99 — treating as saturated"
-            knee_rps="${prev_rps:-$rps}"
-            break
-        fi
+        local saturated p99 p50 actual errors p99_ratio
+        IFS='|' read -r saturated p99 p50 actual errors p99_ratio <<< "$result"
 
-        [[ -z "$baseline_p99" ]] && baseline_p99="$p99" \
-            && step1_log "$exp_dir" "  Baseline p99: ${baseline_p99}ms"
+        # Append saturated flag to CSV row (step1_eval_sweep_level wrote an 8-col row;
+        # rewrite the last line with the saturated column appended)
+        # Simpler: recompute CSV line here directly
+        sed -i '$ s/$/,'"${saturated}"'/' "$csv_file" 2>/dev/null || true
 
-        p99_ratio=$(awk "BEGIN {printf \"%.2f\", $p99 / $baseline_p99}")
-
-        step1_log "$exp_dir" "  p99=${p99}ms  p50=${p50}ms  actual_rps=${actual}  errors=${errors}  p99_ratio=${p99_ratio}x"
-        echo "$level,$rps,$actual,$p99,$p50,$p99_ratio,$errors" >> "$sweep_dir/sweep_results.csv"
-
-        # ---- Saturation checks ----
-        local saturated=false
-
-        if awk "BEGIN {exit !($p99_ratio >= $SATURATION_P99_THRESHOLD)}" 2>/dev/null; then
-            step1_log "$exp_dir" "  SATURATED: p99 ratio ${p99_ratio}x >= ${SATURATION_P99_THRESHOLD}x"
-            saturated=true
-        fi
-        if [[ "${errors:-0}" -gt 0 ]]; then
-            step1_log "$exp_dir" "  SATURATED: ${errors} non-2xx responses"
-            saturated=true
-        fi
-        if [[ -n "$actual" ]] && awk "BEGIN {exit !($actual < $rps * 0.85)}" 2>/dev/null; then
-            step1_log "$exp_dir" "  SATURATED: actual RPS ${actual} << target ${rps}"
-            saturated=true
+        # First successful run establishes baseline
+        if [[ -z "$baseline_p99" && "$p99" != "0" ]]; then
+            baseline_p99="$p99"
+            step1_log "$exp_dir" "  Baseline p99: ${baseline_p99}ms"
         fi
 
         if [[ "$saturated" == "true" ]]; then
-            knee_rps="${prev_rps:-$rps}"
-            break
+            # Track the first saturating RPS
+            if [[ -z "$first_saturated_rps" ]]; then
+                first_saturated_rps=$rps
+                step1_log "$exp_dir" "  First saturation at ${rps} RPS — continuing for ${SATURATION_EXTRA_LEVELS} more level(s)"
+            fi
+        else
+            # Healthy level — update knee candidate
+            last_healthy_rps=$rps
         fi
 
-        prev_rps="$rps"; prev_p99="$p99"
+        # If we've already seen saturation, count extra levels
+        if [[ -n "$first_saturated_rps" ]]; then
+            ((extra_done++))
+            if [[ $extra_done -ge $SATURATION_EXTRA_LEVELS ]]; then
+                step1_log "$exp_dir" "  Completed ${SATURATION_EXTRA_LEVELS} extra level(s) after first saturation — stopping sweep"
+                break
+            fi
+        fi
+
         rps=$((rps + SATURATION_STEP_RPS))
-        sleep 5   # cool-down between levels
+        sleep 5
     done
 
-    [[ -z "$knee_rps" ]] && knee_rps="$SATURATION_MAX_RPS" \
-        && step1_log "$exp_dir" "WARNING: reached max RPS without saturation"
+    # --- Determine knee ---
+    local knee_rps=""
+    if [[ -z "$last_healthy_rps" ]]; then
+        step1_log "$exp_dir" "WARNING: system saturated from the start"
+        knee_rps=$SATURATION_START_RPS
+    else
+        knee_rps=$last_healthy_rps
+        if [[ -z "$first_saturated_rps" ]]; then
+            step1_log "$exp_dir" "WARNING: reached max RPS ${SATURATION_MAX_RPS} without saturation"
+        fi
+    fi
 
     local char_rps
     char_rps=$(awk "BEGIN {printf \"%.0f\", $knee_rps * $CHARACTERIZE_KNEE_FRACTION}")
 
     step1_log "$exp_dir" "=========================================="
-    step1_log "$exp_dir" " Knee point      : ${knee_rps} RPS"
-    step1_log "$exp_dir" " Characterize at : ${char_rps} RPS (${CHARACTERIZE_KNEE_FRACTION} x knee)"
-    step1_log "$exp_dir" " Baseline p99    : ${baseline_p99}ms"
+    step1_log "$exp_dir" " Knee point (max healthy) : ${knee_rps} RPS"
+    step1_log "$exp_dir" " First saturated at       : ${first_saturated_rps:-N/A} RPS"
+    step1_log "$exp_dir" " Characterize at          : ${char_rps} RPS (${CHARACTERIZE_KNEE_FRACTION} x knee)"
+    step1_log "$exp_dir" " Baseline p99             : ${baseline_p99}ms"
+    step1_log "$exp_dir" " Levels tested            : ${level}"
     step1_log "$exp_dir" "=========================================="
 
     echo "$knee_rps" > "$sweep_dir/knee_point_rps.txt"
@@ -203,13 +279,16 @@ step1_saturation_sweep() {
     cat > "$sweep_dir/sweep_summary.json" <<-EOJSON
 {
     "knee_point_rps": $knee_rps,
+    "first_saturated_rps": ${first_saturated_rps:-0},
     "characterize_rps": $char_rps,
     "characterize_fraction": $CHARACTERIZE_KNEE_FRACTION,
     "baseline_p99_ms": ${baseline_p99:-0},
     "saturation_threshold": $SATURATION_P99_THRESHOLD,
     "levels_tested": $level,
+    "extra_levels_after_saturation": $SATURATION_EXTRA_LEVELS,
     "rps_start": $SATURATION_START_RPS,
     "rps_step": $SATURATION_STEP_RPS,
+    "rps_max": $SATURATION_MAX_RPS,
     "duration_per_level_s": $SATURATION_DURATION
 }
 EOJSON
@@ -977,7 +1056,9 @@ Optional:
   SATURATION_STEP_RPS   Increment per level     (default: 50)
   SATURATION_MAX_RPS    Upper bound             (default: 2000)
   SATURATION_DURATION   Seconds per level       (default: 30)
-  SATURATION_P99_THRESHOLD  p99 multiplier to declare saturation (default: 2.0)
+  SATURATION_P99_THRESHOLD  p99 multiplier to declare saturation (default: 4.0)
+  SATURATION_EXTRA_LEVELS   Extra sweep levels after first saturation
+                            (default: 4 — verifies saturation, refines knee)
 
   CHARACTERIZE_DURATION Seconds per run         (default: 300)
   CHARACTERIZE_RUNS     Number of runs          (default: 5)
