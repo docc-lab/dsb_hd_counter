@@ -223,10 +223,10 @@ EOJSON
 # ===========================================================================
 # Pod-level monitoring  (CPU / memory / network)
 #
-# Runs a lightweight polling loop *inside* each victim pod via kubectl exec.
-# Reads /proc/1/stat, /proc/1/status, /proc/net/dev once per second and
-# writes a CSV to /data/system_metrics_run<N>/metrics.csv in the pod.
-# Returns the background kubectl-exec PID.
+# Runs a lightweight polling loop *inside* each observed-service pod via
+# kubectl exec.  Reads /proc/1/stat, /proc/1/status, /proc/net/dev once
+# per second and writes a CSV to /data/system_metrics_run<N>/metrics.csv
+# in the pod.  Returns the background kubectl-exec PID.
 # ===========================================================================
 
 step1_start_pod_monitor() {
@@ -274,7 +274,7 @@ step1_stop_pod_monitor() {
 }
 
 # ===========================================================================
-# Retrieve data from a victim pod after a characterization run
+# Retrieve data from an observed-service pod after a characterization run
 # ===========================================================================
 
 step1_retrieve_run_data() {
@@ -338,11 +338,11 @@ step1_retrieve_run_data() {
 # ===========================================================================
 
 step1_prepare_iteration() {
-    local exp_dir="$1" run_num="$2" victim_services="$3"
+    local exp_dir="$1" run_num="$2" observed_services="$3"
 
     step1_log "$exp_dir" "Preparing run $run_num — updating ITERATION_ID and restarting pods ..."
 
-    for service in $victim_services; do
+    for service in $observed_services; do
         if validate_timing_service "$service"; then
             kubectl set env "deployment/$service" \
                 "ITERATION_ID=${run_num}" \
@@ -364,7 +364,7 @@ step1_prepare_iteration() {
 }
 
 step1_run_single_characterization() {
-    local exp_dir="$1" run_num="$2" char_rps="$3" victim_services="$4"
+    local exp_dir="$1" run_num="$2" char_rps="$3" observed_services="$4"
 
     local run_dir="$exp_dir/runs/run_${run_num}"
     mkdir -p "$run_dir"/{latency,windowed,system}
@@ -375,11 +375,11 @@ step1_run_single_characterization() {
     step1_log "$exp_dir" "------------------------------------------"
 
     # 1. Prepare pods (new ITERATION_ID, restart, wait)
-    step1_prepare_iteration "$exp_dir" "$run_num" "$victim_services"
+    step1_prepare_iteration "$exp_dir" "$run_num" "$observed_services"
 
-    # 2. Start pod monitors for every victim service
+    # 2. Start pod monitors for every observed service
     local monitor_pids=()
-    for service in $victim_services; do
+    for service in $observed_services; do
         local pod
         pod=$(kubectl get pods -l io.kompose.service="$service" \
                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
@@ -431,7 +431,7 @@ step1_run_single_characterization() {
 
     # 10. Retrieve all data from pods
     step1_log "$exp_dir" "  Retrieving run data from pods ..."
-    for service in $victim_services; do
+    for service in $observed_services; do
         step1_retrieve_run_data "$service" "$run_num" "$run_dir" "$exp_dir"
     done
 
@@ -455,16 +455,16 @@ EOJSON
 }
 
 step1_characterize() {
-    local exp_dir="$1" char_rps="$2" victim_services="$3"
+    local exp_dir="$1" char_rps="$2" observed_services="$3"
 
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" " STAGE 2: CHARACTERIZATION"
     step1_log "$exp_dir" " ${CHARACTERIZE_RUNS} runs x ${CHARACTERIZE_DURATION}s @ ${char_rps} RPS"
-    step1_log "$exp_dir" " Victim services: $victim_services"
+    step1_log "$exp_dir" " Observed services: $observed_services"
     step1_log "$exp_dir" "=========================================="
 
     for run_num in $(seq 1 "$CHARACTERIZE_RUNS"); do
-        step1_run_single_characterization "$exp_dir" "$run_num" "$char_rps" "$victim_services"
+        step1_run_single_characterization "$exp_dir" "$run_num" "$char_rps" "$observed_services"
 
         if [[ $run_num -lt $CHARACTERIZE_RUNS ]]; then
             step1_log "$exp_dir" "  Cool-down 30s before next run ..."
@@ -774,7 +774,7 @@ step1_validate_config() {
 
     source "$config_file"
 
-    local required=(EXPERIMENT_NAME TARGET_NODE VICTIM_SERVICES
+    local required=(EXPERIMENT_NAME TARGET_NODE OBSERVED_SERVICES
                     WRK2_TARGET_IP WRK2_TARGET_PORT)
     for var in "${required[@]}"; do
         if [[ -z "${!var:-}" ]]; then
@@ -782,6 +782,9 @@ step1_validate_config() {
             exit 1
         fi
     done
+
+    # Alias for data-collector.sh functions that reference VICTIM_SERVICES
+    VICTIM_SERVICES="$OBSERVED_SERVICES"
 
     # Defaults for variables referenced by data-collector.sh deploy functions
     NOISY_NEIGHBOR_TYPE="${NOISY_NEIGHBOR_TYPE:-cpu}"
@@ -821,7 +824,7 @@ step1_setup() {
     "experiment_name": "$EXPERIMENT_NAME",
     "experiment_type": "step1_characterization",
     "target_node": "$TARGET_NODE",
-    "victim_services": "$(echo $VICTIM_SERVICES)",
+    "observed_services": "$(echo $OBSERVED_SERVICES)",
     "config_file": "$(basename "$config_file")",
     "saturation_sweep": {
         "start_rps": $SATURATION_START_RPS,
@@ -852,7 +855,7 @@ EOJSON
 step1_deploy() {
     local exp_dir="$1"
 
-    step1_log "$exp_dir" "Deploying victim services: $VICTIM_SERVICES"
+    step1_log "$exp_dir" "Deploying observed services: $OBSERVED_SERVICES"
 
     # Remove anti-affinity from all deployments to allow placement
     local all_deps
@@ -862,11 +865,11 @@ step1_deploy() {
         sleep 5
     fi
 
-    # Reset non-victim services to default images
-    reset_non_victim_services "$VICTIM_SERVICES" "$exp_dir"
+    # Reset other services to default images (function name from data-collector.sh)
+    reset_non_victim_services "$OBSERVED_SERVICES" "$exp_dir"
 
-    # Deploy victim services with timing images on target node
-    deploy_victim_services "$VICTIM_SERVICES" "$TARGET_NODE" "$exp_dir"
+    # Deploy observed services with timing images on target node
+    deploy_victim_services "$OBSERVED_SERVICES" "$TARGET_NODE" "$exp_dir"
 
     # Stabilisation
     step1_log "$exp_dir" "Waiting 45s for services to stabilize ..."
@@ -906,8 +909,8 @@ Two stages:
 
 Required config variables:
   EXPERIMENT_NAME       Descriptive name
-  TARGET_NODE           Kubernetes node to pin victims to
-  VICTIM_SERVICES       Space-separated list (e.g. 'search profile')
+  TARGET_NODE           Kubernetes node to pin observed services to
+  OBSERVED_SERVICES       Space-separated list (e.g. 'search profile')
   WRK2_TARGET_IP        IP reachable from wrk2 client
   WRK2_TARGET_PORT      Port (usually 5000)
 
@@ -935,7 +938,7 @@ Example config:
 
   EXPERIMENT_NAME='Step1 Hotel Reservation Characterization'
   TARGET_NODE='node-1'
-  VICTIM_SERVICES='search profile'
+  OBSERVED_SERVICES='search profile'
   WRK2_TARGET_IP='192.168.1.100'
   WRK2_TARGET_PORT=5000
   WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
@@ -973,10 +976,10 @@ USAGE
     sleep 30
 
     # Stage 2 — Characterization runs
-    step1_characterize "$exp_dir" "$char_rps" "$VICTIM_SERVICES"
+    step1_characterize "$exp_dir" "$char_rps" "$OBSERVED_SERVICES"
 
     # Aggregate
-    step1_aggregate "$exp_dir" "$VICTIM_SERVICES"
+    step1_aggregate "$exp_dir" "$OBSERVED_SERVICES"
 
     step1_log "$exp_dir" ""
     step1_log "$exp_dir" "=========================================="
