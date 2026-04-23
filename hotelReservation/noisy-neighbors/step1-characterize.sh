@@ -437,14 +437,49 @@ for line in data.splitlines():
         counters[name] = val
 
 result = dict(counters)
-cyc = counters.get('cycles', 0)
-ins = counters.get('instructions', 0)
-cref = counters.get('cache-references', 0)
+cyc   = counters.get('cycles', 0)
+ins   = counters.get('instructions', 0)
+# Generic cache
+cref  = counters.get('cache-references', 0)
 cmiss = counters.get('cache-misses', 0)
+# LLC (last-level cache)
+llc_loads = counters.get('LLC-loads', 0)
+llc_miss  = counters.get('LLC-load-misses', 0)
+# Branches
+br_ins    = counters.get('branch-instructions', counters.get('branches', 0))
+br_miss   = counters.get('branch-misses', 0)
+# L1 instruction cache (optional)
+l1i_miss  = counters.get('L1-icache-load-misses', 0)
+# L1 data cache (optional)
+l1d_loads = counters.get('L1-dcache-loads', 0)
+l1d_miss  = counters.get('L1-dcache-load-misses', 0)
+
 if cyc > 0:
     result['ipc'] = round(ins / cyc, 4)
+
+# Miss rates
 if cref > 0:
     result['cache_miss_rate'] = round(cmiss / cref, 6)
+if llc_loads > 0:
+    result['llc_miss_rate'] = round(llc_miss / llc_loads, 6)
+if br_ins > 0:
+    result['branch_miss_rate'] = round(br_miss / br_ins, 6)
+if l1d_loads > 0:
+    result['l1d_miss_rate'] = round(l1d_miss / l1d_loads, 6)
+
+# MPKI = misses per kilo instructions
+if ins > 0:
+    if llc_miss > 0:
+        result['llc_mpki'] = round(llc_miss / ins * 1000, 4)
+    if l1i_miss > 0:
+        result['l1i_mpki'] = round(l1i_miss / ins * 1000, 4)
+    if l1d_miss > 0:
+        result['l1d_mpki'] = round(l1d_miss / ins * 1000, 4)
+    if br_miss > 0:
+        result['branch_mpki'] = round(br_miss / ins * 1000, 4)
+    if cmiss > 0:
+        result['cache_mpki'] = round(cmiss / ins * 1000, 4)
+
 print(json.dumps(result))
 " "$perf_file" 2>/dev/null || echo "{}"
 }
@@ -791,8 +826,10 @@ for run_num in range(1, total_runs + 1):
 # ---- Cross-run aggregation ----
 cross_run = {}
 for svc in services:
-    svc_agg = {"ipc": [], "cache_miss_rate": [], "cpu_pct": [],
-               "cpu_usr": [], "cpu_sys": [], "vmrss_kb": [],
+    svc_agg = {"ipc": [],
+               "cache_miss_rate": [], "llc_miss_rate": [], "branch_miss_rate": [], "l1d_miss_rate": [],
+               "cache_mpki": [], "llc_mpki": [], "l1i_mpki": [], "l1d_mpki": [], "branch_mpki": [],
+               "cpu_pct": [], "cpu_usr": [], "cpu_sys": [], "vmrss_kb": [],
                "net_rx_mbps": [], "net_tx_mbps": [],
                "p99_ms": [], "p50_ms": [], "actual_rps": []}
 
@@ -802,8 +839,14 @@ for svc in services:
         sys_d  = si.get("system", {})
         lat_d  = rd.get("latency", {})
 
-        if perf_d.get("ipc"):             svc_agg["ipc"].append(perf_d["ipc"])
-        if perf_d.get("cache_miss_rate"): svc_agg["cache_miss_rate"].append(perf_d["cache_miss_rate"])
+        # Derived perf metrics (only append if present)
+        for k in ("ipc",
+                  "cache_miss_rate", "llc_miss_rate", "branch_miss_rate", "l1d_miss_rate",
+                  "cache_mpki", "llc_mpki", "l1i_mpki", "l1d_mpki", "branch_mpki"):
+            v = perf_d.get(k)
+            if v is not None and v != 0:
+                svc_agg[k].append(v)
+
         if sys_d.get("cpu_pct_mean"):     svc_agg["cpu_pct"].append(sys_d["cpu_pct_mean"])
         if sys_d.get("cpu_usr_mean"):     svc_agg["cpu_usr"].append(sys_d["cpu_usr_mean"])
         if sys_d.get("cpu_sys_mean"):     svc_agg["cpu_sys"].append(sys_d["cpu_sys_mean"])
@@ -860,8 +903,16 @@ with open(summary_dir / "report.txt", "w") as f:
                     f"  (min={d['min']*mult:.4f}  max={d['max']*mult:.4f}  n={d['n']})")
 
         f.write(f"\n  [Perf Counters — external perf stat]\n")
-        f.write(f"    IPC               :{fmt('ipc')}\n")
-        f.write(f"    Cache miss rate   :{fmt('cache_miss_rate')}\n")
+        f.write(f"    IPC                :{fmt('ipc')}\n")
+        f.write(f"    LLC miss rate      :{fmt('llc_miss_rate')}\n")
+        f.write(f"    Branch miss rate   :{fmt('branch_miss_rate')}\n")
+        f.write(f"    L1-d miss rate     :{fmt('l1d_miss_rate')}\n")
+        f.write(f"    Cache miss rate    :{fmt('cache_miss_rate')}\n")
+        f.write(f"    LLC MPKI           :{fmt('llc_mpki')}\n")
+        f.write(f"    L1-i MPKI          :{fmt('l1i_mpki')}\n")
+        f.write(f"    L1-d MPKI          :{fmt('l1d_mpki')}\n")
+        f.write(f"    Branch MPKI        :{fmt('branch_mpki')}\n")
+        f.write(f"    Cache MPKI         :{fmt('cache_mpki')}\n")
 
         f.write(f"\n  [CPU — /proc/1/stat]\n")
         f.write(f"    Total CPU %%       :{fmt('cpu_pct', '%')}\n")
