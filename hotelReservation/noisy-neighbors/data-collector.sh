@@ -8,9 +8,6 @@ set -e
 DATA_DIR="${DATA_DIR:-./experiment_data}"
 HOTEL_MANIFESTS_DIR="${HOTEL_MANIFESTS_DIR:-./hotelReservation}"
 WRK2_DIR="${WRK2_DIR:-../../wrk2}"
-# giltene/wrk2 (https://github.com/giltene/wrk2): used when WRK2_RATE is 1 (1 RPS baseline).
-# Default ../../../wrk2 is from hotelReservation/noisy-neighbors/ on layouts where wrk2 sits above the repo root; override with WRK2_GILTENE_DIR or point at the same tree as WRK2_DIR if yours is ../../wrk2.
-WRK2_GILTENE_DIR="${WRK2_GILTENE_DIR:-../../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
@@ -1072,17 +1069,9 @@ validate_config() {
         exit 1
     fi
     
-    # Check if wrk2 exists (giltene tree when WRK2_RATE=1, else DSB/custom fork under WRK2_DIR)
-    if [[ -n "${WRK2_TARGET_SERVICE:-}" ]]; then
-        local _wrk_rate="${WRK2_RATE:-200}"
-        if [[ "$_wrk_rate" =~ ^[0-9]+$ ]] && (( 10#_wrk_rate == 1 )); then
-            if [[ ! -f "$WRK2_GILTENE_DIR/wrk" ]]; then
-                echo "WARNING: giltene wrk2 (1 RPS baseline) not found at: $WRK2_GILTENE_DIR/wrk (will skip workload generation)"
-                echo "         Build from https://github.com/giltene/wrk2 or set WRK2_GILTENE_DIR to the directory containing the wrk binary."
-            fi
-        elif [[ ! -f "$WRK2_DIR/wrk" ]]; then
-            echo "WARNING: wrk2 not found at: $WRK2_DIR/wrk (will skip workload generation)"
-        fi
+    # Check if wrk2 exists
+    if [[ -n "${WRK2_TARGET_SERVICE:-}" && ! -f "$WRK2_DIR/wrk" ]]; then
+        echo "WARNING: wrk2 not found at: $WRK2_DIR/wrk (will skip workload generation)"
     fi
     
     # Check Docker access for timing image building (if needed)
@@ -2214,19 +2203,12 @@ start_workload_and_latency() {
         return
     fi
     
-    local wrk2_binary="$WRK2_DIR/wrk"
-    local use_giltene_baseline=false
-    if [[ "$rate" =~ ^[0-9]+$ ]] && (( 10#rate == 1 )); then
-        use_giltene_baseline=true
-        wrk2_binary="$WRK2_GILTENE_DIR/wrk"
-    fi
-
     # Skip if wrk2 not available
-    if [[ ! -f "$wrk2_binary" ]]; then
-        log "$exp_dir" "wrk2 not found at: $wrk2_binary (giltene baseline uses WRK2_GILTENE_DIR when rate=1), skipping workload generation"
+    if [[ ! -f "$WRK2_DIR/wrk" ]]; then
+        log "$exp_dir" "wrk2 not found, skipping workload generation"
         return
     fi
-
+    
     log "$exp_dir" "Starting wrk2 workload generation for $target_service"
     
     # Get service endpoint - try different methods
@@ -2247,20 +2229,9 @@ start_workload_and_latency() {
     log "$exp_dir" "Target URL: $target_url"
     log "$exp_dir" "Workload script: ${workload_script:-none}"
     log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $connections, Duration: ${duration}s"
-
-    local wrk2_cmd=""
-    if [[ "$use_giltene_baseline" == true ]]; then
-        log "$exp_dir" "wrk2 mode: giltene/wrk2 baseline (1 RPS) — binary: $wrk2_binary"
-        if [[ "$duration" =~ ^[0-9]+$ ]] && (( duration < 20 )); then
-            log "$exp_dir" "NOTE: giltene/wrk2 uses a long calibration window; runs under ~10–20s may show limited percentile detail (duration=${duration}s)."
-        fi
-        # giltene/wrk2: constant throughput via -R/--rate; detailed HdrHistogram output via --latency (not -D exp / -L).
-        # giltene README examples use no-space flag style: -t2 -c100 -d30s -R2000
-        wrk2_cmd="$wrk2_binary -t${threads} -c${connections} -d${duration}s -R1 --latency"
-        [[ -n "${WRK2_GILTENE_EXTRA_ARGS:-}" ]] && wrk2_cmd="$wrk2_cmd $WRK2_GILTENE_EXTRA_ARGS"
-    else
-        wrk2_cmd="$wrk2_binary -D exp -t $threads -c $connections -d ${duration}s -L -R $rate"
-    fi
+    
+    # Construct wrk2 command
+    local wrk2_cmd="$WRK2_DIR/wrk -D exp -t $threads -c $connections -d ${duration}s -L -R $rate"
     
     if [[ -n "$workload_script" && -f "$workload_script" ]]; then
         wrk2_cmd="$wrk2_cmd -s $workload_script"
@@ -2604,12 +2575,6 @@ generate_metadata() {
             }
         }"
     fi
-
-    local wrk2_mode="dsb_wrk2_fork"
-    local _meta_wrk_rate="${WRK2_RATE:-200}"
-    if [[ "$_meta_wrk_rate" =~ ^[0-9]+$ ]] && (( 10#_meta_wrk_rate == 1 )); then
-        wrk2_mode="giltene_1rps_baseline"
-    fi
     
     cat > "$exp_dir/metadata/experiment.json" << EOF
 {
@@ -2648,11 +2613,7 @@ generate_metadata() {
             "rate": ${WRK2_RATE:-200},
             "threads": ${WRK2_THREADS:-2},
             "connections": ${WRK2_CONNECTIONS:-2},
-            "start_timing": "5s after iteration start (early start)",
-            "mode": "$wrk2_mode",
-            "wrk2_dir": "${WRK2_DIR}",
-            "wrk2_giltene_dir": "${WRK2_GILTENE_DIR}",
-            "giltene_command_note": "When mode is giltene_1rps_baseline: wrk -t T -c C -d Ds -R 1 --latency [WRK2_GILTENE_EXTRA_ARGS] [-s script] URL"
+            "start_timing": "5s after iteration start (early start)"
         }
     },
     "system_info": {
@@ -3139,7 +3100,7 @@ STARTING_CPU=0        # Start allocating from CPU 0
 # Jaeger tracing
 JAEGER_SAMPLE_RATIO=0.01  # 1% sampling, set to 0 to disable
 
-# wrk2 workload (WRK2_RATE=1 uses giltene/wrk2 from WRK2_GILTENE_DIR with -R 1 --latency; other rates use WRK2_DIR with -D exp -L)
+# wrk2 workload
 WRK2_TARGET_SERVICE='frontend'
 WRK2_TARGET_IP='192.168.1.100'  # CHANGE TO YOUR IP
 WRK2_TARGET_PORT=5000
@@ -3147,8 +3108,6 @@ WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
 WRK2_RATE=200
 WRK2_THREADS=3
 WRK2_CONNECTIONS=3
-# WRK2_GILTENE_DIR='../../../wrk2'   # default; set to ../../wrk2 if wrk2 lives next to your repo root
-# WRK2_GILTENE_EXTRA_ARGS=''       # e.g. --u_latency for giltene-only histograms
 
 # Timeline (per iteration):
 #   0-30s:   Burst 1 (4 CPUs) - active samples
