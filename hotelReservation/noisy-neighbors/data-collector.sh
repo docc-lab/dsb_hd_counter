@@ -11,7 +11,7 @@ WRK2_DIR="${WRK2_DIR:-../../wrk2}"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timing image configuration
-TIMING_REGISTRY="${TIMING_REGISTRY:-royno7}"
+TIMING_REGISTRY="${TIMING_REGISTRY:-docclabgroup}"
 WINDOWED_IMAGE_SUFFIX="windowed"
 
 # CPU allocation configuration
@@ -2231,7 +2231,7 @@ start_workload_and_latency() {
     log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $connections, Duration: ${duration}s"
     
     # Construct wrk2 command
-    local wrk2_cmd="$WRK2_DIR/wrk -D exp -t $threads -c $connections -d ${duration}s -L -R $rate"
+    local wrk2_cmd="$WRK2_DIR/wrk -D ${WRK2_DIST:-fixed} -t $threads -c $connections -d ${duration}s -L -R $rate"
     
     if [[ -n "$workload_script" && -f "$workload_script" ]]; then
         wrk2_cmd="$wrk2_cmd -s $workload_script"
