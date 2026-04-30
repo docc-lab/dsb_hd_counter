@@ -42,8 +42,27 @@ CHARACTERIZE_DURATION="${CHARACTERIZE_DURATION:-300}"   # 5 min
 CHARACTERIZE_RUNS="${CHARACTERIZE_RUNS:-5}"
 CHARACTERIZE_KNEE_FRACTION="${CHARACTERIZE_KNEE_FRACTION:-0.9}"  # 90 %
 
-# External perf stat
-PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,context-switches,cpu-migrations,page-faults}"
+# External perf stat — Ice Lake-SP optimized event set
+#
+# Top-down L1 group (uses PERF_METRICS register on Ice Lake+, semi-free):
+#   slots, topdown-retiring, topdown-bad-spec, topdown-fe-bound, topdown-be-bound
+#
+# Raw counters (10 events, multiplexed to ~50-70% scheduling on Ice Lake-SP):
+#   cycles, instructions                   — IPC denominator/numerator
+#   LLC-loads, LLC-load-misses             — last-level cache pressure
+#   cycle_activity.stalls_l3_miss          — DRAM stall cycles (direct latency cost)
+#   offcore_requests.all_data_rd           — DRAM read bandwidth
+#   L1-dcache-load-misses                  — L1 data cache pressure
+#   L1-icache-load-misses                  — L1 instruction cache (frontend signal)
+#   dTLB-load-misses                       — data TLB pressure
+#   branch-misses                          — branch behavior / workload signature
+#
+# Multiplexing on Ice Lake-SP is expected (~50-70%) due to event constraints
+# (cycle_activity.* and offcore_requests.* have specific PMC requirements).
+# perf scales values to estimate true counts; for steady 100s wrk2 runs the
+# averaging absorbs most of the noise.
+PERF_TOPDOWN_GROUP="${PERF_TOPDOWN_GROUP:-slots,topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound}"
+PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,LLC-loads,LLC-load-misses,cycle_activity.stalls_l3_miss,offcore_requests.all_data_rd,L1-dcache-load-misses,L1-icache-load-misses,dTLB-load-misses,branch-misses}"
 
 # ===========================================================================
 # Logging
@@ -315,7 +334,7 @@ step1_start_pod_monitor() {
         DIR="/data/system_metrics_run${RUN}"
         mkdir -p "$DIR"
 
-        HDR="ts_epoch_ns,utime,stime,threads,vsize_bytes,rss_pages,vmrss_kb,rx_bytes,tx_bytes"
+        HDR="ts_epoch_ns,utime,stime,threads,vsize_bytes,rss_pages,vmrss_kb,rx_bytes,tx_bytes,vol_ctxt,nonvol_ctxt"
         echo "$HDR" > "$DIR/metrics.csv"
 
         END=$(( $(date +%s) + DUR + 5 ))
@@ -328,9 +347,11 @@ step1_start_pod_monitor() {
             VS=$(echo     "$RAW" | awk "{print \$21}")
             RSSPG=$(echo  "$RAW" | awk "{print \$22}")
             VMRSS=$(grep VmRSS /proc/1/status | awk "{print \$2}")
+            VCS=$(grep "^voluntary_ctxt_switches" /proc/1/status | awk "{print \$2}")
+            NVCS=$(grep "^nonvoluntary_ctxt_switches" /proc/1/status | awk "{print \$2}")
             RX=$(awk "NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$2}END{print s+0}" /proc/net/dev)
             TX=$(awk "NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$10}END{print s+0}" /proc/net/dev)
-            echo "$TS,$UTIME,$STIME,$THR,$VS,$RSSPG,$VMRSS,$RX,$TX" >> "$DIR/metrics.csv"
+            echo "$TS,$UTIME,$STIME,$THR,$VS,$RSSPG,$VMRSS,$RX,$TX,$VCS,$NVCS" >> "$DIR/metrics.csv"
             sleep 1
         done
     ' _ "$run_num" "$duration" &
@@ -386,6 +407,16 @@ step1_start_perf_stat() {
     step1_log "$exp_dir" "  Starting perf stat on $node_name for $service (container $container_id)"
 
     local events="$PERF_EVENTS"
+    local topdown="$PERF_TOPDOWN_GROUP"
+
+    # Build perf -e flags. If PERF_TOPDOWN_GROUP is set, wrap it as a strict
+    # event group with {} so its members schedule together (uses PERF_METRICS
+    # register on Ice Lake-SP and newer).  Raw events get a separate -e flag.
+    local perf_args=""
+    if [[ -n "$topdown" ]]; then
+        perf_args="-e '{${topdown}}'"
+    fi
+    perf_args="$perf_args -e $events"
 
     # SSH to the node, find host PID, run perf stat
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$node_name" "
@@ -404,10 +435,11 @@ step1_start_perf_stat() {
         echo \"node=$node_name\"
         echo \"service=$service\"
         echo \"container_id=$container_id\"
+        echo \"topdown_group=$topdown\"
         echo \"events=$events\"
         echo \"duration=${duration}s\"
         echo '---'
-        sudo perf stat -e $events -p \$PID sleep $duration 2>&1
+        sudo perf stat $perf_args -p \$PID sleep $duration 2>&1
     " > "$output_file" 2>&1 &
 
     local pid=$!
@@ -429,33 +461,69 @@ import sys, re, json
 
 data = open(sys.argv[1]).read()
 counters = {}
+schedule_pct = {}
 for line in data.splitlines():
-    m = re.match(r'^\s+([\d,]+)\s+(\S+)', line)
+    # Match: '   1,234,567      event-name           # ...           (74.32%)'
+    m = re.match(r'^\s+([\d,]+)\s+([\S]+)', line)
     if m:
         val = int(m.group(1).replace(',', ''))
         name = m.group(2)
         counters[name] = val
+        pct_match = re.search(r'\(([\d.]+)%\)\s*\$', line)
+        if pct_match:
+            schedule_pct[name] = float(pct_match.group(1))
 
 result = dict(counters)
+
+# ---------- Basic counters ----------
 cyc   = counters.get('cycles', 0)
 ins   = counters.get('instructions', 0)
-# Generic cache
-cref  = counters.get('cache-references', 0)
-cmiss = counters.get('cache-misses', 0)
 # LLC (last-level cache)
 llc_loads = counters.get('LLC-loads', 0)
 llc_miss  = counters.get('LLC-load-misses', 0)
 # Branches
 br_ins    = counters.get('branch-instructions', counters.get('branches', 0))
 br_miss   = counters.get('branch-misses', 0)
-# L1 instruction cache (optional)
+# L1 caches
 l1i_miss  = counters.get('L1-icache-load-misses', 0)
-# L1 data cache (optional)
 l1d_loads = counters.get('L1-dcache-loads', 0)
 l1d_miss  = counters.get('L1-dcache-load-misses', 0)
+# TLBs
+itlb_miss = counters.get('iTLB-load-misses', 0)
+dtlb_loads = counters.get('dTLB-loads', 0)
+dtlb_miss  = counters.get('dTLB-load-misses', 0)
+# Memory subsystem
+stalls_l3   = counters.get('cycle_activity.stalls_l3_miss', 0)
+stalls_mem  = counters.get('cycle_activity.stalls_mem_any', 0)
+stalls_tot  = counters.get('cycle_activity.stalls_total', 0)
+offcore_rd  = counters.get('offcore_requests.all_data_rd', 0)
+offcore_all = counters.get('offcore_requests.all_requests', 0)
+# Generic cache (legacy compatibility)
+cref  = counters.get('cache-references', 0)
+cmiss = counters.get('cache-misses', 0)
 
+# ---------- Top-down (Ice Lake+) ----------
+slots         = counters.get('slots', 0)
+td_retire     = counters.get('topdown-retiring', 0)
+td_badspec    = counters.get('topdown-bad-spec', 0)
+td_febound    = counters.get('topdown-fe-bound', 0)
+td_bebound    = counters.get('topdown-be-bound', 0)
+
+if slots > 0:
+    result['topdown_retiring_pct']     = round(td_retire / slots * 100, 2)
+    result['topdown_bad_spec_pct']     = round(td_badspec / slots * 100, 2)
+    result['topdown_fe_bound_pct']     = round(td_febound / slots * 100, 2)
+    result['topdown_be_bound_pct']     = round(td_bebound / slots * 100, 2)
+
+# ---------- Derived metrics ----------
 if cyc > 0:
     result['ipc'] = round(ins / cyc, 4)
+    if stalls_l3 > 0:
+        result['stalls_l3_pct'] = round(stalls_l3 / cyc * 100, 2)
+    if stalls_mem > 0:
+        result['stalls_mem_pct'] = round(stalls_mem / cyc * 100, 2)
+    if stalls_tot > 0:
+        result['stalls_total_pct'] = round(stalls_tot / cyc * 100, 2)
 
 # Miss rates
 if cref > 0:
@@ -466,6 +534,8 @@ if br_ins > 0:
     result['branch_miss_rate'] = round(br_miss / br_ins, 6)
 if l1d_loads > 0:
     result['l1d_miss_rate'] = round(l1d_miss / l1d_loads, 6)
+if dtlb_loads > 0:
+    result['dtlb_miss_rate'] = round(dtlb_miss / dtlb_loads, 6)
 
 # MPKI = misses per kilo instructions
 if ins > 0:
@@ -479,6 +549,16 @@ if ins > 0:
         result['branch_mpki'] = round(br_miss / ins * 1000, 4)
     if cmiss > 0:
         result['cache_mpki'] = round(cmiss / ins * 1000, 4)
+    if itlb_miss > 0:
+        result['itlb_mpki'] = round(itlb_miss / ins * 1000, 4)
+    if dtlb_miss > 0:
+        result['dtlb_mpki'] = round(dtlb_miss / ins * 1000, 4)
+    if offcore_rd > 0:
+        result['offcore_data_rd_per_kins'] = round(offcore_rd / ins * 1000, 4)
+
+# Scheduling % (multiplexing transparency)
+if schedule_pct:
+    result['_schedule_pct'] = schedule_pct
 
 print(json.dumps(result))
 " "$perf_file" 2>/dev/null || echo "{}"
@@ -803,6 +883,12 @@ for run_num in range(1, total_runs + 1):
                 wall_s   = (safe_float(rows[-1]["ts_epoch_ns"]) - safe_float(rows[0]["ts_epoch_ns"])) / 1e9
                 wall_s   = max(wall_s, 1)
 
+                # Context switch rates (cumulative deltas / wall time)
+                vol_first  = safe_float(rows[0].get("vol_ctxt", 0))
+                vol_last   = safe_float(rows[-1].get("vol_ctxt", 0))
+                nvol_first = safe_float(rows[0].get("nonvol_ctxt", 0))
+                nvol_last  = safe_float(rows[-1].get("nonvol_ctxt", 0))
+
                 svc_info["system"] = {
                     "cpu_pct_mean":  round(mean(cpu_pcts), 2),
                     "cpu_pct_p50":   round(percentile(cpu_pcts, 0.5), 2),
@@ -816,6 +902,8 @@ for run_num in range(1, total_runs + 1):
                     "net_tx_bytes_sec": round((last_tx - first_tx) / wall_s, 0),
                     "net_rx_mbps": round((last_rx - first_rx) / wall_s * 8 / 1e6, 3),
                     "net_tx_mbps": round((last_tx - first_tx) / wall_s * 8 / 1e6, 3),
+                    "vol_ctxt_per_sec":   round((vol_last  - vol_first)  / wall_s, 2),
+                    "nonvol_ctxt_per_sec": round((nvol_last - nvol_first) / wall_s, 2),
                     "sample_count": len(rows),
                 }
 
@@ -826,12 +914,28 @@ for run_num in range(1, total_runs + 1):
 # ---- Cross-run aggregation ----
 cross_run = {}
 for svc in services:
-    svc_agg = {"ipc": [],
-               "cache_miss_rate": [], "llc_miss_rate": [], "branch_miss_rate": [], "l1d_miss_rate": [],
-               "cache_mpki": [], "llc_mpki": [], "l1i_mpki": [], "l1d_mpki": [], "branch_mpki": [],
-               "cpu_pct": [], "cpu_usr": [], "cpu_sys": [], "vmrss_kb": [],
-               "net_rx_mbps": [], "net_tx_mbps": [],
-               "p99_ms": [], "p50_ms": [], "actual_rps": []}
+    svc_agg = {
+        # Compute efficiency
+        "ipc": [],
+        # Top-down breakdown
+        "topdown_retiring_pct": [], "topdown_bad_spec_pct": [],
+        "topdown_fe_bound_pct": [], "topdown_be_bound_pct": [],
+        # Memory subsystem stalls
+        "stalls_l3_pct": [], "stalls_mem_pct": [], "stalls_total_pct": [],
+        # Miss rates
+        "cache_miss_rate": [], "llc_miss_rate": [], "branch_miss_rate": [],
+        "l1d_miss_rate": [], "dtlb_miss_rate": [],
+        # MPKI family
+        "cache_mpki": [], "llc_mpki": [], "l1i_mpki": [], "l1d_mpki": [],
+        "branch_mpki": [], "itlb_mpki": [], "dtlb_mpki": [],
+        "offcore_data_rd_per_kins": [],
+        # System metrics
+        "cpu_pct": [], "cpu_usr": [], "cpu_sys": [], "vmrss_kb": [],
+        "net_rx_mbps": [], "net_tx_mbps": [],
+        "vol_ctxt_per_sec": [], "nonvol_ctxt_per_sec": [],
+        # Latency
+        "p99_ms": [], "p50_ms": [], "actual_rps": []
+    }
 
     for rd in runs_data:
         si = rd.get("services", {}).get(svc, {})
@@ -839,12 +943,24 @@ for svc in services:
         sys_d  = si.get("system", {})
         lat_d  = rd.get("latency", {})
 
-        # Derived perf metrics (only append if present)
+        # Derived perf metrics (only append if present and non-zero)
         for k in ("ipc",
-                  "cache_miss_rate", "llc_miss_rate", "branch_miss_rate", "l1d_miss_rate",
-                  "cache_mpki", "llc_mpki", "l1i_mpki", "l1d_mpki", "branch_mpki"):
+                  "topdown_retiring_pct", "topdown_bad_spec_pct",
+                  "topdown_fe_bound_pct", "topdown_be_bound_pct",
+                  "stalls_l3_pct", "stalls_mem_pct", "stalls_total_pct",
+                  "cache_miss_rate", "llc_miss_rate", "branch_miss_rate",
+                  "l1d_miss_rate", "dtlb_miss_rate",
+                  "cache_mpki", "llc_mpki", "l1i_mpki", "l1d_mpki",
+                  "branch_mpki", "itlb_mpki", "dtlb_mpki",
+                  "offcore_data_rd_per_kins"):
             v = perf_d.get(k)
             if v is not None and v != 0:
+                svc_agg[k].append(v)
+
+        # System metrics
+        for k in ("vol_ctxt_per_sec", "nonvol_ctxt_per_sec"):
+            v = sys_d.get(k)
+            if v is not None:
                 svc_agg[k].append(v)
 
         if sys_d.get("cpu_pct_mean"):     svc_agg["cpu_pct"].append(sys_d["cpu_pct_mean"])
@@ -902,25 +1018,51 @@ with open(summary_dir / "report.txt", "w") as f:
             return (f"  {d['mean']*mult:.4f} +/- {d['stddev']*mult:.4f} {unit}"
                     f"  (min={d['min']*mult:.4f}  max={d['max']*mult:.4f}  n={d['n']})")
 
-        f.write(f"\n  [Perf Counters — external perf stat]\n")
+        f.write(f"\n  [Top-down L1 — Ice Lake PERF_METRICS]\n")
+        f.write(f"    Retiring %         :{fmt('topdown_retiring_pct', '%')}\n")
+        f.write(f"    Bad-speculation %  :{fmt('topdown_bad_spec_pct', '%')}\n")
+        f.write(f"    Frontend-bound %   :{fmt('topdown_fe_bound_pct', '%')}\n")
+        f.write(f"    Backend-bound %    :{fmt('topdown_be_bound_pct', '%')}\n")
+
+        f.write(f"\n  [Compute Efficiency]\n")
         f.write(f"    IPC                :{fmt('ipc')}\n")
+
+        f.write(f"\n  [Memory Subsystem Stalls — % of cycles]\n")
+        f.write(f"    Stalled L3-miss %  :{fmt('stalls_l3_pct', '%')}\n")
+        f.write(f"    Stalled mem-any %  :{fmt('stalls_mem_pct', '%')}\n")
+        f.write(f"    Stalled total %    :{fmt('stalls_total_pct', '%')}\n")
+
+        f.write(f"\n  [Cache Hierarchy — Miss Rates / MPKI]\n")
         f.write(f"    LLC miss rate      :{fmt('llc_miss_rate')}\n")
-        f.write(f"    Branch miss rate   :{fmt('branch_miss_rate')}\n")
-        f.write(f"    L1-d miss rate     :{fmt('l1d_miss_rate')}\n")
-        f.write(f"    Cache miss rate    :{fmt('cache_miss_rate')}\n")
         f.write(f"    LLC MPKI           :{fmt('llc_mpki')}\n")
-        f.write(f"    L1-i MPKI          :{fmt('l1i_mpki')}\n")
+        f.write(f"    L1-d miss rate     :{fmt('l1d_miss_rate')}\n")
         f.write(f"    L1-d MPKI          :{fmt('l1d_mpki')}\n")
-        f.write(f"    Branch MPKI        :{fmt('branch_mpki')}\n")
+        f.write(f"    L1-i MPKI          :{fmt('l1i_mpki')}\n")
+        f.write(f"    Cache miss rate    :{fmt('cache_miss_rate')}\n")
         f.write(f"    Cache MPKI         :{fmt('cache_mpki')}\n")
+
+        f.write(f"\n  [TLB Pressure — MPKI]\n")
+        f.write(f"    dTLB MPKI          :{fmt('dtlb_mpki')}\n")
+        f.write(f"    iTLB MPKI          :{fmt('itlb_mpki')}\n")
+
+        f.write(f"\n  [Branches]\n")
+        f.write(f"    Branch miss rate   :{fmt('branch_miss_rate')}\n")
+        f.write(f"    Branch MPKI        :{fmt('branch_mpki')}\n")
+
+        f.write(f"\n  [DRAM Bandwidth]\n")
+        f.write(f"    Offcore reads/Kins :{fmt('offcore_data_rd_per_kins')}\n")
 
         f.write(f"\n  [CPU — /proc/1/stat]\n")
         f.write(f"    Total CPU %%       :{fmt('cpu_pct', '%')}\n")
         f.write(f"    User  CPU %%       :{fmt('cpu_usr', '%')}\n")
         f.write(f"    Sys   CPU %%       :{fmt('cpu_sys', '%')}\n")
 
+        f.write(f"\n  [Scheduling — /proc/1/status, ctxt switches/sec]\n")
+        f.write(f"    Voluntary    /sec  :{fmt('vol_ctxt_per_sec', '/s')}\n")
+        f.write(f"    Non-voluntary/sec  :{fmt('nonvol_ctxt_per_sec', '/s')}\n")
+
         f.write(f"\n  [Memory — /proc/1/status]\n")
-        f.write(f"    VmRSS (KB)        :{fmt('vmrss_kb', 'KB')}\n")
+        f.write(f"    VmRSS (KB)         :{fmt('vmrss_kb', 'KB')}\n")
 
         f.write(f"\n  [Network — /proc/net/dev]\n")
         f.write(f"    RX throughput      :{fmt('net_rx_mbps', 'Mbps')}\n")
