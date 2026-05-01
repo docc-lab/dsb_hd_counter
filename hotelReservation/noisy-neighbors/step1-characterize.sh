@@ -1241,7 +1241,7 @@ step1_expose_nodeport() {
         return 1
     fi
 
-    # Wait briefly for the NodePort to be assigned
+    # Wait briefly for the auto-allocated NodePort to be assigned
     local node_port="" tries=0
     while [[ -z "$node_port" && $tries -lt 10 ]]; do
         node_port=$(kubectl get svc "$service" \
@@ -1254,6 +1254,25 @@ step1_expose_nodeport() {
     if [[ -z "$node_port" ]]; then
         step1_log "$exp_dir" "ERROR: NodePort not assigned for $service after 10s"
         return 1
+    fi
+
+    # Pin to a specific NodePort if requested (firewalld on RHEL/OpenShift
+    # only opens 30000-32767 by default; the kube-apiserver port range may
+    # be wider but allocations below 30000 will be silently dropped at the
+    # host firewall.  Always pin to a port in the firewall-friendly range
+    # to avoid silent connection-refused failures.)
+    if [[ -n "${LOADGEN_NODEPORT:-}" ]]; then
+        if [[ "$node_port" != "$LOADGEN_NODEPORT" ]]; then
+            step1_log "$exp_dir" "  Pinning NodePort -> $LOADGEN_NODEPORT (was auto=$node_port)"
+            if ! kubectl patch svc "$service" \
+                    --type='json' \
+                    -p='[{"op":"replace","path":"/spec/ports/0/nodePort","value":'"$LOADGEN_NODEPORT"'}]' \
+                    >/dev/null 2>&1; then
+                step1_log "$exp_dir" "ERROR: failed to pin NodePort to $LOADGEN_NODEPORT (already in use?)"
+                return 1
+            fi
+            node_port="$LOADGEN_NODEPORT"
+        fi
     fi
 
     local node_ip
@@ -1275,6 +1294,30 @@ step1_expose_nodeport() {
     export LOADGEN_TARGET_HOST LOADGEN_TARGET_PORT
 
     step1_log "$exp_dir" "  $service exposed at ${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT} (NodePort, node=$TARGET_NODE)"
+
+    # Fail-fast TCP reachability probe.  Many clusters silently drop
+    # NodePort traffic below the firewalld-allowed range; without this
+    # check the saturation sweep would burn an entire run before noticing.
+    # Endpoints can take a few seconds to populate, so retry briefly.
+    local probe_ok=false probe_tries=0
+    while [[ "$probe_ok" == "false" && $probe_tries -lt 8 ]]; do
+        if timeout 3 bash -c "</dev/tcp/${LOADGEN_TARGET_HOST}/${LOADGEN_TARGET_PORT}" 2>/dev/null; then
+            probe_ok=true
+            break
+        fi
+        sleep 2
+        ((probe_tries++))
+    done
+
+    if [[ "$probe_ok" != "true" ]]; then
+        step1_log "$exp_dir" "ERROR: ${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT} not reachable from this host."
+        step1_log "$exp_dir" "       Likely cause: firewalld blocks NodePort outside 30000-32767."
+        step1_log "$exp_dir" "       Set LOADGEN_NODEPORT=<port-in-30000-32767> in the config,"
+        step1_log "$exp_dir" "       or LOADGEN_TARGET_HOST_OVERRIDE=<reachable-IP> if the node IP is not routable."
+        return 1
+    fi
+
+    step1_log "$exp_dir" "  TCP reachability OK (${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT})"
     return 0
 }
 
@@ -1443,6 +1486,10 @@ Optional:
   LOADGEN_PROTO_ROOT     Proto import root (default: ../services)
   LOADGEN_CONCURRENCY    ghz virtual users  (default: 12)
   LOADGEN_CONNECTIONS    ghz gRPC connections (default: 4)
+  LOADGEN_NODEPORT       Pin NodePort to this value (recommended: 30000-32767
+                         so RHEL/OpenShift firewalld doesn't drop the traffic).
+                         If unset, k8s auto-allocates -- which may pick a port
+                         outside firewalld's range.
   LOADGEN_TARGET_HOST_OVERRIDE
                          Override the resolved node IP (e.g. external IP)
 
