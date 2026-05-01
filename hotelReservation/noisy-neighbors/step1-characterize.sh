@@ -83,11 +83,13 @@ step1_log() {
 # single JSON document containing a HDR-style latencyDistribution array
 # plus rps / count / errorDistribution.
 #
-# IMPORTANT: payload is passed via `-d` (inline string) rather than
-# `--data-file`.  ghz only renders Sprig template functions
-# ({{randInt}}, {{randFloat}}, ...) when the data string comes from -d;
-# --data-file is treated as literal JSON and would freeze the payload
-# across all requests.
+# Payload strategy: ghz's `-d` requires the entire data string to parse
+# as valid JSON (template tokens are only allowed inside string values,
+# which won't auto-coerce into proto float fields).  Instead we generate
+# a randomized JSON array once per experiment via a small Python generator
+# and feed it via `-D / --data-file`.  ghz cycles through the array,
+# sending one element per request, giving us the same per-request
+# variance we'd get from templates without any template-engine risk.
 # ===========================================================================
 
 # Read a percentile (50 / 99 / ...) from ghz JSON output, in milliseconds.
@@ -164,7 +166,7 @@ step1_run_ghz() {
     : "${LOADGEN_BIN:?LOADGEN_BIN not set}"
     : "${LOADGEN_PROTO:?LOADGEN_PROTO not set}"
     : "${LOADGEN_METHOD:?LOADGEN_METHOD not set}"
-    : "${LOADGEN_PAYLOAD_FILE:?LOADGEN_PAYLOAD_FILE not set}"
+    : "${LOADGEN_DATA_FILE:?LOADGEN_DATA_FILE not set (step1_prepare_payload not run?)}"
     : "${LOADGEN_TARGET_HOST:?LOADGEN_TARGET_HOST not set (NodePort expose failed?)}"
     : "${LOADGEN_TARGET_PORT:?LOADGEN_TARGET_PORT not set (NodePort expose failed?)}"
 
@@ -172,14 +174,11 @@ step1_run_ghz() {
     local connections="${LOADGEN_CONNECTIONS:-4}"
     local proto_root="${LOADGEN_PROTO_ROOT:-../services}"
 
-    if [[ ! -f "$LOADGEN_PAYLOAD_FILE" ]]; then
-        step1_log "$exp_dir" "  ERROR: payload file not found: $LOADGEN_PAYLOAD_FILE"
+    if [[ ! -f "$LOADGEN_DATA_FILE" ]]; then
+        step1_log "$exp_dir" "  ERROR: payload data file not found: $LOADGEN_DATA_FILE"
         echo "{}" > "$output"
         return
     fi
-
-    local payload
-    payload=$(cat "$LOADGEN_PAYLOAD_FILE")
 
     step1_log "$exp_dir" \
         "  ghz: --rps=$rps --duration=${duration}s -c $concurrency --connections=$connections" \
@@ -195,9 +194,42 @@ step1_run_ghz() {
         --connections "$connections" \
         --duration "${duration}s" \
         --format json \
-        -d "$payload" \
+        -D "$LOADGEN_DATA_FILE" \
         "${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT}" \
         > "$output" 2>&1 || true
+}
+
+# ===========================================================================
+# Pre-generate a randomized JSON array of request payloads (one element per
+# request, ghz cycles through them).  Run once per experiment in step1_deploy.
+# ===========================================================================
+
+step1_prepare_payload() {
+    local exp_dir="$1"
+    local count="${LOADGEN_PAYLOAD_COUNT:-5000}"
+    local out="$exp_dir/loadgen_payload.json"
+
+    if [[ ! -f "$LOADGEN_PAYLOAD_GENERATOR" ]]; then
+        step1_log "$exp_dir" "ERROR: payload generator not found: $LOADGEN_PAYLOAD_GENERATOR"
+        return 1
+    fi
+
+    step1_log "$exp_dir" "Generating $count randomized payloads -> $out"
+
+    if ! python3 "$LOADGEN_PAYLOAD_GENERATOR" "$count" > "$out"; then
+        step1_log "$exp_dir" "ERROR: payload generator failed"
+        return 1
+    fi
+
+    if [[ ! -s "$out" ]]; then
+        step1_log "$exp_dir" "ERROR: payload generator produced empty output"
+        return 1
+    fi
+
+    LOADGEN_DATA_FILE="$out"
+    export LOADGEN_DATA_FILE
+    step1_log "$exp_dir" "  payload data file: $LOADGEN_DATA_FILE ($(wc -c < "$out") bytes)"
+    return 0
 }
 
 # Evaluate one sweep level.
@@ -1171,7 +1203,7 @@ step1_validate_config() {
     source "$config_file"
 
     local required=(EXPERIMENT_NAME TARGET_NODE OBSERVED_SERVICE
-                    LOADGEN_BIN LOADGEN_PROTO LOADGEN_METHOD LOADGEN_PAYLOAD_FILE)
+                    LOADGEN_BIN LOADGEN_PROTO LOADGEN_METHOD LOADGEN_PAYLOAD_GENERATOR)
     for var in "${required[@]}"; do
         if [[ -z "${!var:-}" ]]; then
             echo "ERROR: required variable $var not set in $config_file" >&2
@@ -1200,9 +1232,14 @@ step1_validate_config() {
         exit 1
     fi
 
-    # Payload file precheck (templates are evaluated by ghz at request time)
-    if [[ ! -f "$LOADGEN_PAYLOAD_FILE" ]]; then
-        echo "ERROR: LOADGEN_PAYLOAD_FILE not found: $LOADGEN_PAYLOAD_FILE" >&2
+    # Payload generator precheck (Python script that prints a JSON array
+    # of N randomized requests; called once per experiment).
+    if [[ ! -f "$LOADGEN_PAYLOAD_GENERATOR" ]]; then
+        echo "ERROR: LOADGEN_PAYLOAD_GENERATOR not found: $LOADGEN_PAYLOAD_GENERATOR" >&2
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "ERROR: python3 is required to run the payload generator" >&2
         exit 1
     fi
 
@@ -1358,7 +1395,8 @@ step1_create_exp_dir() {
         "binary": "$LOADGEN_BIN",
         "proto": "$LOADGEN_PROTO",
         "method": "$LOADGEN_METHOD",
-        "payload_file": "$LOADGEN_PAYLOAD_FILE",
+        "payload_generator": "$LOADGEN_PAYLOAD_GENERATOR",
+        "payload_count": ${LOADGEN_PAYLOAD_COUNT:-5000},
         "concurrency": ${LOADGEN_CONCURRENCY:-12},
         "connections": ${LOADGEN_CONNECTIONS:-4},
         "transport": "direct_grpc_nodeport"
@@ -1439,6 +1477,14 @@ step1_deploy() {
     fi
     STEP1_EXPOSED_SERVICE="$OBSERVED_SERVICE"
     export STEP1_EXPOSED_SERVICE
+
+    # Generate the randomized payload array used by ghz (-D).  This is what
+    # gives every request a fresh lat/lon/dates (search) or hotelIds list
+    # (profile) without relying on ghz's template engine.
+    if ! step1_prepare_payload "$exp_dir"; then
+        step1_log "$exp_dir" "ERROR: failed to prepare loadgen payload"
+        exit 1
+    fi
 }
 
 # Cleanup hook installed via trap in step1_main.  Runs on EXIT/INT/TERM.
@@ -1479,11 +1525,14 @@ Required config variables:
   LOADGEN_PROTO          .proto file for the target service
   LOADGEN_METHOD         Fully-qualified method, e.g.
                          'search.Search/Nearby' or 'profile.Profile/GetProfiles'
-  LOADGEN_PAYLOAD_FILE   ghz -d payload template (Sprig-templated, evaluated
-                         per request)
+  LOADGEN_PAYLOAD_GENERATOR  Python3 script that prints a JSON array of N
+                             randomized request bodies to stdout (called once
+                             per experiment; ghz cycles through the array)
 
 Optional:
   LOADGEN_PROTO_ROOT     Proto import root (default: ../services)
+  LOADGEN_PAYLOAD_COUNT  Number of pre-randomized requests in the array
+                         (default: 5000)
   LOADGEN_CONCURRENCY    ghz virtual users  (default: 12)
   LOADGEN_CONNECTIONS    ghz gRPC connections (default: 4)
   LOADGEN_NODEPORT       Pin NodePort to this value (recommended: 30000-32767
