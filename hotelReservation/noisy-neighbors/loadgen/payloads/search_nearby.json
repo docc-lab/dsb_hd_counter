@@ -1,6 +1,6 @@
 {
-  "lat": {{ randFloat 37.783 38.264 }},
-  "lon": {{ randFloat -122.252 -121.927 }},
+  "lat": {{ divf (randInt 37783 38265) 1000.0 }},
+  "lon": {{ divf (randInt -122252 -121926) 1000.0 }},
   "inDate":  "2015-04-{{ printf "%02d" (randInt 9 24) }}",
   "outDate": "2015-04-{{ printf "%02d" (randInt 10 25) }}"
 }

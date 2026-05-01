@@ -1,5 +1,5 @@
 {
-  {{- if lt (randFloat 0 1) 0.4 -}}
+  {{- if lt (randInt 0 100) 40 -}}
   "hotelIds": ["{{ randInt 1 81 }}"],
   {{- else -}}
   "hotelIds": [
