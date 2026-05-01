@@ -1370,6 +1370,67 @@ step1_revert_nodeport() {
         >/dev/null 2>&1 || true
 }
 
+# ===========================================================================
+# step1-specific readiness validation
+#
+# data-collector.sh's validate_system_readiness probes the frontend HTTP
+# endpoints (/hotels, /recommendations).  step1 bypasses the frontend
+# entirely (ghz -> NodePort -> observed service), so a /hotels failure is
+# a false-positive for step1.  We check only what step1 actually depends on:
+#   1. The observed service's pod is ready.
+#   2. The Consul services required by the observed service's gRPC clients
+#      are registered:
+#        - search   needs srv-geo and srv-rate (consul resolver)
+#        - profile  needs no Consul-resolved peer (talks to memcached/mongo
+#                   via kube-dns, which is verified by pod readiness probes)
+# ===========================================================================
+step1_validate_readiness() {
+    local exp_dir="$1"
+    local svc="${OBSERVED_SERVICE:-}"
+
+    step1_log "$exp_dir" "=== STEP1 READINESS VALIDATION ==="
+
+    if [[ -z "$svc" ]]; then
+        step1_log "$exp_dir" "  ERROR: OBSERVED_SERVICE is empty"
+        return 1
+    fi
+
+    # 1. Observed service pod ready
+    local ready desired
+    ready=$(kubectl get deployment "$svc" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    desired=$(kubectl get deployment "$svc" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+    if [[ "$ready" != "$desired" || "$ready" == "0" ]]; then
+        step1_log "$exp_dir" "  FAIL: $svc pods ready=$ready/$desired"
+        return 1
+    fi
+    step1_log "$exp_dir" "  $svc: $ready/$desired pods ready"
+
+    # 2. Required downstream Consul services for the observed service
+    local required_consul=()
+    case "$svc" in
+        search)  required_consul=(srv-search srv-geo srv-rate) ;;
+        profile) required_consul=(srv-profile) ;;
+        *)       required_consul=("srv-$svc") ;;
+    esac
+
+    local consul_services
+    consul_services=$(kubectl exec -it deployment/consul -- \
+        consul catalog services 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//')
+
+    for c in "${required_consul[@]}"; do
+        if echo "$consul_services" | grep -qx "$c"; then
+            step1_log "$exp_dir" "  $c: registered"
+        else
+            step1_log "$exp_dir" "  FAIL: $c not registered in Consul"
+            step1_log "$exp_dir" "  Registered services seen: $(echo $consul_services | tr '\n' ' ')"
+            return 1
+        fi
+    done
+
+    step1_log "$exp_dir" "Step1 readiness: PASS"
+    return 0
+}
+
 step1_create_exp_dir() {
     local exp_id="step1_$(date +%Y%m%d_%H%M%S)_$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ')"
     local exp_dir="${STEP1_DATA_DIR:-./step1_data}/$exp_id"
@@ -1456,14 +1517,14 @@ step1_deploy() {
     # Configure Jaeger (disabled by default to avoid overhead)
     configure_jaeger_tracing "$exp_dir"
 
-    # Validate system readiness
-    step1_log "$exp_dir" "Validating system readiness ..."
-    if ! validate_system_readiness "$exp_dir"; then
-        step1_log "$exp_dir" "WARNING: validation failed — attempting recovery ..."
+    # Validate system readiness (step1-specific: only what direct-gRPC needs)
+    step1_log "$exp_dir" "Validating step1 readiness ..."
+    if ! step1_validate_readiness "$exp_dir"; then
+        step1_log "$exp_dir" "WARNING: validation failed — attempting Consul re-registration ..."
         manual_register_all_services "$exp_dir" 2>/dev/null || true
         sleep 15
-        if ! validate_system_readiness "$exp_dir"; then
-            step1_log "$exp_dir" "ERROR: system validation failed after recovery. Aborting."
+        if ! step1_validate_readiness "$exp_dir"; then
+            step1_log "$exp_dir" "ERROR: step1 readiness failed after recovery. Aborting."
             exit 1
         fi
     fi
