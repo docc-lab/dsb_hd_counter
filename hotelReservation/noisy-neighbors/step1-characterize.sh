@@ -38,9 +38,11 @@ SATURATION_P99_THRESHOLD="${SATURATION_P99_THRESHOLD:-4.0}"
 # for saturation gating; only the p99 ratio decides.  Default 1% — set
 # to 0 to recover the strict "any error = saturated" behavior.
 SATURATION_ERROR_RATE_THRESHOLD="${SATURATION_ERROR_RATE_THRESHOLD:-0.01}"
-# After first saturation, keep running this many extra levels at the same
-# step to verify saturation holds and to better localize the knee.
-SATURATION_EXTRA_LEVELS="${SATURATION_EXTRA_LEVELS:-4}"
+# Number of CONSECUTIVE saturated levels required to declare saturation
+# confirmed (and stop the sweep).  A single-level p99 spike that recovers
+# (e.g. one GC pause or conntrack flush) does not stop the run; the
+# consecutive counter resets on any healthy level.  Default 3.
+SATURATION_CONFIRM_LEVELS="${SATURATION_CONFIRM_LEVELS:-3}"
 
 # Characterization
 CHARACTERIZE_DURATION="${CHARACTERIZE_DURATION:-300}"   # 5 min
@@ -376,7 +378,7 @@ step1_saturation_sweep() {
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" "RPS range: ${SATURATION_START_RPS}–${SATURATION_MAX_RPS}  step=${SATURATION_STEP_RPS}"
     step1_log "$exp_dir" "Duration per level: ${SATURATION_DURATION}s   p99 threshold: ${SATURATION_P99_THRESHOLD}x"
-    step1_log "$exp_dir" "Extra levels past first saturation: ${SATURATION_EXTRA_LEVELS}"
+    step1_log "$exp_dir" "Confirm-saturation requires: ${SATURATION_CONFIRM_LEVELS} CONSECUTIVE saturated levels"
 
     # Warmup
     step1_log "$exp_dir" "Warmup at ${SATURATION_START_RPS} RPS for ${SATURATION_WARMUP}s ..."
@@ -384,17 +386,21 @@ step1_saturation_sweep() {
     sleep 5
 
     # Sweep strategy:
-    #   Run at increasing RPS using a fixed coarse step.
-    #   On first saturation, record first_saturated_rps, then continue for
-    #   SATURATION_EXTRA_LEVELS more levels to verify saturation / collect
-    #   more post-knee data.  Knee = highest RPS across all levels that did
-    #   not saturate.
+    #   Run at increasing RPS using a fixed step.  Track CONSECUTIVE
+    #   saturated levels.  A single-level p99 spike that recovers (e.g.
+    #   one GC pause, scheduler hiccup, conntrack flush) does NOT stop
+    #   the run -- the consecutive counter resets on any healthy level.
+    #   Saturation is only confirmed (and the sweep terminates) when the
+    #   consecutive count reaches SATURATION_CONFIRM_LEVELS.  Knee =
+    #   highest RPS across all levels that did not saturate.
     local baseline_p99=""
     local last_healthy_rps=""
-    local first_saturated_rps=""
+    local first_saturated_rps=""        # start of the CURRENT consecutive run
+    local first_saturated_rps_ever=""   # ever-seen first saturation (for reporting)
+    local confirmed_saturated_at=""     # RPS at which CONFIRM_LEVELS was reached
     local rps=$SATURATION_START_RPS
     local level=0
-    local extra_done=0
+    local consec_sat=0
 
     while [[ $rps -le $SATURATION_MAX_RPS ]]; do
         ((level++))
@@ -412,7 +418,6 @@ step1_saturation_sweep() {
 
         # Append saturated flag to CSV row (step1_eval_sweep_level wrote an 8-col row;
         # rewrite the last line with the saturated column appended)
-        # Simpler: recompute CSV line here directly
         sed -i '$ s/$/,'"${saturated}"'/' "$csv_file" 2>/dev/null || true
 
         # First successful run establishes baseline
@@ -422,23 +427,27 @@ step1_saturation_sweep() {
         fi
 
         if [[ "$saturated" == "true" ]]; then
-            # Track the first saturating RPS
+            ((consec_sat++))
             if [[ -z "$first_saturated_rps" ]]; then
                 first_saturated_rps=$rps
-                step1_log "$exp_dir" "  First saturation at ${rps} RPS — continuing for ${SATURATION_EXTRA_LEVELS} more level(s)"
+                [[ -z "$first_saturated_rps_ever" ]] && first_saturated_rps_ever=$rps
+                step1_log "$exp_dir" "  Saturation at ${rps} RPS (consec=${consec_sat}/${SATURATION_CONFIRM_LEVELS})"
+            else
+                step1_log "$exp_dir" "  Saturation continues at ${rps} RPS (consec=${consec_sat}/${SATURATION_CONFIRM_LEVELS})"
             fi
-        else
-            # Healthy level — update knee candidate
-            last_healthy_rps=$rps
-        fi
 
-        # If we've already seen saturation, count extra levels
-        if [[ -n "$first_saturated_rps" ]]; then
-            ((extra_done++))
-            if [[ $extra_done -ge $SATURATION_EXTRA_LEVELS ]]; then
-                step1_log "$exp_dir" "  Completed ${SATURATION_EXTRA_LEVELS} extra level(s) after first saturation — stopping sweep"
+            if [[ $consec_sat -ge $SATURATION_CONFIRM_LEVELS ]]; then
+                confirmed_saturated_at=$first_saturated_rps
+                step1_log "$exp_dir" "  CONFIRMED: ${SATURATION_CONFIRM_LEVELS} consecutive saturated levels (started at ${confirmed_saturated_at} RPS) — stopping sweep"
                 break
             fi
+        else
+            if [[ $consec_sat -gt 0 ]]; then
+                step1_log "$exp_dir" "  Saturation cleared after ${consec_sat} level(s) (transient at ${first_saturated_rps} RPS) — continuing"
+            fi
+            consec_sat=0
+            first_saturated_rps=""
+            last_healthy_rps=$rps
         fi
 
         rps=$((rps + SATURATION_STEP_RPS))
@@ -452,8 +461,12 @@ step1_saturation_sweep() {
         knee_rps=$SATURATION_START_RPS
     else
         knee_rps=$last_healthy_rps
-        if [[ -z "$first_saturated_rps" ]]; then
-            step1_log "$exp_dir" "WARNING: reached max RPS ${SATURATION_MAX_RPS} without saturation"
+        if [[ -z "$confirmed_saturated_at" ]]; then
+            if [[ -n "$first_saturated_rps_ever" ]]; then
+                step1_log "$exp_dir" "WARNING: reached max RPS ${SATURATION_MAX_RPS} without confirming saturation; transient spikes seen starting at ${first_saturated_rps_ever} RPS"
+            else
+                step1_log "$exp_dir" "WARNING: reached max RPS ${SATURATION_MAX_RPS} without any saturation — knee likely above tested range"
+            fi
         fi
     fi
 
@@ -462,7 +475,8 @@ step1_saturation_sweep() {
 
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" " Knee point (max healthy) : ${knee_rps} RPS"
-    step1_log "$exp_dir" " First saturated at       : ${first_saturated_rps:-N/A} RPS"
+    step1_log "$exp_dir" " First saturation seen    : ${first_saturated_rps_ever:-N/A} RPS  (transient spikes do not stop the sweep)"
+    step1_log "$exp_dir" " Confirmed saturation at  : ${confirmed_saturated_at:-N/A} RPS  (${SATURATION_CONFIRM_LEVELS} consecutive levels)"
     step1_log "$exp_dir" " Characterize at          : ${char_rps} RPS (${CHARACTERIZE_KNEE_FRACTION} x knee)"
     step1_log "$exp_dir" " Baseline p99             : ${baseline_p99}ms"
     step1_log "$exp_dir" " Levels tested            : ${level}"
@@ -473,13 +487,15 @@ step1_saturation_sweep() {
     cat > "$sweep_dir/sweep_summary.json" <<-EOJSON
 {
     "knee_point_rps": $knee_rps,
-    "first_saturated_rps": ${first_saturated_rps:-0},
+    "first_saturated_rps_ever": ${first_saturated_rps_ever:-0},
+    "confirmed_saturated_at_rps": ${confirmed_saturated_at:-0},
     "characterize_rps": $char_rps,
     "characterize_fraction": $CHARACTERIZE_KNEE_FRACTION,
     "baseline_p99_ms": ${baseline_p99:-0},
-    "saturation_threshold": $SATURATION_P99_THRESHOLD,
+    "saturation_p99_threshold": $SATURATION_P99_THRESHOLD,
+    "saturation_error_rate_threshold": $SATURATION_ERROR_RATE_THRESHOLD,
+    "saturation_confirm_levels": $SATURATION_CONFIRM_LEVELS,
     "levels_tested": $level,
-    "extra_levels_after_saturation": $SATURATION_EXTRA_LEVELS,
     "rps_start": $SATURATION_START_RPS,
     "rps_step": $SATURATION_STEP_RPS,
     "rps_max": $SATURATION_MAX_RPS,
@@ -1697,8 +1713,11 @@ Optional:
                             Below this it is treated as transport noise and
                             ignored.  Set to 0 for strict "any error
                             = saturated" semantics.
-  SATURATION_EXTRA_LEVELS   Extra sweep levels after first saturation
-                            (default: 4 — verifies saturation, refines knee)
+  SATURATION_CONFIRM_LEVELS Number of CONSECUTIVE saturated levels required
+                            to terminate the sweep (default: 3).  A single
+                            transient p99 spike that recovers does not stop
+                            the run; the consecutive counter resets on any
+                            healthy level.
 
   CHARACTERIZE_DURATION  Seconds per run         (default: 300)
   CHARACTERIZE_RUNS      Number of runs          (default: 5)
