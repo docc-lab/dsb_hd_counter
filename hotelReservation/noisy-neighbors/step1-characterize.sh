@@ -33,6 +33,11 @@ SATURATION_MAX_RPS="${SATURATION_MAX_RPS:-2000}"
 SATURATION_DURATION="${SATURATION_DURATION:-30}"
 SATURATION_WARMUP="${SATURATION_WARMUP:-10}"
 SATURATION_P99_THRESHOLD="${SATURATION_P99_THRESHOLD:-4.0}"
+# Error-rate threshold (errors / requests).  Levels with a non-zero but
+# below-threshold error rate are treated as transport noise and IGNORED
+# for saturation gating; only the p99 ratio decides.  Default 1% — set
+# to 0 to recover the strict "any error = saturated" behavior.
+SATURATION_ERROR_RATE_THRESHOLD="${SATURATION_ERROR_RATE_THRESHOLD:-0.01}"
 # After first saturation, keep running this many extra levels at the same
 # step to verify saturation holds and to better localize the knee.
 SATURATION_EXTRA_LEVELS="${SATURATION_EXTRA_LEVELS:-4}"
@@ -136,7 +141,14 @@ except Exception:
 PYEOF
 }
 
-# Total error count: errorDistribution values + non-OK status codes.
+# Total error count.
+#
+# IMPORTANT: ghz reports the SAME failed RPC twice -- once in
+# statusCodeDistribution (e.g. {"OK": 998, "Unavailable": 2}) and once in
+# errorDistribution (e.g. {"rpc error: code = Unavailable...": 2}).  The
+# previous version of this function summed both and double-counted.  We
+# use only statusCodeDistribution as the canonical count; errorDistribution
+# is reserved for human-readable error summaries (see step1_format_ghz_errors).
 step1_parse_ghz_errors() {
     local file="$1"
     [[ -s "$file" ]] || { echo "0"; return; }
@@ -147,12 +159,43 @@ try:
         text = f.read()
         i = text.find('{')
         data = json.loads(text[i:]) if i >= 0 else {}
-    err_total = sum(int(v) for v in (data.get('errorDistribution') or {}).values())
     sc = data.get('statusCodeDistribution') or {}
     non_ok = sum(int(v) for k, v in sc.items() if k != 'OK')
-    print(int(err_total + non_ok))
+    # Fallback to errorDistribution if statusCodeDistribution is empty
+    # (very early ghz failure that never reached the gRPC stack).
+    if not sc:
+        non_ok = sum(int(v) for v in (data.get('errorDistribution') or {}).values())
+    print(int(non_ok))
 except Exception:
     print("0")
+PYEOF
+}
+
+# Human-readable one-line summary of ghz errors.  Prints e.g.:
+#   ghz errors: [Unavailable]=2; "rpc error: code=Unavailable desc=..."=2
+step1_format_ghz_errors() {
+    local file="$1"
+    [[ -s "$file" ]] || { echo "ghz errors: <no output>"; return; }
+    python3 - "$file" <<'PYEOF' 2>/dev/null || echo "ghz errors: <parse failed>"
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        text = f.read()
+        i = text.find('{')
+        data = json.loads(text[i:]) if i >= 0 else {}
+    sc = data.get('statusCodeDistribution') or {}
+    non_ok = {k: v for k, v in sc.items() if k != 'OK'}
+    err = data.get('errorDistribution') or {}
+    parts = []
+    for k, v in sorted(non_ok.items()):
+        parts.append(f"[{k}]={v}")
+    for k, v in sorted(err.items()):
+        # Trim long messages so the log line stays readable
+        short = k if len(k) <= 120 else k[:117] + "..."
+        parts.append(f'"{short}"={v}')
+    print("ghz errors: " + ("; ".join(parts) if parts else "<none>"))
+except Exception:
+    print("ghz errors: <parse failed>")
 PYEOF
 }
 
@@ -173,6 +216,15 @@ step1_run_ghz() {
     local concurrency="${LOADGEN_CONCURRENCY:-12}"
     local connections="${LOADGEN_CONNECTIONS:-4}"
     local proto_root="${LOADGEN_PROTO_ROOT:-../services}"
+    local async_flag=""
+    # Open-loop (--async): tokens dispatch a fire-and-forget goroutine per
+    # request; workers do NOT wait for the previous response before taking
+    # the next token.  This is the wrk2-equivalent semantics required to
+    # avoid coordinated omission and to actually observe latency blow up
+    # past the saturation knee.  Default on for this experiment.
+    if [[ "${LOADGEN_ASYNC:-true}" == "true" ]]; then
+        async_flag="--async"
+    fi
 
     if [[ ! -f "$LOADGEN_DATA_FILE" ]]; then
         step1_log "$exp_dir" "  ERROR: payload data file not found: $LOADGEN_DATA_FILE"
@@ -181,11 +233,12 @@ step1_run_ghz() {
     fi
 
     step1_log "$exp_dir" \
-        "  ghz: --rps=$rps --duration=${duration}s -c $concurrency --connections=$connections" \
+        "  ghz: --rps=$rps --duration=${duration}s -c $concurrency --connections=$connections ${async_flag:+open-loop}" \
         "    method=$LOADGEN_METHOD target=${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT}"
 
     "$LOADGEN_BIN" \
         --insecure \
+        $async_flag \
         --proto "$LOADGEN_PROTO" \
         -i "$proto_root" \
         --call "$LOADGEN_METHOD" \
@@ -261,8 +314,28 @@ step1_eval_sweep_level() {
         p99_ratio=$(awk "BEGIN {printf \"%.2f\", $p99 / $baseline_p99}")
     fi
 
-    step1_log "$exp_dir" "  p99=${p99}ms  p50=${p50}ms  actual_rps=${actual}  errors=${errors}  p99_ratio=${p99_ratio}x"
+    # Compute error rate (errors / total_requests).  The earlier parser
+    # double-counted gRPC failures (errorDistribution + statusCodeDistribution
+    # both include the same RPC); that's been fixed in step1_parse_ghz_errors,
+    # so the count below is the true number of failed RPCs.
+    local total_req=0 err_rate="0.0000"
+    if [[ -n "$actual" && "$actual" != "0" ]]; then
+        total_req=$(awk "BEGIN {printf \"%.0f\", $actual * $duration}")
+        if [[ "$total_req" != "0" ]]; then
+            err_rate=$(awk "BEGIN {printf \"%.4f\", ${errors:-0} / $total_req}")
+        fi
+    fi
+
+    step1_log "$exp_dir" "  p99=${p99}ms  p50=${p50}ms  actual_rps=${actual}  errors=${errors:-0}/${total_req} (${err_rate})  p99_ratio=${p99_ratio}x"
     echo "$label,$phase,$rps,${actual:-0},$p99,$p50,$p99_ratio,${errors:-0}" >> "$csv_file"
+
+    # If errors observed, dump the ghz errorDistribution so we can see
+    # *what* is failing (transport, backend exception, etc.) rather than
+    # only knowing the count.  This is logged regardless of whether the
+    # rate crosses SATURATION_ERROR_RATE_THRESHOLD.
+    if [[ "${errors:-0}" -gt 0 ]]; then
+        step1_log "$exp_dir" "  $(step1_format_ghz_errors "$out")"
+    fi
 
     # ---- Saturation checks ----
     local saturated=false
@@ -273,8 +346,11 @@ step1_eval_sweep_level() {
         reasons="p99_ratio=${p99_ratio}x"
         saturated=true
     fi
-    if [[ "${errors:-0}" -gt 0 ]]; then
-        reasons="${reasons:+$reasons, }errors=${errors}"
+    # Only flag saturation on the error rate; transient transport noise
+    # (e.g. one closed connection per few thousand requests) stays under
+    # the threshold and does not contaminate the knee.
+    if awk "BEGIN {exit !($err_rate >= $SATURATION_ERROR_RATE_THRESHOLD)}" 2>/dev/null; then
+        reasons="${reasons:+$reasons, }err_rate=${err_rate} (${errors:-0}/${total_req})"
         saturated=true
     fi
     if [[ -n "$actual" ]] && awk "BEGIN {exit !($actual < $rps * 0.85)}" 2>/dev/null; then
@@ -1460,6 +1536,7 @@ step1_create_exp_dir() {
         "payload_count": ${LOADGEN_PAYLOAD_COUNT:-5000},
         "concurrency": ${LOADGEN_CONCURRENCY:-12},
         "connections": ${LOADGEN_CONNECTIONS:-4},
+        "loop_mode": "$([[ "${LOADGEN_ASYNC:-true}" == "true" ]] && echo open_loop_async || echo closed_loop_sync)",
         "transport": "direct_grpc_nodeport"
     },
     "saturation_sweep": {
@@ -1596,6 +1673,12 @@ Optional:
                          (default: 5000)
   LOADGEN_CONCURRENCY    ghz virtual users  (default: 12)
   LOADGEN_CONNECTIONS    ghz gRPC connections (default: 4)
+  LOADGEN_ASYNC          true | false  (default: true)
+                         When true, ghz runs in open-loop mode (--async):
+                         requests fire on schedule independent of in-flight
+                         response completion -- avoids coordinated omission
+                         and exposes the real saturation knee.  Set to false
+                         only if you specifically want closed-loop semantics.
   LOADGEN_NODEPORT       Pin NodePort to this value (recommended: 30000-32767
                          so RHEL/OpenShift firewalld doesn't drop the traffic).
                          If unset, k8s auto-allocates -- which may pick a port
@@ -1608,6 +1691,12 @@ Optional:
   SATURATION_MAX_RPS     Upper bound             (default: 2000)
   SATURATION_DURATION    Seconds per level       (default: 30)
   SATURATION_P99_THRESHOLD  p99 multiplier to declare saturation (default: 4.0)
+  SATURATION_ERROR_RATE_THRESHOLD
+                            errors / requests fraction above which a level
+                            is treated as saturated (default: 0.01 = 1%).
+                            Below this it is treated as transport noise and
+                            ignored.  Set to 0 for strict "any error
+                            = saturated" semantics.
   SATURATION_EXTRA_LEVELS   Extra sweep levels after first saturation
                             (default: 4 — verifies saturation, refines knee)
 
