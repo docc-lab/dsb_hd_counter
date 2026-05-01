@@ -1,0 +1,11 @@
+{
+  {{- if lt (randFloat 0 1) 0.4 -}}
+  "hotelIds": ["{{ randInt 1 81 }}"],
+  {{- else -}}
+  "hotelIds": [
+    "{{ randInt 1 81 }}", "{{ randInt 1 81 }}", "{{ randInt 1 81 }}",
+    "{{ randInt 1 81 }}", "{{ randInt 1 81 }}"
+  ],
+  {{- end }}
+  "locale": "en"
+}

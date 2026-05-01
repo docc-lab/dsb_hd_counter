@@ -59,7 +59,7 @@ CHARACTERIZE_KNEE_FRACTION="${CHARACTERIZE_KNEE_FRACTION:-0.9}"  # 90 %
 #
 # Multiplexing on Ice Lake-SP is expected (~50-70%) due to event constraints
 # (cycle_activity.* and offcore_requests.* have specific PMC requirements).
-# perf scales values to estimate true counts; for steady 100s wrk2 runs the
+# perf scales values to estimate true counts; for steady 100s ghz runs the
 # averaging absorbs most of the noise.
 PERF_TOPDOWN_GROUP="${PERF_TOPDOWN_GROUP:-slots,topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound}"
 PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,LLC-loads,LLC-load-misses,cycle_activity.stalls_l3_miss,offcore_requests.all_data_rd,L1-dcache-load-misses,L1-icache-load-misses,dTLB-load-misses,branch-misses}"
@@ -76,61 +76,128 @@ step1_log() {
 }
 
 # ===========================================================================
-# wrk2 output helpers
+# ghz (gRPC load generator) helpers
+#
+# We drive the under-observation service's gRPC method directly, bypassing
+# the frontend.  ghz is invoked with `--format json`, so its output is a
+# single JSON document containing a HDR-style latencyDistribution array
+# plus rps / count / errorDistribution.
+#
+# IMPORTANT: payload is passed via `-d` (inline string) rather than
+# `--data-file`.  ghz only renders Sprig template functions
+# ({{randInt}}, {{randFloat}}, ...) when the data string comes from -d;
+# --data-file is treated as literal JSON and would freeze the payload
+# across all requests.
 # ===========================================================================
 
-step1_parse_wrk2_p99() {
-    local file="$1"
-    grep -E '^\s+99\.000%' "$file" 2>/dev/null | head -1 | awk '{
-        v = $2
-        if      (v ~ /ms$/) { gsub(/ms$/, "", v); printf "%.2f", v }
-        else if (v ~ /us$/) { gsub(/us$/, "", v); printf "%.2f", v/1000 }
-        else if (v ~ /s$/)  { gsub(/s$/,  "", v); printf "%.2f", v*1000 }
-        else                 { printf "%.2f", v }
-    }'
+# Read a percentile (50 / 99 / ...) from ghz JSON output, in milliseconds.
+step1_parse_ghz_pct() {
+    local file="$1" pct="$2"
+    [[ -s "$file" ]] || { echo ""; return; }
+    python3 - "$file" "$pct" <<'PYEOF' 2>/dev/null || echo ""
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        # ghz may print non-JSON warnings before the JSON object; find the
+        # first '{' to be safe.
+        text = f.read()
+        i = text.find('{')
+        data = json.loads(text[i:]) if i >= 0 else {}
+    pct = float(sys.argv[2])
+    for entry in data.get('latencyDistribution', []) or []:
+        if abs(float(entry.get('percentage', -1)) - pct) < 0.001:
+            ns = float(entry.get('latency', 0))
+            print(f"{ns/1e6:.2f}")
+            sys.exit(0)
+    print("")
+except Exception:
+    print("")
+PYEOF
 }
 
-step1_parse_wrk2_p50() {
+step1_parse_ghz_p99() { step1_parse_ghz_pct "$1" 99; }
+step1_parse_ghz_p50() { step1_parse_ghz_pct "$1" 50; }
+
+step1_parse_ghz_actual_rps() {
     local file="$1"
-    grep -E '^\s+50\.000%' "$file" 2>/dev/null | head -1 | awk '{
-        v = $2
-        if      (v ~ /ms$/) { gsub(/ms$/, "", v); printf "%.2f", v }
-        else if (v ~ /us$/) { gsub(/us$/, "", v); printf "%.2f", v/1000 }
-        else if (v ~ /s$/)  { gsub(/s$/,  "", v); printf "%.2f", v*1000 }
-        else                 { printf "%.2f", v }
-    }'
+    [[ -s "$file" ]] || { echo "0"; return; }
+    python3 - "$file" <<'PYEOF' 2>/dev/null || echo "0"
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        text = f.read()
+        i = text.find('{')
+        data = json.loads(text[i:]) if i >= 0 else {}
+    print(f"{float(data.get('rps', 0)):.2f}")
+except Exception:
+    print("0")
+PYEOF
 }
 
-step1_parse_wrk2_actual_rps() {
+# Total error count: errorDistribution values + non-OK status codes.
+step1_parse_ghz_errors() {
     local file="$1"
-    grep 'Requests/sec:' "$file" 2>/dev/null | awk '{print $2}' | head -1
-}
-
-step1_parse_wrk2_errors() {
-    local file="$1"
-    local non2xx
-    non2xx=$(grep -i 'Non-2xx' "$file" 2>/dev/null | awk '{print $NF}')
-    echo "${non2xx:-0}"
+    [[ -s "$file" ]] || { echo "0"; return; }
+    python3 - "$file" <<'PYEOF' 2>/dev/null || echo "0"
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        text = f.read()
+        i = text.find('{')
+        data = json.loads(text[i:]) if i >= 0 else {}
+    err_total = sum(int(v) for v in (data.get('errorDistribution') or {}).values())
+    sc = data.get('statusCodeDistribution') or {}
+    non_ok = sum(int(v) for k, v in sc.items() if k != 'OK')
+    print(int(err_total + non_ok))
+except Exception:
+    print("0")
+PYEOF
 }
 
 # ===========================================================================
 # Stage 1 — Saturation Sweep
 # ===========================================================================
 
-step1_run_wrk2() {
+step1_run_ghz() {
     local exp_dir="$1" rps="$2" duration="$3" output="$4"
 
-    local url="http://${WRK2_TARGET_IP}:${WRK2_TARGET_PORT}"
-    local cmd="$WRK2_DIR/wrk -D exp -t ${WRK2_THREADS:-2} -c ${WRK2_CONNECTIONS:-2}"
-    cmd="$cmd -d ${duration}s -L -R $rps"
+    : "${LOADGEN_BIN:?LOADGEN_BIN not set}"
+    : "${LOADGEN_PROTO:?LOADGEN_PROTO not set}"
+    : "${LOADGEN_METHOD:?LOADGEN_METHOD not set}"
+    : "${LOADGEN_PAYLOAD_FILE:?LOADGEN_PAYLOAD_FILE not set}"
+    : "${LOADGEN_TARGET_HOST:?LOADGEN_TARGET_HOST not set (NodePort expose failed?)}"
+    : "${LOADGEN_TARGET_PORT:?LOADGEN_TARGET_PORT not set (NodePort expose failed?)}"
 
-    if [[ -n "${WRK2_SCRIPT:-}" && -f "${WRK2_SCRIPT}" ]]; then
-        cmd="$cmd -s $WRK2_SCRIPT"
+    local concurrency="${LOADGEN_CONCURRENCY:-12}"
+    local connections="${LOADGEN_CONNECTIONS:-4}"
+    local proto_root="${LOADGEN_PROTO_ROOT:-../services}"
+
+    if [[ ! -f "$LOADGEN_PAYLOAD_FILE" ]]; then
+        step1_log "$exp_dir" "  ERROR: payload file not found: $LOADGEN_PAYLOAD_FILE"
+        echo "{}" > "$output"
+        return
     fi
-    cmd="$cmd $url"
 
-    step1_log "$exp_dir" "  wrk2: $cmd"
-    eval "$cmd" > "$output" 2>&1 || true
+    local payload
+    payload=$(cat "$LOADGEN_PAYLOAD_FILE")
+
+    step1_log "$exp_dir" \
+        "  ghz: --rps=$rps --duration=${duration}s -c $concurrency --connections=$connections" \
+        "    method=$LOADGEN_METHOD target=${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT}"
+
+    "$LOADGEN_BIN" \
+        --insecure \
+        --proto "$LOADGEN_PROTO" \
+        -i "$proto_root" \
+        --call "$LOADGEN_METHOD" \
+        --rps "$rps" \
+        --concurrency "$concurrency" \
+        --connections "$connections" \
+        --duration "${duration}s" \
+        --format json \
+        -d "$payload" \
+        "${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT}" \
+        > "$output" 2>&1 || true
 }
 
 # Evaluate one sweep level.
@@ -142,13 +209,13 @@ step1_eval_sweep_level() {
     local baseline_p99="$5" label="$6" csv_file="$7" phase="$8"
 
     step1_log "$exp_dir" "--- $label: ${rps} RPS ---"
-    step1_run_wrk2 "$exp_dir" "$rps" "$duration" "$out"
+    step1_run_ghz "$exp_dir" "$rps" "$duration" "$out"
 
     local p99 p50 actual errors
-    p99=$(step1_parse_wrk2_p99 "$out")
-    p50=$(step1_parse_wrk2_p50 "$out")
-    actual=$(step1_parse_wrk2_actual_rps "$out")
-    errors=$(step1_parse_wrk2_errors "$out")
+    p99=$(step1_parse_ghz_p99 "$out")
+    p50=$(step1_parse_ghz_p50 "$out")
+    actual=$(step1_parse_ghz_actual_rps "$out")
+    errors=$(step1_parse_ghz_errors "$out")
 
     if [[ -z "$p99" || "$p99" == "0" || "$p99" == "0.00" ]]; then
         step1_log "$exp_dir" "  WARNING: could not parse p99 — treating as saturated"
@@ -205,7 +272,7 @@ step1_saturation_sweep() {
 
     # Warmup
     step1_log "$exp_dir" "Warmup at ${SATURATION_START_RPS} RPS for ${SATURATION_WARMUP}s ..."
-    step1_run_wrk2 "$exp_dir" "$SATURATION_START_RPS" "$SATURATION_WARMUP" "$sweep_dir/warmup.txt"
+    step1_run_ghz "$exp_dir" "$SATURATION_START_RPS" "$SATURATION_WARMUP" "$sweep_dir/warmup.txt"
     sleep 5
 
     # Sweep strategy:
@@ -597,7 +664,7 @@ step1_retrieve_system_metrics() {
 # Stage 2 — Characterization Runs
 #
 # Each run: restart pods (clean state) → start monitors + perf stat →
-#           run wrk2 → collect data.
+#           run ghz → collect data.
 # ===========================================================================
 
 step1_prepare_run() {
@@ -662,10 +729,10 @@ step1_run_single_characterization() {
     wl_start=$(date +%s)
     echo "$wl_start" > "$run_dir/workload_start_epoch.txt"
 
-    # 5. Run wrk2
-    step1_log "$exp_dir" "  Starting wrk2: ${char_rps} RPS for ${CHARACTERIZE_DURATION}s"
-    step1_run_wrk2 "$exp_dir" "$char_rps" "$CHARACTERIZE_DURATION" \
-        "$run_dir/latency/wrk2_output.txt"
+    # 5. Run ghz
+    step1_log "$exp_dir" "  Starting ghz: ${char_rps} RPS for ${CHARACTERIZE_DURATION}s"
+    step1_run_ghz "$exp_dir" "$char_rps" "$CHARACTERIZE_DURATION" \
+        "$run_dir/latency/ghz_output.json"
 
     # 6. Record workload-end timestamp
     local wl_end
@@ -673,14 +740,14 @@ step1_run_single_characterization() {
     echo "$wl_end" > "$run_dir/workload_end_epoch.txt"
 
     local actual_dur=$((wl_end - wl_start))
-    step1_log "$exp_dir" "  wrk2 finished (actual ${actual_dur}s)"
+    step1_log "$exp_dir" "  ghz finished (actual ${actual_dur}s)"
 
     # 7. Parse latency headline numbers
     local p99 p50 actual_rps errors
-    p99=$(step1_parse_wrk2_p99 "$run_dir/latency/wrk2_output.txt")
-    p50=$(step1_parse_wrk2_p50 "$run_dir/latency/wrk2_output.txt")
-    actual_rps=$(step1_parse_wrk2_actual_rps "$run_dir/latency/wrk2_output.txt")
-    errors=$(step1_parse_wrk2_errors "$run_dir/latency/wrk2_output.txt")
+    p99=$(step1_parse_ghz_p99 "$run_dir/latency/ghz_output.json")
+    p50=$(step1_parse_ghz_p50 "$run_dir/latency/ghz_output.json")
+    actual_rps=$(step1_parse_ghz_actual_rps "$run_dir/latency/ghz_output.json")
+    errors=$(step1_parse_ghz_errors "$run_dir/latency/ghz_output.json")
     step1_log "$exp_dir" "  Latency: p50=${p50}ms  p99=${p99}ms  actual_rps=${actual_rps}  errors=${errors}"
 
     # 8. Wait for monitors and perf stat to finish
@@ -1068,7 +1135,7 @@ with open(summary_dir / "report.txt", "w") as f:
         f.write(f"    RX throughput      :{fmt('net_rx_mbps', 'Mbps')}\n")
         f.write(f"    TX throughput      :{fmt('net_tx_mbps', 'Mbps')}\n")
 
-        f.write(f"\n  [End-to-end Latency — wrk2]\n")
+        f.write(f"\n  [Service Latency — ghz (direct gRPC, downstream live)]\n")
         f.write(f"    p50               :{fmt('p50_ms', 'ms')}\n")
         f.write(f"    p99               :{fmt('p99_ms', 'ms')}\n")
         f.write(f"    Actual RPS        :{fmt('actual_rps', 'rps')}\n")
@@ -1103,8 +1170,8 @@ step1_validate_config() {
 
     source "$config_file"
 
-    local required=(EXPERIMENT_NAME TARGET_NODE OBSERVED_SERVICES
-                    WRK2_TARGET_IP WRK2_TARGET_PORT)
+    local required=(EXPERIMENT_NAME TARGET_NODE OBSERVED_SERVICE
+                    LOADGEN_BIN LOADGEN_PROTO LOADGEN_METHOD LOADGEN_PAYLOAD_FILE)
     for var in "${required[@]}"; do
         if [[ -z "${!var:-}" ]]; then
             echo "ERROR: required variable $var not set in $config_file" >&2
@@ -1112,8 +1179,38 @@ step1_validate_config() {
         fi
     done
 
-    # Alias for data-collector.sh functions that reference VICTIM_SERVICES
-    VICTIM_SERVICES="$OBSERVED_SERVICES"
+    # OBSERVED_SERVICE must be a single service name (one experiment per
+    # service).  The script exposes that one service via NodePort and drives
+    # ghz directly at it; multi-service runs are no longer supported here.
+    if [[ "$OBSERVED_SERVICE" =~ [[:space:]] ]]; then
+        echo "ERROR: OBSERVED_SERVICE must be a single service name (got: '$OBSERVED_SERVICE')" >&2
+        echo "       Run separate experiments per service with one config each." >&2
+        exit 1
+    fi
+
+    # Many helpers downstream still loop over a space-separated list; expose
+    # a singleton list so they keep working unchanged.
+    OBSERVED_SERVICES="$OBSERVED_SERVICE"
+    VICTIM_SERVICES="$OBSERVED_SERVICE"
+
+    # ghz binary precheck
+    if ! command -v "$LOADGEN_BIN" >/dev/null 2>&1 && [[ ! -x "$LOADGEN_BIN" ]]; then
+        echo "ERROR: ghz binary not found at LOADGEN_BIN='$LOADGEN_BIN'" >&2
+        echo "       Install with: $STEP1_SCRIPTS_DIR/loadgen/install-ghz.sh" >&2
+        exit 1
+    fi
+
+    # Payload file precheck (templates are evaluated by ghz at request time)
+    if [[ ! -f "$LOADGEN_PAYLOAD_FILE" ]]; then
+        echo "ERROR: LOADGEN_PAYLOAD_FILE not found: $LOADGEN_PAYLOAD_FILE" >&2
+        exit 1
+    fi
+
+    # Proto file precheck
+    if [[ ! -f "$LOADGEN_PROTO" ]]; then
+        echo "ERROR: LOADGEN_PROTO not found: $LOADGEN_PROTO" >&2
+        exit 1
+    fi
 
     # Vanilla deployment — no interceptor, no windowed sampling
     ENABLE_WINDOWED_SAMPLING="false"
@@ -1123,6 +1220,74 @@ step1_validate_config() {
     EXPERIMENT_DURATION="${EXPERIMENT_DURATION:-$CHARACTERIZE_DURATION}"
     JAEGER_SAMPLE_RATIO="${JAEGER_SAMPLE_RATIO:-0}"
     CONTENTION_BURSTS="none"
+}
+
+# ===========================================================================
+# NodePort exposure for the under-observation service
+#
+# search/profile k8s Services are ClusterIP by default; ghz lives outside the
+# cluster, so we patch the Service to NodePort, capture the assigned port,
+# and revert on cleanup.
+# ===========================================================================
+
+step1_expose_nodeport() {
+    local service="$1" exp_dir="$2"
+
+    step1_log "$exp_dir" "Exposing $service via NodePort ..."
+
+    if ! kubectl patch svc "$service" \
+            -p '{"spec":{"type":"NodePort"}}' >/dev/null 2>&1; then
+        step1_log "$exp_dir" "ERROR: kubectl patch svc $service failed"
+        return 1
+    fi
+
+    # Wait briefly for the NodePort to be assigned
+    local node_port="" tries=0
+    while [[ -z "$node_port" && $tries -lt 10 ]]; do
+        node_port=$(kubectl get svc "$service" \
+            -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+        [[ -n "$node_port" ]] && break
+        sleep 1
+        ((tries++))
+    done
+
+    if [[ -z "$node_port" ]]; then
+        step1_log "$exp_dir" "ERROR: NodePort not assigned for $service after 10s"
+        return 1
+    fi
+
+    local node_ip
+    node_ip=$(kubectl get node "$TARGET_NODE" \
+        -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
+    if [[ -z "$node_ip" ]]; then
+        # Fallback to ExternalIP if no InternalIP
+        node_ip=$(kubectl get node "$TARGET_NODE" \
+            -o jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null)
+    fi
+    if [[ -z "$node_ip" ]]; then
+        step1_log "$exp_dir" "ERROR: could not resolve IP for node $TARGET_NODE"
+        return 1
+    fi
+
+    # Allow override via config (e.g. cluster-internal IP not reachable from loadgen host)
+    LOADGEN_TARGET_HOST="${LOADGEN_TARGET_HOST_OVERRIDE:-$node_ip}"
+    LOADGEN_TARGET_PORT="$node_port"
+    export LOADGEN_TARGET_HOST LOADGEN_TARGET_PORT
+
+    step1_log "$exp_dir" "  $service exposed at ${LOADGEN_TARGET_HOST}:${LOADGEN_TARGET_PORT} (NodePort, node=$TARGET_NODE)"
+    return 0
+}
+
+step1_revert_nodeport() {
+    local service="$1"
+    [[ -z "$service" ]] && return 0
+
+    # Best-effort revert.  JSON Patch leaves nodePort allocation alone but
+    # changes type back to ClusterIP; failure is non-fatal (cleanup path).
+    kubectl patch svc "$service" \
+        --type='json' \
+        -p='[{"op":"replace","path":"/spec/type","value":"ClusterIP"}]' \
+        >/dev/null 2>&1 || true
 }
 
 step1_create_exp_dir() {
@@ -1143,8 +1308,18 @@ step1_create_exp_dir() {
     "experiment_name": "$EXPERIMENT_NAME",
     "experiment_type": "step1_characterization_vanilla",
     "target_node": "$TARGET_NODE",
-    "observed_services": "$(echo $OBSERVED_SERVICES)",
+    "observed_service": "$OBSERVED_SERVICE",
     "config_file": "$(basename "$config_file")",
+    "loadgen": {
+        "tool": "ghz",
+        "binary": "$LOADGEN_BIN",
+        "proto": "$LOADGEN_PROTO",
+        "method": "$LOADGEN_METHOD",
+        "payload_file": "$LOADGEN_PAYLOAD_FILE",
+        "concurrency": ${LOADGEN_CONCURRENCY:-12},
+        "connections": ${LOADGEN_CONNECTIONS:-4},
+        "transport": "direct_grpc_nodeport"
+    },
     "saturation_sweep": {
         "start_rps": $SATURATION_START_RPS,
         "step_rps": $SATURATION_STEP_RPS,
@@ -1163,7 +1338,7 @@ step1_create_exp_dir() {
         "perf_stat_external": true,
         "perf_events": "$PERF_EVENTS",
         "system_metrics": "proc_stat+proc_status+proc_net_dev@1Hz",
-        "latency": "wrk2_hdr_histogram"
+        "latency": "ghz_hdr_histogram"
     },
     "timestamp": "$(date -Iseconds)"
 }
@@ -1175,7 +1350,7 @@ EOJSON
 step1_deploy() {
     local exp_dir="$1"
 
-    step1_log "$exp_dir" "Deploying observed services (vanilla images): $OBSERVED_SERVICES"
+    step1_log "$exp_dir" "Deploying observed service (vanilla image): $OBSERVED_SERVICE"
 
     # Remove anti-affinity from all deployments to allow placement
     local all_deps
@@ -1189,10 +1364,10 @@ step1_deploy() {
     # Reset ALL services to default images (ensures vanilla deployment)
     reset_non_victim_services "" "$exp_dir"
 
-    # Deploy observed services on target node using vanilla images
+    # Deploy the observed service on the target node using vanilla images.
     # ENABLE_WINDOWED_SAMPLING=false causes deploy_victim_services to use
     # deploy_regular_service (standard image, no interceptor)
-    deploy_victim_services "$OBSERVED_SERVICES" "$TARGET_NODE" "$exp_dir"
+    deploy_victim_services "$OBSERVED_SERVICE" "$TARGET_NODE" "$exp_dir"
 
     step1_log "$exp_dir" "Waiting 45s for services to stabilize ..."
     sleep 45
@@ -1212,6 +1387,22 @@ step1_deploy() {
         fi
     fi
     step1_log "$exp_dir" "System ready"
+
+    # Expose the observed service via NodePort so the external ghz client
+    # can dial it directly.  Trap-based revert is set in step1_main.
+    if ! step1_expose_nodeport "$OBSERVED_SERVICE" "$exp_dir"; then
+        step1_log "$exp_dir" "ERROR: failed to expose $OBSERVED_SERVICE via NodePort"
+        exit 1
+    fi
+    STEP1_EXPOSED_SERVICE="$OBSERVED_SERVICE"
+    export STEP1_EXPOSED_SERVICE
+}
+
+# Cleanup hook installed via trap in step1_main.  Runs on EXIT/INT/TERM.
+step1_cleanup() {
+    if [[ -n "${STEP1_EXPOSED_SERVICE:-}" ]]; then
+        step1_revert_nodeport "$STEP1_EXPOSED_SERVICE"
+    fi
 }
 
 # ===========================================================================
@@ -1225,43 +1416,54 @@ Usage: ./step1-characterize.sh <config-file>
 
 Step 1 — Workload Characterization Without Stressor (Vanilla)
 
-Deploys services with standard (unmodified) images — no interceptor,
-no in-process perf sampling.  Perf counters are collected externally
-via SSH + perf stat on the target node.
+Deploys ONE service with the standard (unmodified) image — no
+interceptor, no in-process perf sampling.  ghz drives that service's
+gRPC method directly via NodePort while its downstream call chain
+stays live (search→geo+rate, profile→memcached+mongo).  Perf counters
+are collected externally via SSH + perf stat on the target node.
 
 Two stages:
-  Stage 1  Saturation sweep — ramp RPS to find knee point
-  Stage 2  Characterization — 5 min x 5 runs at 90% knee-point RPS
+  Stage 1  Saturation sweep   — ramp RPS to find the knee point
+  Stage 2  Characterization   — N runs at (knee_fraction * knee) RPS
 
 Required config variables:
-  EXPERIMENT_NAME       Descriptive name
-  TARGET_NODE           Kubernetes node to pin observed services to
-  OBSERVED_SERVICES     Space-separated list (e.g. 'search profile')
-  WRK2_TARGET_IP        IP reachable from wrk2 client
-  WRK2_TARGET_PORT      Port (usually 5000)
+  EXPERIMENT_NAME        Descriptive name
+  TARGET_NODE            Kubernetes node to pin the observed service to
+  OBSERVED_SERVICE       Single service name (e.g. 'search' or 'profile')
+
+  LOADGEN_BIN            Path to the ghz binary (install via
+                         ./loadgen/install-ghz.sh)
+  LOADGEN_PROTO          .proto file for the target service
+  LOADGEN_METHOD         Fully-qualified method, e.g.
+                         'search.Search/Nearby' or 'profile.Profile/GetProfiles'
+  LOADGEN_PAYLOAD_FILE   ghz -d payload template (Sprig-templated, evaluated
+                         per request)
 
 Optional:
-  WRK2_SCRIPT           Lua workload script path
-  WRK2_THREADS          wrk2 threads  (default: 2)
-  WRK2_CONNECTIONS      wrk2 connections (default: 2)
+  LOADGEN_PROTO_ROOT     Proto import root (default: ../services)
+  LOADGEN_CONCURRENCY    ghz virtual users  (default: 12)
+  LOADGEN_CONNECTIONS    ghz gRPC connections (default: 4)
+  LOADGEN_TARGET_HOST_OVERRIDE
+                         Override the resolved node IP (e.g. external IP)
 
-  SATURATION_START_RPS  Starting RPS for sweep  (default: 50)
-  SATURATION_STEP_RPS   Increment per level     (default: 50)
-  SATURATION_MAX_RPS    Upper bound             (default: 2000)
-  SATURATION_DURATION   Seconds per level       (default: 30)
+  SATURATION_START_RPS   Starting RPS for sweep  (default: 50)
+  SATURATION_STEP_RPS    Increment per level     (default: 50)
+  SATURATION_MAX_RPS     Upper bound             (default: 2000)
+  SATURATION_DURATION    Seconds per level       (default: 30)
   SATURATION_P99_THRESHOLD  p99 multiplier to declare saturation (default: 4.0)
   SATURATION_EXTRA_LEVELS   Extra sweep levels after first saturation
                             (default: 4 — verifies saturation, refines knee)
 
-  CHARACTERIZE_DURATION Seconds per run         (default: 300)
-  CHARACTERIZE_RUNS     Number of runs          (default: 5)
-  CHARACTERIZE_KNEE_FRACTION  Fraction of knee  (default: 0.9)
+  CHARACTERIZE_DURATION  Seconds per run         (default: 300)
+  CHARACTERIZE_RUNS      Number of runs          (default: 5)
+  CHARACTERIZE_KNEE_FRACTION  Fraction of knee   (default: 0.9)
 
-  PERF_EVENTS           perf stat events (sensible default)
-  JAEGER_SAMPLE_RATIO   0 to disable tracing overhead (default: 0)
+  PERF_EVENTS            perf stat events (sensible default)
+  JAEGER_SAMPLE_RATIO    0 to disable tracing overhead (default: 0)
 
 Prerequisites:
-  - SSH access from wrk2 client to TARGET_NODE (for perf stat)
+  - ghz installed and pointed to by LOADGEN_BIN (./loadgen/install-ghz.sh)
+  - SSH access from this host to TARGET_NODE (for perf stat)
   - perf installed on TARGET_NODE
   - sudo access for perf stat on TARGET_NODE
 USAGE
@@ -1274,8 +1476,12 @@ USAGE
     [[ -f "$SHAPES_SCRIPT" ]] && source "$SHAPES_SCRIPT"
 
     # Load and validate config in the current shell (NOT a subshell)
-    # so that all variables (OBSERVED_SERVICES, WRK2_TARGET_IP, etc.) persist
+    # so that all variables (OBSERVED_SERVICE, LOADGEN_*, etc.) persist
     step1_validate_config "$config_file"
+
+    # Install cleanup trap BEFORE deploy so a failure mid-deploy still
+    # reverts any NodePort patch that was applied.
+    trap step1_cleanup EXIT INT TERM
 
     # Create experiment directory (runs in subshell to capture path)
     local exp_dir
@@ -1294,9 +1500,9 @@ USAGE
     step1_log "$exp_dir" "Cool-down 30s between stages ..."
     sleep 30
 
-    step1_characterize "$exp_dir" "$char_rps" "$OBSERVED_SERVICES"
+    step1_characterize "$exp_dir" "$char_rps" "$OBSERVED_SERVICE"
 
-    step1_aggregate "$exp_dir" "$OBSERVED_SERVICES"
+    step1_aggregate "$exp_dir" "$OBSERVED_SERVICE"
 
     step1_log "$exp_dir" ""
     step1_log "$exp_dir" "=========================================="
