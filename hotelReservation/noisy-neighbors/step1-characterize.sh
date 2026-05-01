@@ -1655,7 +1655,14 @@ step1_cleanup() {
 step1_main() {
     if [[ $# -eq 0 ]]; then
         cat <<'USAGE'
-Usage: ./step1-characterize.sh <config-file>
+Usage: ./step1-characterize.sh <config-file> [<char-rps>]
+
+  <config-file>  per-service config (e.g. configs/step1-search.conf)
+  <char-rps>     OPTIONAL.  If given, skip Stage 1 (saturation sweep)
+                 and run Stage 2 directly at this RPS.  Use when you
+                 already know the knee from a prior run.
+                 Example:
+                   ./step1-characterize.sh configs/step1-profile.conf 9000
 
 Step 1 — Workload Characterization Without Stressor (Vanilla)
 
@@ -1736,6 +1743,14 @@ USAGE
     fi
 
     local config_file="$1"
+    local char_rps_override="${2:-}"
+
+    if [[ -n "$char_rps_override" ]]; then
+        if ! [[ "$char_rps_override" =~ ^[0-9]+$ ]] || [[ "$char_rps_override" -le 0 ]]; then
+            echo "ERROR: <char-rps> must be a positive integer, got: '$char_rps_override'" >&2
+            exit 1
+        fi
+    fi
 
     # Source contention-shapes.sh (needed by data-collector.sh internals)
     [[ -f "$SHAPES_SCRIPT" ]] && source "$SHAPES_SCRIPT"
@@ -1755,15 +1770,49 @@ USAGE
     step1_deploy "$exp_dir"
 
     local char_rps
-    char_rps=$(step1_saturation_sweep "$exp_dir")
+    if [[ -n "$char_rps_override" ]]; then
+        # Skip Stage 1 — caller already knows the knee from a prior run.
+        char_rps="$char_rps_override"
+        step1_log "$exp_dir" "=========================================="
+        step1_log "$exp_dir" " STAGE 1: SATURATION SWEEP (SKIPPED)"
+        step1_log "$exp_dir" "=========================================="
+        step1_log "$exp_dir" " Using user-supplied char_rps=${char_rps} RPS"
+        step1_log "$exp_dir" " (no knee detection; proceeding directly to characterization)"
+        step1_log "$exp_dir" "=========================================="
 
-    if [[ -z "$char_rps" || "$char_rps" == "0" ]]; then
-        step1_log "$exp_dir" "ERROR: saturation sweep produced no usable RPS"
-        exit 1
+        # Write a synthetic sweep_summary.json so downstream aggregation /
+        # report.txt still has the "knee / characterize" headline numbers.
+        mkdir -p "$exp_dir/saturation"
+        cat > "$exp_dir/saturation/sweep_summary.json" <<-EOJSON
+{
+    "knee_point_rps": 0,
+    "first_saturated_rps_ever": 0,
+    "confirmed_saturated_at_rps": 0,
+    "characterize_rps": $char_rps,
+    "characterize_fraction": 1.0,
+    "baseline_p99_ms": 0,
+    "saturation_p99_threshold": $SATURATION_P99_THRESHOLD,
+    "saturation_error_rate_threshold": $SATURATION_ERROR_RATE_THRESHOLD,
+    "saturation_confirm_levels": $SATURATION_CONFIRM_LEVELS,
+    "levels_tested": 0,
+    "rps_start": 0,
+    "rps_step": 0,
+    "rps_max": 0,
+    "duration_per_level_s": 0,
+    "skipped": true,
+    "skip_reason": "char_rps_override supplied via CLI"
+}
+EOJSON
+    else
+        char_rps=$(step1_saturation_sweep "$exp_dir")
+        if [[ -z "$char_rps" || "$char_rps" == "0" ]]; then
+            step1_log "$exp_dir" "ERROR: saturation sweep produced no usable RPS"
+            exit 1
+        fi
+
+        step1_log "$exp_dir" "Cool-down 30s between stages ..."
+        sleep 30
     fi
-
-    step1_log "$exp_dir" "Cool-down 30s between stages ..."
-    sleep 30
 
     step1_characterize "$exp_dir" "$char_rps" "$OBSERVED_SERVICE"
 
