@@ -609,16 +609,57 @@ step1_start_perf_stat() {
     fi
     perf_args="$perf_args -e $events"
 
-    # SSH to the node, find host PID, run perf stat
+    # SSH to the node, find host PID, run perf stat.
+    # Container PID resolution tries several runtimes in order so the
+    # script works on Docker hosts, containerd-with-crictl hosts, and
+    # plain-containerd hosts.  Whichever one returns a non-zero PID first
+    # wins; remaining methods are skipped.
     ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$node_name" "
-        # Try docker first, then crictl
-        PID=\$(docker inspect $container_id --format '{{.State.Pid}}' 2>/dev/null)
+        CID='$container_id'
+        PID=''
+
+        # 1) Docker (legacy / docker-shim hosts)
+        if command -v docker >/dev/null 2>&1; then
+            PID=\$(sudo docker inspect \$CID --format '{{.State.Pid}}' 2>/dev/null)
+        fi
+
+        # 2) crictl with a list of common containerd / cri-o endpoints.
+        #    crictl auto-detect often fails over ssh because /etc/crictl.yaml
+        #    isn't read for non-interactive shells; supply endpoints explicitly.
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]] && command -v crictl >/dev/null 2>&1; then
+            for ep in \\
+                unix:///run/containerd/containerd.sock \\
+                unix:///var/run/containerd/containerd.sock \\
+                unix:///run/crio/crio.sock \\
+                unix:///var/run/crio/crio.sock \\
+                unix:///run/dockershim.sock; do
+                PID=\$(sudo crictl --runtime-endpoint=\$ep \\
+                       inspect --output go-template --template '{{.info.pid}}' \\
+                       \$CID 2>/dev/null)
+                if [[ -n \"\$PID\" && \"\$PID\" != \"0\" ]]; then break; fi
+                PID=''
+            done
+        fi
+
+        # 3) ctr (containerd direct, k8s.io namespace).  ctr.tasks output
+        #    columns: TASK PID STATUS.  Container ID may be a short prefix.
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]] && command -v ctr >/dev/null 2>&1; then
+            PID=\$(sudo ctr -n k8s.io tasks ls 2>/dev/null \\
+                   | awk -v cid=\$CID '\$1 == cid || index(cid,\$1) == 1 {print \$2; exit}')
+        fi
+
+        # 4) Last resort: scan host /proc for a cgroup containing the cid.
         if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
-            PID=\$(crictl inspect --output go-template --template '{{.info.pid}}' $container_id 2>/dev/null)
+            PID=\$(sudo grep -l \"\$CID\" /proc/*/cgroup 2>/dev/null \\
+                   | head -1 | awk -F/ '{print \$3}')
         fi
 
         if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
-            echo 'ERROR: could not resolve container PID'
+            echo 'ERROR: could not resolve container PID for cid='\$CID
+            echo 'tried: docker, crictl(5 endpoints), ctr(k8s.io), /proc/*/cgroup scan'
+            sudo which docker  2>&1
+            sudo which crictl  2>&1
+            sudo which ctr     2>&1
             exit 1
         fi
 
