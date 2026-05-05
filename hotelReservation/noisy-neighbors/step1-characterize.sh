@@ -507,49 +507,135 @@ EOJSON
 }
 
 # ===========================================================================
-# Pod-level monitoring  (CPU / memory / network)
+# Host-side system metrics monitor (CPU / memory / network)
 #
-# Runs a lightweight polling loop *inside* each observed-service pod via
-# kubectl exec.  Reads /proc/1/stat, /proc/1/status, /proc/net/dev once
-# per second and writes a CSV in the pod.
-# Returns the background kubectl-exec PID.
+# Runs a polling loop ON THE NODE (via SSH) reading
+#   /proc/<host_pid>/stat
+#   /proc/<host_pid>/status
+#   /proc/<host_pid>/net/dev
+# once per second and writes a CSV to /tmp on the worker node.  We retrieve
+# it later via scp.  This replaces the previous "kubectl exec into the pod
+# and write to /data" path, which was unreliable because:
+#   - /data wasn't always a writable volume in the pod
+#   - PID 1 inside the pod is sometimes an init wrapper (taskset shim,
+#     dumb-init, etc.) with near-zero CPU, producing garbage "0.05% CPU"
+#     readings even when the actual service was at full utilization
+#   - kubectl-exec sessions can race with rolling restarts between runs
+#
+# Reading /proc/<host_pid>/* on the node gives the exact same data the
+# in-pod /proc/1/* would give if PID 1 were the right process, but we use
+# the container-PID resolved by the same multi-runtime fallback as perf
+# stat, so we always read the *gRPC server* process, not the wrapper.
 # ===========================================================================
 
-step1_start_pod_monitor() {
-    local pod_name="$1" run_num="$2" duration="$3" exp_dir="$4"
+step1_start_host_monitor() {
+    local service="$1" run_num="$2" duration="$3" exp_dir="$4"
 
-    step1_log "$exp_dir" "  Starting system monitor in $pod_name (run $run_num, ${duration}s)"
+    # Resolve pod -> node + container ID (same as step1_start_perf_stat)
+    local pod_name node_name container_id
+    pod_name=$(kubectl get pods -l io.kompose.service="$service" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod_name" ]]; then
+        step1_log "$exp_dir" "  WARNING: no pod for $service, skipping system monitor"
+        echo ""
+        return
+    fi
+    node_name=$(kubectl get pod "$pod_name" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    container_id=$(kubectl get pod "$pod_name" \
+        -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null \
+        | sed 's|.*://||')
+    if [[ -z "$node_name" || -z "$container_id" ]]; then
+        step1_log "$exp_dir" "  WARNING: could not resolve node/container for $service monitor"
+        echo ""
+        return
+    fi
 
-    kubectl exec "$pod_name" -- sh -c '
-        RUN=$1; DUR=$2
-        DIR="/data/system_metrics_run${RUN}"
-        mkdir -p "$DIR"
+    local remote_csv="/tmp/step1_${service}_run${run_num}.csv"
 
-        HDR="ts_epoch_ns,utime,stime,threads,vsize_bytes,rss_pages,vmrss_kb,rx_bytes,tx_bytes,vol_ctxt,nonvol_ctxt"
-        echo "$HDR" > "$DIR/metrics.csv"
+    step1_log "$exp_dir" "  Starting host monitor on $node_name for $service -> $remote_csv"
 
-        END=$(( $(date +%s) + DUR + 5 ))
-        while [ "$(date +%s)" -lt "$END" ]; do
-            TS=$(date +%s%N)
-            RAW=$(sed "s/.*) //" /proc/1/stat)
-            UTIME=$(echo  "$RAW" | awk "{print \$12}")
-            STIME=$(echo  "$RAW" | awk "{print \$13}")
-            THR=$(echo    "$RAW" | awk "{print \$18}")
-            VS=$(echo     "$RAW" | awk "{print \$21}")
-            RSSPG=$(echo  "$RAW" | awk "{print \$22}")
-            VMRSS=$(grep VmRSS /proc/1/status | awk "{print \$2}")
-            VCS=$(grep "^voluntary_ctxt_switches" /proc/1/status | awk "{print \$2}")
-            NVCS=$(grep "^nonvoluntary_ctxt_switches" /proc/1/status | awk "{print \$2}")
-            RX=$(awk "NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$2}END{print s+0}" /proc/net/dev)
-            TX=$(awk "NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$10}END{print s+0}" /proc/net/dev)
-            echo "$TS,$UTIME,$STIME,$THR,$VS,$RSSPG,$VMRSS,$RX,$TX,$VCS,$NVCS" >> "$DIR/metrics.csv"
+    # SSH to the worker, resolve the host PID via the same fallback chain
+    # as perf, then poll /proc/<pid>/* into a CSV on /tmp.
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$node_name" "
+        CID='$container_id'
+        PID=''
+
+        # 1) Docker
+        if command -v docker >/dev/null 2>&1; then
+            PID=\$(sudo docker inspect \$CID --format '{{.State.Pid}}' 2>/dev/null)
+        fi
+        # 2) crictl with explicit endpoints
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]] && command -v crictl >/dev/null 2>&1; then
+            for ep in \\
+                unix:///run/containerd/containerd.sock \\
+                unix:///var/run/containerd/containerd.sock \\
+                unix:///run/crio/crio.sock \\
+                unix:///var/run/crio/crio.sock \\
+                unix:///run/dockershim.sock; do
+                PID=\$(sudo crictl --runtime-endpoint=\$ep \\
+                       inspect --output go-template --template '{{.info.pid}}' \\
+                       \$CID 2>/dev/null)
+                if [[ -n \"\$PID\" && \"\$PID\" != \"0\" ]]; then break; fi
+                PID=''
+            done
+        fi
+        # 3) ctr (containerd direct)
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]] && command -v ctr >/dev/null 2>&1; then
+            PID=\$(sudo ctr -n k8s.io tasks ls 2>/dev/null \\
+                   | awk -v cid=\$CID '\$1 == cid || index(cid,\$1) == 1 {print \$2; exit}')
+        fi
+        # 4) /proc/*/cgroup scan
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
+            PID=\$(sudo grep -l \"\$CID\" /proc/*/cgroup 2>/dev/null \\
+                   | head -1 | awk -F/ '{print \$3}')
+        fi
+
+        if [[ -z \"\$PID\" || \"\$PID\" == \"0\" ]]; then
+            echo 'ERROR: monitor could not resolve container PID' >&2
+            exit 1
+        fi
+
+        OUT='$remote_csv'
+        DUR=$duration
+        echo \"# host_pid=\$PID node=$node_name service=$service container=\$CID\" > \$OUT
+        echo 'ts_epoch_ns,utime,stime,threads,vsize_bytes,rss_pages,vmrss_kb,rx_bytes,tx_bytes,vol_ctxt,nonvol_ctxt' >> \$OUT
+
+        END=\$(( \$(date +%s) + \$DUR + 5 ))
+        while [ \"\$(date +%s)\" -lt \"\$END\" ]; do
+            # /proc/<pid>/stat may disappear if the process exits; tolerate that.
+            STAT=\$(sudo cat /proc/\$PID/stat 2>/dev/null) || break
+
+            # Strip up to and including '(comm)' so subsequent awk fields are
+            # 1=state, 2=ppid, ..., 12=utime, 13=stime, 18=num_threads,
+            # 21=vsize, 22=rss.  (See proc(5).)
+            RAW=\$(echo \"\$STAT\" | sed 's/.*) //')
+            UTIME=\$(echo  \"\$RAW\" | awk '{print \$12}')
+            STIME=\$(echo  \"\$RAW\" | awk '{print \$13}')
+            THR=\$(echo    \"\$RAW\" | awk '{print \$18}')
+            VS=\$(echo     \"\$RAW\" | awk '{print \$21}')
+            RSSPG=\$(echo  \"\$RAW\" | awk '{print \$22}')
+
+            STATUS=\$(sudo cat /proc/\$PID/status 2>/dev/null) || break
+            VMRSS=\$(echo \"\$STATUS\" | awk '/^VmRSS:/ {print \$2}')
+            VCS=\$(echo   \"\$STATUS\" | awk '/^voluntary_ctxt_switches:/ {print \$2}')
+            NVCS=\$(echo  \"\$STATUS\" | awk '/^nonvoluntary_ctxt_switches:/ {print \$2}')
+
+            # /proc/<pid>/net/dev sees the netns of <pid>, i.e. the pod's
+            # network namespace -- so this measures the container's traffic.
+            NET=\$(sudo cat /proc/\$PID/net/dev 2>/dev/null) || break
+            RX=\$(echo \"\$NET\" | awk 'NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$2}END{print s+0}')
+            TX=\$(echo \"\$NET\" | awk 'NR>2 && \$1!~/lo:/{gsub(/:/,\"\",\$1);s+=\$10}END{print s+0}')
+
+            TS=\$(date +%s%N)
+            echo \"\$TS,\$UTIME,\$STIME,\$THR,\$VS,\$RSSPG,\${VMRSS:-0},\$RX,\$TX,\${VCS:-0},\${NVCS:-0}\" >> \$OUT
             sleep 1
         done
-    ' _ "$run_num" "$duration" &
+    " > "$exp_dir/logs/host_monitor_${service}_run${run_num}.log" 2>&1 &
 
     local pid=$!
-    step1_log "$exp_dir" "  Monitor PID $pid (kubectl exec background)"
-    echo "$pid"
+    step1_log "$exp_dir" "  Host-monitor SSH PID $pid (background)"
+    # Stash the remote CSV path so retrieval can scp it back.
+    echo "${pid}|${node_name}|${remote_csv}"
 }
 
 step1_wait_background_pid() {
@@ -800,28 +886,37 @@ print(json.dumps(result))
 # Retrieve system metrics from a pod after a characterization run
 # ===========================================================================
 
-step1_retrieve_system_metrics() {
+# step1_retrieve_host_monitor: scp the per-run CSV off the worker.
+# Args: service run_num run_dir exp_dir node_name remote_csv
+step1_retrieve_host_monitor() {
     local service="$1" run_num="$2" run_dir="$3" exp_dir="$4"
+    local node_name="$5" remote_csv="$6"
 
-    local pod_name
-    pod_name=$(kubectl get pods -l io.kompose.service="$service" \
-                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [[ -z "$pod_name" ]]; then
-        step1_log "$exp_dir" "  WARNING: no pod found for $service"
+    if [[ -z "$node_name" || -z "$remote_csv" ]]; then
+        step1_log "$exp_dir" "  WARNING: missing node/remote-csv for $service monitor; skipping retrieve"
         return 1
     fi
 
     mkdir -p "$run_dir/system"
-    local remote_csv="/data/system_metrics_run${run_num}/metrics.csv"
+    local local_csv="$run_dir/system/${service}_metrics.csv"
 
-    if kubectl exec "$pod_name" -- test -f "$remote_csv" 2>/dev/null; then
-        kubectl exec "$pod_name" -- cat "$remote_csv" \
-            > "$run_dir/system/${service}_metrics.csv" 2>/dev/null
+    if scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            "${node_name}:${remote_csv}" "$local_csv" >/dev/null 2>&1; then
+        # Remove the worker-side copy so /tmp doesn't fill up over many runs.
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$node_name" \
+            "rm -f $remote_csv" >/dev/null 2>&1 || true
+
         local nlines
-        nlines=$(wc -l < "$run_dir/system/${service}_metrics.csv")
-        step1_log "$exp_dir" "  Retrieved system metrics for $service ($nlines samples)"
+        nlines=$(wc -l < "$local_csv" 2>/dev/null || echo 0)
+        step1_log "$exp_dir" "  Retrieved system metrics for $service ($nlines lines)"
     else
-        step1_log "$exp_dir" "  WARNING: system metrics not found for $service"
+        step1_log "$exp_dir" "  WARNING: scp failed for $service from $node_name:$remote_csv"
+        # Try to capture the host-monitor SSH log if it has anything useful.
+        local mlog="$exp_dir/logs/host_monitor_${service}_run${run_num}.log"
+        if [[ -s "$mlog" ]]; then
+            step1_log "$exp_dir" "  Host-monitor log tail: $(tail -2 "$mlog" | tr '\n' ' | ')"
+        fi
+        return 1
     fi
 }
 
@@ -864,16 +959,16 @@ step1_run_single_characterization() {
     # 0. Restart pods for clean process state
     step1_prepare_run "$exp_dir" "$run_num" "$observed_services"
 
-    # 1. Start pod monitors (CPU / memory / network via /proc)
-    local monitor_pids=()
+    # 1. Start host-side system monitors (CPU / memory / network via /proc on the node).
+    #    Each entry is "service|pid|node|remote_csv" so we can later wait
+    #    on the SSH PID and scp the right CSV back.
+    local monitor_entries=()
     for service in $observed_services; do
-        local pod
-        pod=$(kubectl get pods -l io.kompose.service="$service" \
-                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        if [[ -n "$pod" ]]; then
-            local mpid
-            mpid=$(step1_start_pod_monitor "$pod" "$run_num" "$CHARACTERIZE_DURATION" "$exp_dir")
-            monitor_pids+=("$mpid")
+        local mout
+        mout=$(step1_start_host_monitor "$service" "$run_num" \
+                  "$CHARACTERIZE_DURATION" "$exp_dir")
+        if [[ -n "$mout" ]]; then
+            monitor_entries+=("${service}|${mout}")
         fi
     done
 
@@ -917,17 +1012,21 @@ step1_run_single_characterization() {
 
     # 8. Wait for monitors and perf stat to finish
     step1_log "$exp_dir" "  Waiting for background collectors ..."
-    for mpid in "${monitor_pids[@]}"; do
-        step1_wait_background_pid "$mpid" "$exp_dir" "Monitor"
+    local entry svc_name mon_pid mon_node mon_csv
+    for entry in "${monitor_entries[@]}"; do
+        IFS='|' read -r svc_name mon_pid mon_node mon_csv <<< "$entry"
+        step1_wait_background_pid "$mon_pid" "$exp_dir" "Host-monitor[$svc_name]"
     done
     for ppid in "${perf_pids[@]}"; do
         step1_wait_background_pid "$ppid" "$exp_dir" "perf stat"
     done
 
-    # 9. Retrieve system metrics from pods
-    step1_log "$exp_dir" "  Retrieving data from pods ..."
-    for service in $observed_services; do
-        step1_retrieve_system_metrics "$service" "$run_num" "$run_dir" "$exp_dir"
+    # 9. Retrieve system metrics (scp from worker node)
+    step1_log "$exp_dir" "  Retrieving system metrics from worker nodes ..."
+    for entry in "${monitor_entries[@]}"; do
+        IFS='|' read -r svc_name mon_pid mon_node mon_csv <<< "$entry"
+        step1_retrieve_host_monitor "$svc_name" "$run_num" "$run_dir" \
+            "$exp_dir" "$mon_node" "$mon_csv"
     done
 
     # 10. Parse perf stat results
@@ -1085,10 +1184,18 @@ for run_num in range(1, total_runs + 1):
                 svc_info["perf"] = perf_data
 
         # --- System metrics (CPU / memory / network from /proc) ---
+        # CSV layout (written by step1_start_host_monitor on the worker):
+        #   line 1: "# host_pid=... node=... service=... container=..."
+        #   line 2: column header (ts_epoch_ns,utime,stime,...)
+        #   line 3+: data rows
         csv_file = run_dir / "system" / f"{svc}_metrics.csv"
         if csv_file.exists():
             rows = []
             with open(csv_file) as f:
+                # Skip leading comment lines so DictReader sees the real header.
+                first = f.readline()
+                if not first.startswith('#'):
+                    f.seek(0)
                 reader = csv.DictReader(f)
                 for row in reader:
                     rows.append(row)
@@ -1284,19 +1391,19 @@ with open(summary_dir / "report.txt", "w") as f:
         f.write(f"\n  [DRAM Bandwidth]\n")
         f.write(f"    Offcore reads/Kins :{fmt('offcore_data_rd_per_kins')}\n")
 
-        f.write(f"\n  [CPU — /proc/1/stat]\n")
+        f.write(f"\n  [CPU — host /proc/<pid>/stat, multi-thread total: 100% per core]\n")
         f.write(f"    Total CPU %%       :{fmt('cpu_pct', '%')}\n")
         f.write(f"    User  CPU %%       :{fmt('cpu_usr', '%')}\n")
         f.write(f"    Sys   CPU %%       :{fmt('cpu_sys', '%')}\n")
 
-        f.write(f"\n  [Scheduling — /proc/1/status, ctxt switches/sec]\n")
+        f.write(f"\n  [Scheduling — host /proc/<pid>/status, ctxt switches/sec]\n")
         f.write(f"    Voluntary    /sec  :{fmt('vol_ctxt_per_sec', '/s')}\n")
         f.write(f"    Non-voluntary/sec  :{fmt('nonvol_ctxt_per_sec', '/s')}\n")
 
-        f.write(f"\n  [Memory — /proc/1/status]\n")
+        f.write(f"\n  [Memory — host /proc/<pid>/status]\n")
         f.write(f"    VmRSS (KB)         :{fmt('vmrss_kb', 'KB')}\n")
 
-        f.write(f"\n  [Network — /proc/net/dev]\n")
+        f.write(f"\n  [Network — host /proc/<pid>/net/dev (pod netns)]\n")
         f.write(f"    RX throughput      :{fmt('net_rx_mbps', 'Mbps')}\n")
         f.write(f"    TX throughput      :{fmt('net_tx_mbps', 'Mbps')}\n")
 
@@ -1613,7 +1720,7 @@ step1_create_exp_dir() {
         "windowed_sampling": false,
         "perf_stat_external": true,
         "perf_events": "$PERF_EVENTS",
-        "system_metrics": "proc_stat+proc_status+proc_net_dev@1Hz",
+        "system_metrics": "host_side_proc_<pid>_stat+status+net_dev@1Hz_via_ssh",
         "latency": "ghz_hdr_histogram"
     },
     "timestamp": "$(date -Iseconds)"
