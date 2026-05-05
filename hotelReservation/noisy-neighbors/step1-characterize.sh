@@ -1489,8 +1489,24 @@ step1_validate_config() {
         exit 1
     fi
 
-    # Vanilla deployment — no interceptor, no windowed sampling
+    # Vanilla deployment — no interceptor, no windowed sampling.  Even when
+    # OBSERVED_SERVICE_IMAGE points at a -windowed image, we leave the
+    # windowed-sampling code path OFF: that image's binary checks the env
+    # var ENABLE_WINDOWED_SAMPLING at startup and only enables in-process
+    # perf sampling when it is "true".  We want the modified-binary
+    # behavior (e.g. cache-contention working set) running in standard
+    # mode so external perf stat reads clean counters.
     ENABLE_WINDOWED_SAMPLING="false"
+
+    # Optional: override the container image for the observed service AFTER
+    # the canonical YAML has been applied (and after taskset pinning has
+    # been patched in).  Format: registry/image:tag.  When set, step1_deploy
+    # does a `kubectl set image` swap, sets ENABLE_WINDOWED_SAMPLING=false
+    # in the pod env, and waits for the rollout.  Use case: characterize a
+    # custom binary (e.g. profile rebuilt with a larger working set to
+    # study cache contention) without editing the canonical kubernetes
+    # YAML in ../kubernetes/$service/.
+    OBSERVED_SERVICE_IMAGE="${OBSERVED_SERVICE_IMAGE:-}"
 
     # Defaults for data-collector.sh deploy function compatibility
     NOISY_NEIGHBOR_TYPE="${NOISY_NEIGHBOR_TYPE:-cpu}"
@@ -1690,6 +1706,7 @@ step1_create_exp_dir() {
     "experiment_type": "step1_characterization_vanilla",
     "target_node": "$TARGET_NODE",
     "observed_service": "$OBSERVED_SERVICE",
+    "observed_service_image_override": "${OBSERVED_SERVICE_IMAGE:-}",
     "config_file": "$(basename "$config_file")",
     "loadgen": {
         "tool": "ghz",
@@ -1730,10 +1747,72 @@ EOJSON
     echo "$exp_dir"
 }
 
+# ===========================================================================
+# Optional image override for the observed service.
+#
+# Swaps the container image after deploy_victim_services has applied the
+# canonical YAML and patched in the taskset command.  Also forces
+# ENABLE_WINDOWED_SAMPLING=false so a -windowed image runs its binary in
+# standard (non-sampled) mode -- step1 reads counters externally via perf
+# stat, so we do NOT want the in-process sampler running concurrently.
+#
+# Assumes the override image has the service binary at the same PATH
+# location as the canonical image (true for both `deathstarbench/...` and
+# `docclabgroup/<service>-windowed:...` since both are built from the same
+# golang:1.21 base via `go install ./cmd/...`).
+# ===========================================================================
+step1_apply_image_override() {
+    local exp_dir="$1"
+    local svc="$OBSERVED_SERVICE"
+    local image="$OBSERVED_SERVICE_IMAGE"
+    local container_name
+    container_name=$(get_container_name "$svc")
+
+    if [[ -z "$container_name" ]]; then
+        step1_log "$exp_dir" "ERROR: could not resolve container name for $svc"
+        return 1
+    fi
+
+    step1_log "$exp_dir" "Applying image override on $svc: $image (container=$container_name)"
+
+    if ! kubectl set image "deployment/$svc" "${container_name}=${image}" >/dev/null 2>&1; then
+        step1_log "$exp_dir" "ERROR: kubectl set image deployment/$svc $container_name=$image failed"
+        return 1
+    fi
+
+    # Make absolutely sure the binary's in-process windowed sampler stays
+    # off.  cmd/$svc/main.go branches on os.Getenv("ENABLE_WINDOWED_SAMPLING")
+    # at startup; a stale value left on the deployment from a previous run
+    # would otherwise enable the sampler.
+    kubectl set env "deployment/$svc" "ENABLE_WINDOWED_SAMPLING=false" >/dev/null 2>&1 || \
+        step1_log "$exp_dir" "  WARNING: failed to set ENABLE_WINDOWED_SAMPLING=false on $svc"
+
+    # Wait for the rollout to settle on the new image.
+    if ! kubectl rollout status "deployment/$svc" --timeout=180s >/dev/null 2>&1; then
+        step1_log "$exp_dir" "ERROR: rollout for $svc did not become ready within 180s after image swap"
+        return 1
+    fi
+
+    # Confirm the running pod actually uses the new image.
+    local current_image
+    current_image=$(kubectl get deployment "$svc" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    if [[ "$current_image" != "$image" ]]; then
+        step1_log "$exp_dir" "WARNING: deployment image is '$current_image', expected '$image'"
+    else
+        step1_log "$exp_dir" "  Image override confirmed: $svc is now running $current_image"
+    fi
+    return 0
+}
+
 step1_deploy() {
     local exp_dir="$1"
 
-    step1_log "$exp_dir" "Deploying observed service (vanilla image): $OBSERVED_SERVICE"
+    if [[ -n "$OBSERVED_SERVICE_IMAGE" ]]; then
+        step1_log "$exp_dir" "Deploying observed service (image override: $OBSERVED_SERVICE_IMAGE): $OBSERVED_SERVICE"
+    else
+        step1_log "$exp_dir" "Deploying observed service (vanilla image): $OBSERVED_SERVICE"
+    fi
 
     # Remove anti-affinity from all deployments to allow placement
     local all_deps
@@ -1749,8 +1828,20 @@ step1_deploy() {
 
     # Deploy the observed service on the target node using vanilla images.
     # ENABLE_WINDOWED_SAMPLING=false causes deploy_victim_services to use
-    # deploy_regular_service (standard image, no interceptor)
+    # deploy_regular_service (standard image, no interceptor).  This also
+    # patches in the taskset-based CPU pinning command via
+    # apply_cpu_pinning_to_deployment.
     deploy_victim_services "$OBSERVED_SERVICE" "$TARGET_NODE" "$exp_dir"
+
+    # If the user wants a custom image (e.g. modified profile for
+    # cache-contention experiments), swap it in now.  The taskset
+    # `command: ["sh","-c","exec taskset -c $cpu_set $service"]` patched
+    # in by apply_cpu_pinning_to_deployment is preserved across
+    # `kubectl set image`, so we keep the same pinning while running the
+    # modified binary.
+    if [[ -n "$OBSERVED_SERVICE_IMAGE" ]]; then
+        step1_apply_image_override "$exp_dir"
+    fi
 
     step1_log "$exp_dir" "Waiting 45s for services to stabilize ..."
     sleep 45
@@ -1828,6 +1919,20 @@ Required config variables:
   EXPERIMENT_NAME        Descriptive name
   TARGET_NODE            Kubernetes node to pin the observed service to
   OBSERVED_SERVICE       Single service name (e.g. 'search' or 'profile')
+
+  OBSERVED_SERVICE_IMAGE Optional. registry/image:tag of a custom container
+                         image to use for the observed service (e.g. a
+                         locally-modified profile rebuilt for cache-
+                         contention experiments).  When set, the canonical
+                         k8s YAML is applied first (so taskset CPU pinning
+                         is patched in normally), then the image is swapped
+                         via `kubectl set image`.  ENABLE_WINDOWED_SAMPLING
+                         is forced to false in the pod env so a -windowed
+                         image runs its binary in standard mode (no
+                         in-process perf sampler -- step1 reads counters
+                         externally).
+                         Example:
+                           OBSERVED_SERVICE_IMAGE='docclabgroup/profile-windowed:windowed-v3.1.2'
 
   LOADGEN_BIN            Path to the ghz binary (install via
                          ./loadgen/install-ghz.sh)
