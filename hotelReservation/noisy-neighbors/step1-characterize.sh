@@ -954,10 +954,31 @@ step1_run_single_characterization() {
     step1_log "$exp_dir" "------------------------------------------"
     step1_log "$exp_dir" " Characterization Run $run_num / $CHARACTERIZE_RUNS"
     step1_log "$exp_dir" " RPS=${char_rps}  Duration=${CHARACTERIZE_DURATION}s"
+    if [[ "$STRESSOR_TYPE" != "none" ]]; then
+        step1_log "$exp_dir" " Stressor: $STRESSOR_TYPE (workers=$STRESSOR_WORKERS)"
+    fi
     step1_log "$exp_dir" "------------------------------------------"
 
     # 0. Restart pods for clean process state
     step1_prepare_run "$exp_dir" "$run_num" "$observed_services"
+
+    # 0.5 Launch Stage 2 stressor (no-op when STRESSOR_TYPE=none).
+    #     Duration covers the full run plus a 30s buffer; we explicit-delete
+    #     the pod after monitors/perf finish, so the --timeout is just a
+    #     safety net.
+    local stressor_pod="" stressor_started_epoch=0
+    if [[ "$STRESSOR_TYPE" != "none" ]]; then
+        local stressor_dur=$((CHARACTERIZE_DURATION + 30))
+        if ! stressor_pod=$(step1_start_stressor "$exp_dir" "$run_num" "$stressor_dur"); then
+            step1_log "$exp_dir" "  ERROR: stressor launch failed -- aborting run $run_num"
+            return 1
+        fi
+        STEP1_ACTIVE_STRESSOR_POD="$stressor_pod"
+        stressor_started_epoch=$(date +%s)
+        # Let stress-ng ramp up before we start measurement.
+        step1_log "$exp_dir" "  Letting stressor warm up 5s before starting collectors ..."
+        sleep 5
+    fi
 
     # 1. Start host-side system monitors (CPU / memory / network via /proc on the node).
     #    Each entry is "service|pid|node|remote_csv" so we can later wait
@@ -1021,6 +1042,16 @@ step1_run_single_characterization() {
         step1_wait_background_pid "$ppid" "$exp_dir" "perf stat"
     done
 
+    # 8.5 Stop the stressor (no-op when STRESSOR_TYPE=none).  Done after the
+    #     collectors have finished but before we scp the system-metrics CSV
+    #     so the cooldown between runs is clean.
+    local stressor_stopped_epoch=0
+    if [[ -n "$stressor_pod" ]]; then
+        step1_stop_stressor "$exp_dir" "$stressor_pod"
+        stressor_stopped_epoch=$(date +%s)
+        STEP1_ACTIVE_STRESSOR_POD=""
+    fi
+
     # 9. Retrieve system metrics (scp from worker node)
     step1_log "$exp_dir" "  Retrieving system metrics from worker nodes ..."
     for entry in "${monitor_entries[@]}"; do
@@ -1052,7 +1083,13 @@ step1_run_single_characterization() {
     "duration_planned_s": $CHARACTERIZE_DURATION,
     "duration_actual_s": $actual_dur,
     "workload_start_epoch": $wl_start,
-    "workload_end_epoch": $wl_end
+    "workload_end_epoch": $wl_end,
+    "stressor": {
+        "type": "$STRESSOR_TYPE",
+        "pod_name": "${stressor_pod}",
+        "started_epoch": ${stressor_started_epoch},
+        "stopped_epoch": ${stressor_stopped_epoch}
+    }
 }
 EOJSON
 
@@ -1508,6 +1545,45 @@ step1_validate_config() {
     # YAML in ../kubernetes/$service/.
     OBSERVED_SERVICE_IMAGE="${OBSERVED_SERVICE_IMAGE:-}"
 
+    # ---------------------------------------------------------------------
+    # Stage 2 stressor (optional, max-intensity, per-run lifecycle)
+    #
+    # When STRESSOR_TYPE != "none", a stress-ng pod is launched on
+    # TARGET_NODE for the duration of each Stage 2 characterization run
+    # (Stage 1 stays clean -- we want the knee discovered without
+    # contention so conditions are compared at the same RPS).
+    #
+    #   none  : no stressor (default)
+    #   cpu   : stress-ng-helpers.sh `cpu`        (--cpu N)
+    #   cache : stress-ng-helpers.sh `cache-llc`  (--stream N --stream-l3-size <SIZE>)
+    #
+    # The cache->cache-llc mapping is deliberate: on Ice Lake-SP non-inclusive
+    # caches the bare `--cache` stressor mostly hits per-core L1/L2; the
+    # stream stressor with an L3-sized working set is what actually pollutes
+    # the shared LLC.  See stress-ng-helpers.sh:148-152 for details.
+    #
+    # STRESSOR_WORKERS=0 is the documented "use all online CPUs" semantics
+    # for both --cpu and --stream -- this is the "max intensity" knob.
+    # CACHE_LLC_L3_SIZE is read by parse_stress_intensity (default 8M ->
+    # 32MB working set per worker, which fits typical Ice Lake L3).
+    # ---------------------------------------------------------------------
+    STRESSOR_TYPE="${STRESSOR_TYPE:-none}"
+    STRESSOR_WORKERS="${STRESSOR_WORKERS:-0}"
+    CACHE_LLC_L3_SIZE="${CACHE_LLC_L3_SIZE:-8M}"
+
+    case "$STRESSOR_TYPE" in
+        none|cpu|cache) ;;
+        *)
+            echo "ERROR: STRESSOR_TYPE must be one of {none, cpu, cache}, got: '$STRESSOR_TYPE'" >&2
+            exit 1
+            ;;
+    esac
+
+    if ! [[ "$STRESSOR_WORKERS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: STRESSOR_WORKERS must be a non-negative integer, got: '$STRESSOR_WORKERS'" >&2
+        exit 1
+    fi
+
     # Defaults for data-collector.sh deploy function compatibility
     NOISY_NEIGHBOR_TYPE="${NOISY_NEIGHBOR_TYPE:-cpu}"
     EXPERIMENT_DURATION="${EXPERIMENT_DURATION:-$CHARACTERIZE_DURATION}"
@@ -1732,6 +1808,13 @@ step1_create_exp_dir() {
         "runs": $CHARACTERIZE_RUNS,
         "knee_fraction": $CHARACTERIZE_KNEE_FRACTION
     },
+    "stressor": {
+        "type": "$STRESSOR_TYPE",
+        "workers": $STRESSOR_WORKERS,
+        "helper_mode": "$(step1_stressor_helper_mode)",
+        "cache_llc_l3_size": "$CACHE_LLC_L3_SIZE",
+        "stage": "stage2_only"
+    },
     "instrumentation": {
         "interceptor": false,
         "windowed_sampling": false,
@@ -1803,6 +1886,124 @@ step1_apply_image_override() {
         step1_log "$exp_dir" "  Image override confirmed: $svc is now running $current_image"
     fi
     return 0
+}
+
+# ===========================================================================
+# Stage-2 stressor lifecycle (per-run, max-intensity, unpinned)
+#
+# Wraps stress-ng-helpers.sh ($STRESS_SCRIPT) for the simple "one stressor
+# pod, on the whole run, max intensity" case.  Args translation reuses
+# data-collector.sh's parse_stress_intensity (handles --cpu N for cpu type,
+# and --stream N --stream-l3-size <SIZE> for cache type).
+#
+# Pod naming follows the helper script's hardcoded names (cpu-stress,
+# cache-llc-stress).  We pre-clean these names before each launch so a
+# Completed pod from the previous run doesn't block a fresh launch.
+#
+# STEP1_ACTIVE_STRESSOR_POD is a script-scope global -- the EXIT/INT/TERM
+# trap (step1_cleanup) reads it to force-delete a stressor pod if the
+# script is killed mid-run.
+# ===========================================================================
+
+# Map STRESSOR_TYPE -> stress-ng-helpers.sh subcommand.
+# Echoes empty for STRESSOR_TYPE=none (caller short-circuits).
+step1_stressor_helper_mode() {
+    case "$STRESSOR_TYPE" in
+        cpu)   echo "cpu" ;;
+        cache) echo "cache-llc" ;;
+        *)     echo "" ;;
+    esac
+}
+
+# Pod name produced by stress-ng-helpers.sh for the given STRESSOR_TYPE.
+# These are hardcoded in the helper's `kubectl run <name> ...` invocations.
+step1_stressor_pod_name() {
+    case "$STRESSOR_TYPE" in
+        cpu)   echo "cpu-stress" ;;
+        cache) echo "cache-llc-stress" ;;
+        *)     echo "" ;;
+    esac
+}
+
+# step1_start_stressor: launch a stress-ng pod for the duration of one
+# characterization run.  No-op when STRESSOR_TYPE=none.
+#
+# Args: exp_dir run_num duration_seconds
+# Echoes: pod name (or empty when STRESSOR_TYPE=none / on launch failure)
+# Return: 0 on success or no-op, non-zero if stressor was requested but
+#         failed to come Ready (caller should abort the run -- silently
+#         producing "contended" data without the stressor would corrupt
+#         the experiment).
+step1_start_stressor() {
+    local exp_dir="$1" run_num="$2" duration="$3"
+
+    if [[ "$STRESSOR_TYPE" == "none" ]]; then
+        echo ""
+        return 0
+    fi
+
+    local mode pod_name
+    mode=$(step1_stressor_helper_mode)
+    pod_name=$(step1_stressor_pod_name)
+
+    if [[ -z "$mode" || -z "$pod_name" ]]; then
+        step1_log "$exp_dir" "  ERROR: could not map STRESSOR_TYPE='$STRESSOR_TYPE' to a helper mode"
+        return 1
+    fi
+
+    # Args via parse_stress_intensity (data-collector.sh).  For cpu it
+    # returns just <workers>; for cache (-> cache-llc) it returns
+    # "<workers> <l3_size>" using CACHE_LLC_L3_SIZE.
+    local stress_args
+    stress_args=$(parse_stress_intensity "$mode" "$STRESSOR_WORKERS")
+
+    local run_stress_dir="$exp_dir/runs/run_${run_num}/stress"
+    mkdir -p "$run_stress_dir"
+    local launch_log="$run_stress_dir/launch.log"
+
+    step1_log "$exp_dir" "  Stressor: type=$STRESSOR_TYPE mode=$mode args=[$stress_args] duration=${duration}s pod=$pod_name node=$TARGET_NODE"
+
+    # Pre-clean any stale pod with the same name (Completed from a prior
+    # run, or Running if a previous step1 invocation was killed).
+    kubectl delete pod "$pod_name" --grace-period=0 --force --ignore-not-found \
+        >/dev/null 2>&1 || true
+
+    # Launch via the helper script.  $stress_args is intentionally unquoted
+    # so the helper sees positional args (e.g. "8 8M" -> "8" "8M" for cache-llc).
+    if ! "$STRESS_SCRIPT" "$mode" $stress_args "${duration}s" --node "$TARGET_NODE" \
+            > "$launch_log" 2>&1; then
+        step1_log "$exp_dir" "  ERROR: stress-ng helper script failed; see $launch_log"
+        return 1
+    fi
+
+    # Wait for the pod to actually start running before measurement begins.
+    # 45s covers image pull on a fresh node.  --for=condition=Ready is
+    # safer than a timed sleep (handles slow image pulls deterministically).
+    if ! kubectl wait --for=condition=Ready "pod/$pod_name" --timeout=45s \
+            >>"$launch_log" 2>&1; then
+        step1_log "$exp_dir" "  ERROR: stressor pod $pod_name did not become Ready within 45s"
+        step1_log "$exp_dir" "         tail of $launch_log:"
+        tail -10 "$launch_log" 2>/dev/null | sed 's/^/           /' >&2 || true
+        # Best-effort cleanup of the pod that failed to come up.
+        kubectl delete pod "$pod_name" --grace-period=0 --force --ignore-not-found \
+            >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    step1_log "$exp_dir" "  Stressor pod $pod_name is Ready"
+    echo "$pod_name"
+    return 0
+}
+
+# step1_stop_stressor: force-delete the stressor pod.  No-op when pod_name
+# is empty (STRESSOR_TYPE=none short-circuit).
+step1_stop_stressor() {
+    local exp_dir="$1" pod_name="$2"
+    [[ -z "$pod_name" ]] && return 0
+
+    step1_log "$exp_dir" "  Stopping stressor pod $pod_name"
+    kubectl delete pod "$pod_name" --grace-period=0 --force --ignore-not-found \
+        >/dev/null 2>&1 || true
 }
 
 step1_deploy() {
@@ -1884,6 +2085,15 @@ step1_deploy() {
 step1_cleanup() {
     if [[ -n "${STEP1_EXPOSED_SERVICE:-}" ]]; then
         step1_revert_nodeport "$STEP1_EXPOSED_SERVICE"
+    fi
+    # Force-delete a stressor pod that's still running because the script
+    # was killed mid-run.  The deployment-time cleanup_existing_stress_pods
+    # call also catches strays on the next run, but doing it here too means
+    # Ctrl-C never leaves a stress-ng pod hammering the node.
+    if [[ -n "${STEP1_ACTIVE_STRESSOR_POD:-}" ]]; then
+        kubectl delete pod "$STEP1_ACTIVE_STRESSOR_POD" \
+            --grace-period=0 --force --ignore-not-found \
+            >/dev/null 2>&1 || true
     fi
 }
 
@@ -1983,6 +2193,28 @@ Optional:
   CHARACTERIZE_RUNS      Number of runs          (default: 5)
   CHARACTERIZE_KNEE_FRACTION  Fraction of knee   (default: 0.9)
 
+  Stressor (Stage 2 only -- Stage 1 always runs clean so the knee is
+  found vanilla; conditions are then compared at the SAME char_rps via
+  the skip-Stage-1 CLI invocation):
+
+  STRESSOR_TYPE          none | cpu | cache      (default: none)
+                           cpu   -> stress-ng --cpu N
+                           cache -> stress-ng --stream N --stream-l3-size SIZE
+                                    (LLC bandwidth pressure, Ice Lake-friendly)
+  STRESSOR_WORKERS       0 = use all online CPUs  (default: 0, max intensity)
+  CACHE_LLC_L3_SIZE      Per-worker working-set knob, only used when
+                         STRESSOR_TYPE=cache.  Default 8M (-> 32MB working
+                         set per worker, fits typical Ice Lake L3).
+
+  Typical comparison flow:
+    1. Run vanilla to find knee:
+         ./step1-characterize.sh configs/step1-profile.conf
+       (note the char_rps, e.g. 112)
+    2. Run with cpu contention at the SAME RPS (skip Stage 1):
+         STRESSOR_TYPE=cpu  ./step1-characterize.sh configs/step1-profile.conf 112
+    3. Run with cache contention at the SAME RPS:
+         STRESSOR_TYPE=cache ./step1-characterize.sh configs/step1-profile.conf 112
+
   PERF_EVENTS            perf stat events (sensible default)
   JAEGER_SAMPLE_RATIO    0 to disable tracing overhead (default: 0)
 
@@ -2019,6 +2251,10 @@ USAGE
     # Create experiment directory (runs in subshell to capture path)
     local exp_dir
     exp_dir=$(step1_create_exp_dir)
+
+    # Wipe any leftover stressor pods from a previously-killed run before
+    # we deploy / measure.  Cheap; reuses the helper from data-collector.sh.
+    cleanup_existing_stress_pods "$exp_dir"
 
     step1_deploy "$exp_dir"
 
