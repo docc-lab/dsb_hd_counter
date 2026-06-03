@@ -1121,107 +1121,94 @@ check_and_untolerate_pods() {
         done <<< "$deployments"
     fi
     
-    if [[ ${#deployments_to_untolerate[@]} -gt 0 ]]; then
-        log "$exp_dir" "Untolerating ${#deployments_to_untolerate[@]} deployment(s) to clear target node..."
-        
-        for deployment in "${deployments_to_untolerate[@]}"; do
-            log "$exp_dir" "  Untolerating deployment: $deployment"
-            "$TAINT_SCRIPT" "$target_node" "$deployment" --untolerate 2>/dev/null || log "$exp_dir" "    Warning: Failed to untolerate $deployment (may not have tolerations)"
-            
-            # Add node anti-affinity to prevent scheduling back on target node
-            log "$exp_dir" "  Adding anti-affinity to keep $deployment away from $target_node"
-            kubectl patch deployment "$deployment" -n default --type='merge' -p "{
+    if [[ ${#deployments_to_untolerate[@]} -eq 0 ]]; then
+        log "$exp_dir" "No user deployments found on target node $target_node"
+        return 0
+    fi
+
+    log "$exp_dir" "Untolerating ${#deployments_to_untolerate[@]} deployment(s) to clear target node (single rollout per deployment)..."
+
+    # Remove the node taint once. This is a node-level op and does not by
+    # itself evict any pods; what evicts them is the deployment-spec rollout
+    # below.
+    log "$exp_dir" "  Removing taint 'dedicated' from $target_node"
+    kubectl taint nodes "$target_node" dedicated- 2>/dev/null \
+        || log "$exp_dir" "    Note: taint may not exist or already removed"
+
+    # For each deployment with pods on $target_node, apply ONE merge patch
+    # that combines untolerate + nodeSelector clear + anti-affinity NotIn
+    # $target_node. A single patch creates a single new ReplicaSet, which
+    # in turn does a single graceful rolling update. Three rollouts (the
+    # taint script's rollout, the anti-affinity patch's rollout, and the
+    # force-restart) are eliminated.
+    for deployment in "${deployments_to_untolerate[@]}"; do
+        log "$exp_dir" "  Patching $deployment (untolerate + nodeSelector clear + anti-affinity)"
+        kubectl patch deployment "$deployment" -n default --type='merge' -p "{
+          \"spec\": {
+            \"template\": {
               \"spec\": {
-                \"template\": {
-                  \"spec\": {
-                    \"affinity\": {
-                      \"nodeAffinity\": {
-                        \"requiredDuringSchedulingIgnoredDuringExecution\": {
-                          \"nodeSelectorTerms\": [{
-                            \"matchExpressions\": [{
-                              \"key\": \"kubernetes.io/hostname\",
-                              \"operator\": \"NotIn\",
-                              \"values\": [\"$target_node\"]
-                            }]
-                          }]
-                        }
-                      }
+                \"tolerations\": null,
+                \"nodeSelector\": null,
+                \"affinity\": {
+                  \"nodeAffinity\": {
+                    \"requiredDuringSchedulingIgnoredDuringExecution\": {
+                      \"nodeSelectorTerms\": [{
+                        \"matchExpressions\": [{
+                          \"key\": \"kubernetes.io/hostname\",
+                          \"operator\": \"NotIn\",
+                          \"values\": [\"$target_node\"]
+                        }]
+                      }]
                     }
                   }
                 }
               }
-            }" 2>/dev/null || log "$exp_dir" "    Warning: Failed to add anti-affinity to $deployment"
-        done
-        
-        # Wait for pods to be rescheduled
-        log "$exp_dir" "Waiting for pods to be rescheduled away from $target_node..."
-        sleep 30
-        
-        # Check if any pods are still on the target node and force restart if needed
+            }
+          }
+        }" 2>/dev/null || log "$exp_dir" "    Warning: Failed to patch $deployment"
+    done
+
+    # Wait once for the rolling update on each deployment. 180s timeout is
+    # generous for a single-ReplicaSet rollout; previously we had to retry
+    # because three concurrent ReplicaSets per deployment could not finish
+    # in 60s.
+    log "$exp_dir" "Waiting for rollouts to complete (timeout 180s per deployment)..."
+    for deployment in "${deployments_to_untolerate[@]}"; do
+        kubectl rollout status deployment "$deployment" -n default --timeout=180s 2>/dev/null \
+            || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
+    done
+
+    # Save list of untolerated deployments for cleanup
+    echo "${deployments_to_untolerate[@]}" > "$exp_dir/metadata/untolerated_deployments.txt"
+
+    # Sanity-check: is the target node clear? With the batched patches the
+    # rollout above should have moved everything; if not, do exactly one
+    # forced restart pass per straggler. No polling loop -- if a single
+    # forced restart can't drain it, the cluster has a real problem (e.g.
+    # stuck finalizers, kubelet wedged) that the script can't paper over.
+    local stragglers
+    stragglers=$(kubectl get pods -n default -o wide --no-headers 2>/dev/null \
+        | grep -E "\s+$target_node\s+" | grep -v "Terminating" | awk '{print $1}' | tr '\n' ' ')
+    if [[ -n "$stragglers" ]]; then
+        log "$exp_dir" "WARNING: $target_node still has user pods after rollout: $stragglers"
+        log "$exp_dir" "  Force-restarting affected deployments once..."
         for deployment in "${deployments_to_untolerate[@]}"; do
-            # Use reliable method to check if deployment pods are still on target node
-            local remaining_pods=$(kubectl get pods -n default -l io.kompose.service="$deployment" -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | wc -l)
-            if [[ "$remaining_pods" -eq 0 ]]; then
-                # Fallback to app label
-                remaining_pods=$(kubectl get pods -n default -l app="$deployment" -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | wc -l)
+            local has_remaining
+            has_remaining=$(kubectl get pods -n default -l io.kompose.service="$deployment" \
+                --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
+            if [[ "$has_remaining" -eq 0 ]]; then
+                has_remaining=$(kubectl get pods -n default -l app="$deployment" \
+                    --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
             fi
-            if [[ "$remaining_pods" -gt 0 ]]; then
-                log "$exp_dir" "  $deployment still has $remaining_pods pod(s) on $target_node, forcing restart..."
-                kubectl rollout restart deployment "$deployment" -n default 2>/dev/null || log "$exp_dir" "    Warning: Failed to restart $deployment"
+            if [[ "$has_remaining" -gt 0 ]]; then
+                log "$exp_dir" "    Force-restarting $deployment (still on $target_node)"
+                kubectl rollout restart deployment "$deployment" -n default 2>/dev/null
+                kubectl rollout status deployment "$deployment" -n default --timeout=120s 2>/dev/null \
+                    || log "$exp_dir" "      Warning: Force-restart timeout for $deployment"
             fi
         done
-        
-        # Final wait for rollouts to complete
-        log "$exp_dir" "Waiting for rollouts to complete..."
-        for deployment in "${deployments_to_untolerate[@]}"; do
-            kubectl rollout status deployment "$deployment" -n default --timeout=60s 2>/dev/null || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
-        done
-        
-        # Save list of untolerated deployments for cleanup
-        echo "${deployments_to_untolerate[@]}" > "$exp_dir/metadata/untolerated_deployments.txt"
-        
-        # Verify target node is clear and wait if needed
-        local max_attempts=6
-        local attempt=1
-        while [[ $attempt -le $max_attempts ]]; do
-            # Use a more reliable method: get pods with wide output and grep for the target node
-            local final_user_pods=$(kubectl get pods -n default -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | wc -l)
-            log "$exp_dir" "Attempt $attempt/$max_attempts: Target node $target_node has $final_user_pods running user pod(s) in default namespace"
-            
-            # Also show which pods are still on the target node for debugging
-            local pods_on_target=$(kubectl get pods -n default -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | awk '{print $1}' | tr '\n' ' ')
-            if [[ -n "$pods_on_target" ]]; then
-                log "$exp_dir" "  Pods still on $target_node: $pods_on_target"
-            fi
-            
-            if [[ $final_user_pods -eq 0 ]]; then
-                log "$exp_dir" " Target node $target_node is now clear of user pods"
-                break
-            fi
-            
-            if [[ $attempt -lt $max_attempts ]]; then
-                log "$exp_dir" "Waiting 15s for remaining pods to reschedule..."
-                sleep 15
-            else
-                log "$exp_dir" "WARNING: Target node still has $final_user_pods user pods after $max_attempts attempts"
-                # Force one more round of restarts for any remaining deployments
-                for deployment in "${deployments_to_untolerate[@]}"; do
-                    local remaining=$(kubectl get pods -n default -l io.kompose.service="$deployment" -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | wc -l)
-                    if [[ $remaining -eq 0 ]]; then
-                        # Fallback to app label
-                        remaining=$(kubectl get pods -n default -l app="$deployment" -o wide --no-headers 2>/dev/null | grep -E "\s+$target_node\s+" | grep -v "Terminating" | wc -l)
-                    fi
-                    if [[ $remaining -gt 0 ]]; then
-                        log "$exp_dir" "  Force restarting $deployment (still has $remaining pod(s) on $target_node)"
-                        kubectl rollout restart deployment "$deployment" -n default 2>/dev/null
-                    fi
-                done
-            fi
-            ((attempt++))
-        done
-        
     else
-        log "$exp_dir" "No user deployments found on target node $target_node"
+        log "$exp_dir" " Target node $target_node is now clear of user pods"
     fi
 }
 
@@ -2976,7 +2963,7 @@ run_experiment() {
     
     # Monitor initial service registration
     log "$exp_dir" "Monitoring initial service registration in Consul..."
-    monitor_consul_service_registration "$exp_dir" 90 10
+    monitor_consul_service_registration "$exp_dir" 30 10
     
     # Configure Jaeger tracing for all services after deployment
     configure_jaeger_tracing "$exp_dir"
