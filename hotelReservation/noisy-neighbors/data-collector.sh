@@ -3095,6 +3095,19 @@ WINDOW_INTERVAL_MS=100
 PERF_EVENTS='cycles,ref-cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
 
+# Frequency utilization (per-window MSR + perf-cycles/ref-cycles)
+# TSC_FREQ_MHZ is auto-detected from /proc/cpuinfo on the pod; override
+# only if your CPU misreports it (e.g. virtualized guests with TSC scaling).
+# C0_ACTIVE_THRESHOLD: fraction of TSC a core must spend in C0 to count as
+# active for the turbo-bin lookup. Cluster idle noise is ~3-5%, so 0.05 is
+# the safe default; raise on noisier hosts to avoid over-counting.
+# MSR_TURBO_REFRESH_EVERY_S: how often to re-read MSR 0x1AD to track
+# thermal-throttle drift. Static after boot in normal conditions, so 10s
+# is plenty.
+C0_ACTIVE_THRESHOLD=0.05
+MSR_TURBO_REFRESH_EVERY_S=10
+# TSC_FREQ_MHZ=2400  # uncomment + set to override the /proc/cpuinfo fallback
+
 # CPU pinning (taskset) for no-instrumentation case only
 # (instrumented case always uses CPU pinning via windowed image ENTRYPOINT)
 ENABLE_CPU_PINNING=true
