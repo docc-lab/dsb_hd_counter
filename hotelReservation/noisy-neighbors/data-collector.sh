@@ -1194,13 +1194,13 @@ check_and_untolerate_pods() {
         }" 2>/dev/null || log "$exp_dir" "    Warning: Failed to patch $deployment"
     done
 
-    # Wait once for the rolling update on each deployment. 180s timeout is
-    # generous for a single-ReplicaSet rollout; previously we had to retry
-    # because three concurrent ReplicaSets per deployment could not finish
-    # in 60s.
-    log "$exp_dir" "Waiting for rollouts to complete (timeout 180s per deployment)..."
+    # Wait once for the rolling update on each deployment. With Fix A's
+    # batched patches, only one ReplicaSet is in flight per deployment, so
+    # 20s is plenty for a healthy cluster. If the timeout fires, the
+    # straggler-recovery block below force-restarts and waits longer.
+    log "$exp_dir" "Waiting for rollouts to complete (timeout 20s per deployment)..."
     for deployment in "${deployments_to_untolerate[@]}"; do
-        kubectl rollout status deployment "$deployment" -n default --timeout=180s 2>/dev/null \
+        kubectl rollout status deployment "$deployment" -n default --timeout=20s 2>/dev/null \
             || log "$exp_dir" "    Warning: Timeout waiting for $deployment rollout"
     done
 
