@@ -926,8 +926,8 @@ update_iteration_id() {
         fi
     done
     
-    log "$exp_dir" "Iteration ID updated, waiting 20s for services to stabilize and initialize sampling"
-    sleep 20
+    log "$exp_dir" "Iteration ID updated, waiting 15s for services to stabilize and initialize sampling"
+    sleep 15
 }
 
 # Validate configuration
@@ -1525,7 +1525,7 @@ configure_jaeger_tracing() {
     fi
     
     log "$exp_dir" "Waiting for services to stabilize after Jaeger configuration..."
-    sleep 45  # Increased from 30s to 45s
+    sleep 15  # rollout status already waited; this is a small grace period before validating Consul
     
     # Enhanced service registration validation and monitoring
     log "$exp_dir" "Validating service registration in Consul..."
@@ -2959,16 +2959,16 @@ run_experiment() {
     
     # Wait for services to stabilize after deployment
     log "$exp_dir" "Waiting for services to stabilize after deployment..."
-    sleep 45  # Increased from 30s to 45s
+    sleep 15  # deploy_victim_services already waited for rollout; this is a brief grace period before the Consul monitor
     
-    # Monitor initial service registration. Fast path: 30s window. If services
+    # Monitor initial service registration. Fast path: 20s window. If services
     # haven't registered (typical cause: cleanup phase restarted Consul after
     # the app pods were already up, so app-side registrations were lost),
     # immediately invoke manual registration rather than waiting for
     # validate_system_readiness to discover the same problem and recover.
     log "$exp_dir" "Monitoring initial service registration in Consul..."
-    if ! monitor_consul_service_registration "$exp_dir" 30 10; then
-        log "$exp_dir" "Initial Consul check failed after 30s; attempting manual registration now..."
+    if ! monitor_consul_service_registration "$exp_dir" 20 10; then
+        log "$exp_dir" "Initial Consul check failed after 20s; attempting manual registration now..."
         if manual_register_all_services "$exp_dir"; then
             log "$exp_dir" " Manual registration recovered Consul state"
         else
