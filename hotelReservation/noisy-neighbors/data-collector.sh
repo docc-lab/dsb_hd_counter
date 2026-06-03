@@ -2338,8 +2338,20 @@ execute_burst_schedule() {
     done
     
     log "$exp_dir" "All bursts scheduled (${#bursts[@]} total)"
-    
-    # Return PIDs as space-separated string
+
+    # Wait for all bursts to drain before returning. The caller backgrounds
+    # this whole function and waits on the scheduler PID; doing the per-burst
+    # wait here means the scheduler PID's exit cleanly indicates that every
+    # stress burst has finished, even though the bursts are grandchildren of
+    # the main shell (which can't wait on them directly).
+    for pid in "${burst_pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Return PIDs as space-separated string (kept for any caller still using
+    # the synchronous interface, though run_iteration now backgrounds us).
     echo "${burst_pids[@]}"
 }
 
@@ -2411,9 +2423,13 @@ run_iteration() {
             "${WRK2_CONNECTIONS:-2}")
     fi
     
-    # Start burst schedule execution
-    log "$exp_dir" "Starting burst schedule execution"
-    local burst_pids=$(execute_burst_schedule "$exp_dir" "$iteration" "$TARGET_NODE" "$NOISY_NEIGHBOR_TYPE" "$burst_schedule")
+    # Start burst schedule execution in the background so the main loop's
+    # timeline is the iteration timeline, not iteration + cumulative
+    # inter-burst sleep time. The scheduler waits for all its bursts before
+    # exiting, so wait $burst_scheduler_pid below drains everything.
+    log "$exp_dir" "Starting burst schedule execution (background)"
+    execute_burst_schedule "$exp_dir" "$iteration" "$TARGET_NODE" "$NOISY_NEIGHBOR_TYPE" "$burst_schedule" >/dev/null &
+    local burst_scheduler_pid=$!
     
     # NOTE: Windowed sampling runs automatically inside service containers (if enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
@@ -2472,10 +2488,12 @@ run_iteration() {
         wait "$wrk2_pid" 2>/dev/null || true
     fi
     
-    # Wait for all burst stress processes to complete
-    if [[ -n "$burst_pids" ]]; then
-        log "$exp_dir" "Waiting for all stress bursts to complete..."
-        wait_for_processes $burst_pids
+    # Wait for the burst scheduler subshell. Inside execute_burst_schedule
+    # we already waited for every individual stress burst, so this exit
+    # cleanly indicates all stress activity is done.
+    if [[ -n "$burst_scheduler_pid" ]]; then
+        log "$exp_dir" "Waiting for burst scheduler + stress bursts to drain..."
+        wait "$burst_scheduler_pid" 2>/dev/null || true
     fi
     
     # Cleanup stress pods
