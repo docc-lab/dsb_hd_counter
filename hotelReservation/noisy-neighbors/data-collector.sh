@@ -2961,10 +2961,21 @@ run_experiment() {
     log "$exp_dir" "Waiting for services to stabilize after deployment..."
     sleep 45  # Increased from 30s to 45s
     
-    # Monitor initial service registration
+    # Monitor initial service registration. Fast path: 30s window. If services
+    # haven't registered (typical cause: cleanup phase restarted Consul after
+    # the app pods were already up, so app-side registrations were lost),
+    # immediately invoke manual registration rather than waiting for
+    # validate_system_readiness to discover the same problem and recover.
     log "$exp_dir" "Monitoring initial service registration in Consul..."
-    monitor_consul_service_registration "$exp_dir" 30 10
-    
+    if ! monitor_consul_service_registration "$exp_dir" 30 10; then
+        log "$exp_dir" "Initial Consul check failed after 30s; attempting manual registration now..."
+        if manual_register_all_services "$exp_dir"; then
+            log "$exp_dir" " Manual registration recovered Consul state"
+        else
+            log "$exp_dir" "WARNING: manual_register_all_services partial/failed; validate_system_readiness will report final state"
+        fi
+    fi
+
     # Configure Jaeger tracing for all services after deployment
     configure_jaeger_tracing "$exp_dir"
     
