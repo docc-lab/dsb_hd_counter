@@ -610,15 +610,20 @@ apply_freq_util_env() {
     return $rc
 }
 
-# apply_msr_pod_capabilities: idempotently patch a deployment to add
-# CAP_SYS_RAWIO and a hostPath mount for /dev/cpu so that the pod can pread()
-# MSRs from inside the container. Safe to call repeatedly: re-applying the
-# patches on a deployment that already has them is a no-op for kubectl.
+# apply_msr_pod_capabilities: idempotently patch a deployment so the pod can
+# pread() MSRs from inside the container. Three things must hold:
+#   1) container has CAP_SYS_RAWIO  (kernel capability check)
+#   2) /dev/cpu hostPath mount      (so /dev/cpu/N/msr is reachable)
+#   3) AppArmor profile is Unconfined for the container (otherwise the
+#      runtime-default 'docker-default' profile silently blocks the open
+#      with EPERM, even when caps + uid + file mode all permit it).
+# Safe to call repeatedly: re-applying the patches on a deployment that
+# already has them is a no-op for kubectl.
 apply_msr_pod_capabilities() {
     local service="$1"
     local exp_dir="$2"
 
-    log "$exp_dir" "  Adding CAP_SYS_RAWIO + /dev/cpu hostPath to $service deployment"
+    log "$exp_dir" "  Adding CAP_SYS_RAWIO + /dev/cpu hostPath + AppArmor unconfined to $service deployment"
 
     # 1) Add SYS_RAWIO capability if not already present.
     local existing_caps
@@ -661,6 +666,27 @@ apply_msr_pod_capabilities() {
                 return 1
             }
         fi
+    fi
+
+    # 3) Set AppArmor profile to Unconfined for this container. The default
+    #    profile 'docker-default' (applied by containerd / Docker on Ubuntu)
+    #    blocks open() of /dev/cpu/N/msr with EPERM even when CAP_SYS_RAWIO
+    #    is present and the file mode allows it. Annotation key includes the
+    #    container name. Pre-1.30 annotation form is kept for compatibility.
+    local container_name
+    container_name=$(get_container_name "$service")
+    local annotation_key="container.apparmor.security.beta.kubernetes.io/${container_name}"
+    local existing_annotation
+    existing_annotation=$(kubectl get deployment "$service" \
+        -o jsonpath="{.spec.template.metadata.annotations.${annotation_key//./\\.}}" 2>/dev/null || echo "")
+    if [[ "$existing_annotation" != "unconfined" ]]; then
+        kubectl patch deployment "$service" --type='merge' -p="{
+          \"spec\":{\"template\":{\"metadata\":{\"annotations\":{
+            \"${annotation_key}\":\"unconfined\"
+          }}}}
+        }" >> "$exp_dir/logs/collector.log" 2>&1 || {
+            log "$exp_dir" "    WARNING: failed to set AppArmor unconfined annotation for $container_name"
+        }
     fi
 
     return 0
