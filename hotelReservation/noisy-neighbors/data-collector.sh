@@ -70,11 +70,6 @@ STRESS_SCRIPT="$SCRIPTS_DIR/stress-ng/stress-ng-helpers.sh"
 TAINT_SCRIPT="$SCRIPTS_DIR/node-taint.sh"
 SHAPES_SCRIPT="$SCRIPTS_DIR/contention-shapes.sh"
 
-# CPU cycle counter configuration
-CYCLE_COUNTER_SOURCE="$SCRIPTS_DIR/cycle_counter.c"
-CYCLE_COUNTER_BIN="$SCRIPTS_DIR/cycle_counter"
-CYCLE_COUNTER_CPUS=""  # Will be auto-detected from victim service CPU affinity
-
 # Calculate and verify CPU allocation for victim service
 # Returns: space-separated list of CPU IDs (e.g., "0 1 2")
 calculate_victim_cpu_allocation() {
@@ -211,174 +206,40 @@ apply_cpu_pinning_to_deployment() {
     fi
 }
 
-# Compile cycle counter
-compile_cycle_counter() {
-    local exp_dir="$1"
-    
-    if [[ ! -f "$CYCLE_COUNTER_SOURCE" ]]; then
-        log "$exp_dir" "WARNING: Cycle counter source not found at $CYCLE_COUNTER_SOURCE"
-        return 1
-    fi
-    
-    log "$exp_dir" "Compiling CPU cycle counter..."
-    if gcc -O2 -o "$CYCLE_COUNTER_BIN" "$CYCLE_COUNTER_SOURCE" -pthread 2>&1 | tee -a "$exp_dir/experiment.log"; then
-        log "$exp_dir" "Cycle counter compiled successfully: $CYCLE_COUNTER_BIN"
-        return 0
-    else
-        log "$exp_dir" "ERROR: Failed to compile cycle counter"
-        return 1
-    fi
-}
+# Frequency utilization configuration (consumed by the in-pod windowed sampler)
+# These map 1:1 to env vars read by services/perf/integration.go.
+TSC_FREQ_MHZ="${TSC_FREQ_MHZ:-}"                         # If empty, in-pod sampler falls back to /proc/cpuinfo
+C0_ACTIVE_THRESHOLD="${C0_ACTIVE_THRESHOLD:-0.05}"       # 5% default; OS noise on idle cores is ~3-5%
+MSR_TURBO_REFRESH_EVERY_S="${MSR_TURBO_REFRESH_EVERY_S:-10}"  # re-read MSR 0x1AD every 10s
 
-# Start cycle measurement (multi-core)
-start_cycle_measurement() {
-    local exp_dir="$1"
-    local iteration="$2"
-    local cpu_list="$3"  # Space-separated list of CPUs
-    
-    if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
-        log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
-        return 1
-    fi
-    
-    if [[ -z "$cpu_list" ]]; then
-        log "$exp_dir" "WARNING: No CPU list provided for cycle measurement"
-        return 1
-    fi
-    
-    log "$exp_dir" "Starting cycle measurement for iteration $iteration"
-    log "$exp_dir" "  Monitoring CPUs: $cpu_list"
-    
-    local success=0
-    for cpu in $cpu_list; do
-        local start_file="$exp_dir/metadata/cycles_start_iter${iteration}_cpu${cpu}.txt"
-        
-        if "$CYCLE_COUNTER_BIN" "$cpu" "$start_file" >> "$exp_dir/experiment.log" 2>&1; then
-            if [[ -f "$start_file" ]]; then
-                local cycles=$(cut -d',' -f1 "$start_file")
-                local freq=$(cut -d',' -f2 "$start_file")
-                log "$exp_dir" "  CPU $cpu start cycles: $cycles (freq: ${freq} MHz)"
-                success=1
-            fi
-        else
-            log "$exp_dir" "  WARNING: Failed to record start cycles for CPU $cpu"
-        fi
-    done
-    
-    if [[ $success -eq 1 ]]; then
-        return 0
-    else
-        log "$exp_dir" "WARNING: Failed to record start cycles for any CPU"
-        return 1
-    fi
-}
+# Track whether the 'msr' kernel module is loaded on TARGET_NODE.
+# Set to "true" by ensure_msr_module_on_node, "false" if the load attempt failed.
+# Used by generate_metadata to record the prerequisite state for later analysis.
+MSR_MODULE_LOADED="unknown"
 
-# End cycle measurement and calculate results (multi-core)
-end_cycle_measurement() {
-    local exp_dir="$1"
-    local iteration="$2"
-    local duration_sec="$3"  # Actual duration in seconds
-    local cpu_list="$4"  # Space-separated list of CPUs
-    
-    if [[ ! -x "$CYCLE_COUNTER_BIN" ]]; then
-        log "$exp_dir" "WARNING: Cycle counter binary not found or not executable"
+# Ensure the 'msr' kernel module is loaded on the target worker node. Without
+# it, /dev/cpu/N/msr does not exist and the in-pod MSR reader will soft-fail
+# (Sample.freq.ok = false). One-time setup per experiment.
+ensure_msr_module_on_node() {
+    local node="$1"
+    local exp_dir="$2"
+
+    if [[ -z "$node" ]]; then
+        log "$exp_dir" "WARNING: ensure_msr_module_on_node called without TARGET_NODE; skipping"
+        MSR_MODULE_LOADED="false"
         return 1
     fi
-    
-    if [[ -z "$cpu_list" ]]; then
-        log "$exp_dir" "WARNING: No CPU list provided for cycle measurement"
-        return 1
-    fi
-    
-    log "$exp_dir" "Ending cycle measurement for iteration $iteration"
-    
-    local result_file="$exp_dir/metadata/cycles_result_iter${iteration}.txt"
-    
-    # Initialize result file
-    {
-        echo "=== CPU CYCLE MEASUREMENT - ITERATION $iteration ==="
-        echo "Duration: ${duration_sec}s"
-        echo "Monitored CPUs: $cpu_list"
-        echo ""
-    } > "$result_file"
-    
-    local success=0
-    local cpu_count=0
-    
-    # Process each CPU
-    for cpu in $cpu_list; do
-        local start_file="$exp_dir/metadata/cycles_start_iter${iteration}_cpu${cpu}.txt"
-        local end_file="$exp_dir/metadata/cycles_end_iter${iteration}_cpu${cpu}.txt"
-        
-        if [[ ! -f "$start_file" ]]; then
-            log "$exp_dir" "  WARNING: Start cycles file not found for CPU $cpu"
-            echo "CPU $cpu: Start measurement missing" >> "$result_file"
-            continue
-        fi
-        
-        # Take end measurement
-        if "$CYCLE_COUNTER_BIN" "$cpu" "$end_file" >> "$exp_dir/experiment.log" 2>&1; then
-            if [[ -f "$end_file" ]]; then
-                # Parse start and end measurements
-                local start_cycles=$(cut -d',' -f1 "$start_file")
-                local start_freq=$(cut -d',' -f2 "$start_file")
-                local start_overhead=$(cut -d',' -f3 "$start_file")
-                
-                local end_cycles=$(cut -d',' -f1 "$end_file")
-                local end_freq=$(cut -d',' -f2 "$end_file")
-                local end_overhead=$(cut -d',' -f3 "$end_file")
-                
-                # Calculate total cycles (subtracting overhead)
-                local total_overhead=$((start_overhead + end_overhead))
-                local raw_cycles=$((end_cycles - start_cycles))
-                local net_cycles=$((raw_cycles - total_overhead))
-                
-                # Calculate cycles per second using average frequency
-                local avg_freq=$(awk "BEGIN {printf \"%.2f\", ($start_freq + $end_freq) / 2}")
-                local cycles_per_sec=$(awk "BEGIN {printf \"%.0f\", $net_cycles / $duration_sec}")
-                
-                # Write per-core results
-                {
-                    echo "────────────────────────────────────────────────────────────"
-                    echo "CPU $cpu"
-                    echo "────────────────────────────────────────────────────────────"
-                    echo "  Start cycles:        $start_cycles"
-                    echo "  End cycles:          $end_cycles"
-                    echo "  Raw cycle delta:     $raw_cycles"
-                    echo "  Measurement overhead: $total_overhead cycles"
-                    echo "  Net cycles:          $net_cycles"
-                    echo "  Average frequency:   ${avg_freq} MHz"
-                    echo "  Cycles per second:   $cycles_per_sec"
-                    echo ""
-                } >> "$result_file"
-                
-                log "$exp_dir" "  CPU $cpu: $net_cycles cycles ($cycles_per_sec cycles/sec)"
-                success=1
-                cpu_count=$((cpu_count + 1))
-            fi
-        else
-            log "$exp_dir" "  WARNING: Failed to record end cycles for CPU $cpu"
-            echo "CPU $cpu: End measurement failed" >> "$result_file"
-        fi
-    done
-    
-    # Add summary note
-    {
-        echo "════════════════════════════════════════════════════════════"
-        echo "NOTES"
-        echo "════════════════════════════════════════════════════════════"
-        echo "• RDTSC measures wall-clock cycles (not CPU-busy cycles)"
-        echo "• Each CPU core counted independently"
-        echo "• All cores should show similar cycles/sec ≈ CPU frequency"
-        echo "• Variations may indicate frequency scaling or migration issues"
-        echo "• Successfully measured: $cpu_count CPUs"
-    } >> "$result_file"
-    
-    if [[ $success -eq 1 ]]; then
-        log "$exp_dir" "  Results saved to: $result_file"
+
+    log "$exp_dir" "Ensuring 'msr' kernel module is loaded on $node (for in-pod freq utilization)"
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$node" \
+        "lsmod | grep -q '^msr ' || sudo modprobe msr" \
+        >> "$exp_dir/logs/collector.log" 2>&1; then
+        log "$exp_dir" "  OK: 'msr' module is loaded on $node"
+        MSR_MODULE_LOADED="true"
         return 0
     else
-        log "$exp_dir" "WARNING: Failed to record end cycles for any CPU"
+        log "$exp_dir" "  WARNING: failed to load 'msr' module on $node; freq fields will be ok=false in samples"
+        MSR_MODULE_LOADED="false"
         return 1
     fi
 }
@@ -651,7 +512,7 @@ update_deployment_for_timing() {
     fi
     
     # Set perf events (use safe default if not specified)
-    local perf_events_value="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+    local perf_events_value="${PERF_EVENTS:-cycles,ref-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
     if ! kubectl set env "deployment/$service" "PERF_EVENTS=${perf_events_value}"; then
         log "$exp_dir" "ERROR: Failed to set PERF_EVENTS for $service"
         return 1
@@ -702,7 +563,18 @@ update_deployment_for_timing() {
         log "$exp_dir" "ERROR: Failed to set TIMING_FLUSH_THRESHOLD for $service"
         return 1
     fi
-    
+
+    # Set frequency utilization env vars (consumed by services/perf/integration.go)
+    if ! apply_freq_util_env "$service" "$exp_dir"; then
+        log "$exp_dir" "WARNING: Failed to set freq utilization env vars for $service"
+    fi
+
+    # Patch the deployment to grant SYS_RAWIO and mount /dev/cpu so the in-pod
+    # MSR reader can pread the MSRs needed for current_max_freq/active_n.
+    if ! apply_msr_pod_capabilities "$service" "$exp_dir"; then
+        log "$exp_dir" "WARNING: Failed to apply MSR pod capabilities for $service; freq fields will be ok=false"
+    fi
+
     log "$exp_dir" "Successfully updated deployment configuration for $service"
     log "$exp_dir" "  Windowed Sampling: enabled"
     log "$exp_dir" "  CPU Set: $cpu_set (taskset pinning + perf monitoring)"
@@ -710,7 +582,87 @@ update_deployment_for_timing() {
     log "$exp_dir" "  Window Interval: ${WINDOW_INTERVAL_MS}ms"
     log "$exp_dir" "  Perf Events: ${PERF_EVENTS}"
     log "$exp_dir" "  Ring Buffer: size=${buffer_size}, threshold=${flush_threshold}%"
-    
+    log "$exp_dir" "  TSC Freq: ${TSC_FREQ_MHZ:-(auto from /proc/cpuinfo)} MHz"
+    log "$exp_dir" "  C0 Active Threshold: ${C0_ACTIVE_THRESHOLD}"
+    log "$exp_dir" "  MSR Turbo Refresh: ${MSR_TURBO_REFRESH_EVERY_S}s"
+
+    return 0
+}
+
+# apply_freq_util_env: forward TSC_FREQ_MHZ, C0_ACTIVE_THRESHOLD,
+# MSR_TURBO_REFRESH_EVERY_S to the deployment via kubectl set env. These are
+# read by services/perf/integration.go on pod startup.
+apply_freq_util_env() {
+    local service="$1"
+    local exp_dir="$2"
+    local rc=0
+
+    # Only set TSC_FREQ_MHZ if the operator overrode it; otherwise let the
+    # in-pod fallback (parse /proc/cpuinfo) decide.
+    if [[ -n "$TSC_FREQ_MHZ" ]]; then
+        kubectl set env "deployment/$service" "TSC_FREQ_MHZ=${TSC_FREQ_MHZ}" \
+            >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
+    fi
+    kubectl set env "deployment/$service" "C0_ACTIVE_THRESHOLD=${C0_ACTIVE_THRESHOLD}" \
+        >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
+    kubectl set env "deployment/$service" "MSR_TURBO_REFRESH_EVERY_S=${MSR_TURBO_REFRESH_EVERY_S}" \
+        >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
+    return $rc
+}
+
+# apply_msr_pod_capabilities: idempotently patch a deployment to add
+# CAP_SYS_RAWIO and a hostPath mount for /dev/cpu so that the pod can pread()
+# MSRs from inside the container. Safe to call repeatedly: re-applying the
+# patches on a deployment that already has them is a no-op for kubectl.
+apply_msr_pod_capabilities() {
+    local service="$1"
+    local exp_dir="$2"
+
+    log "$exp_dir" "  Adding CAP_SYS_RAWIO + /dev/cpu hostPath to $service deployment"
+
+    # 1) Add SYS_RAWIO capability if not already present.
+    local existing_caps
+    existing_caps=$(kubectl get deployment "$service" \
+        -o jsonpath='{.spec.template.spec.containers[0].securityContext.capabilities.add}' 2>/dev/null || echo "")
+    if [[ "$existing_caps" != *"SYS_RAWIO"* ]]; then
+        kubectl patch deployment "$service" --type='json' -p='[
+          {"op":"add","path":"/spec/template/spec/containers/0/securityContext/capabilities/add/-","value":"SYS_RAWIO"}
+        ]' >> "$exp_dir/logs/collector.log" 2>&1 || {
+            log "$exp_dir" "    WARNING: failed to add CAP_SYS_RAWIO (may already exist or be denied by PSA)"
+        }
+    fi
+
+    # 2) Add /dev/cpu hostPath volume + readonly mount if not already present.
+    local existing_volumes
+    existing_volumes=$(kubectl get deployment "$service" \
+        -o jsonpath='{.spec.template.spec.volumes}' 2>/dev/null || echo "")
+    if [[ "$existing_volumes" != *"dev-cpu"* ]]; then
+        # If the deployment has no volumes/volumeMounts arrays yet, JSON-patch
+        # add-with-"-" fails. Use add-with-array-init in that case.
+        local volumes_exist=true
+        if [[ "$existing_volumes" == "" || "$existing_volumes" == "[]" ]]; then
+            volumes_exist=false
+        fi
+
+        if $volumes_exist; then
+            kubectl patch deployment "$service" --type='json' -p='[
+              {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"dev-cpu","hostPath":{"path":"/dev/cpu","type":"Directory"}}},
+              {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"dev-cpu","mountPath":"/dev/cpu","readOnly":true}}
+            ]' >> "$exp_dir/logs/collector.log" 2>&1 || {
+                log "$exp_dir" "    WARNING: failed to add /dev/cpu volume mount"
+                return 1
+            }
+        else
+            kubectl patch deployment "$service" --type='json' -p='[
+              {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"dev-cpu","hostPath":{"path":"/dev/cpu","type":"Directory"}}]},
+              {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"dev-cpu","mountPath":"/dev/cpu","readOnly":true}]}
+            ]' >> "$exp_dir/logs/collector.log" 2>&1 || {
+                log "$exp_dir" "    WARNING: failed to initialize volume mount arrays for /dev/cpu"
+                return 1
+            }
+        fi
+    fi
+
     return 0
 }
 
@@ -1028,7 +980,7 @@ validate_config() {
 	# Set defaults for windowed sampling if not specified
 	WINDOW_INTERVAL_MS="${WINDOW_INTERVAL_MS:-100}"
 	# Safe default using only universally available counters
-	PERF_EVENTS="${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
+	PERF_EVENTS="${PERF_EVENTS:-cycles,ref-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}"
 	ENABLE_WINDOWED_SAMPLING="${ENABLE_WINDOWED_SAMPLING:-true}"
 	# Large buffer size for channel + ring buffer architecture
 	TIMING_BUFFER_SIZE="${TIMING_BUFFER_SIZE:-16384}"
@@ -2414,30 +2366,16 @@ run_iteration() {
     # Collect baseline metrics
     collect_system_metrics "$exp_dir" "$iteration" "baseline"
     
-    # Calculate CPU allocation for victim service (for cycle measurement)
-    local victim_cpus=""
+    # Verify victim service CPU pinning (logs expected vs actual taskset)
     if [[ -n "$VICTIM_SERVICES" ]]; then
-        # Get first (and only) victim service
         local victim_service=$(echo "$VICTIM_SERVICES" | awk '{print $1}')
-        victim_cpus=$(calculate_victim_cpu_allocation "$exp_dir" "$victim_service")
-        
-        if [[ -n "$victim_cpus" ]]; then
-            log "$exp_dir" "Will measure cycles on victim service CPUs: $victim_cpus"
-            echo "$victim_cpus" > "$exp_dir/metadata/cycle_measurement_cpus_iter${iteration}.txt"
-        else
-            log "$exp_dir" "WARNING: Could not calculate victim service CPU allocation, skipping cycle measurements"
-        fi
+        calculate_victim_cpu_allocation "$exp_dir" "$victim_service" >/dev/null || true
     fi
-    
+
     # Record iteration start time
     local iteration_start=$(date +%s)
     echo "$iteration_start" > "$exp_dir/metadata/iteration_${iteration}_start.txt"
-    
-    # Start CPU cycle measurement (if CPUs detected)
-    if [[ -n "$victim_cpus" ]]; then
-        start_cycle_measurement "$exp_dir" "$iteration" "$victim_cpus"
-    fi
-    
+
     # Start workload generation early (at +5s)
     log "$exp_dir" "Waiting 5s before starting workload generation..."
     sleep 5
@@ -2498,12 +2436,7 @@ run_iteration() {
     # Calculate actual duration
     local actual_duration=$((iteration_end - iteration_start))
     log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
-    
-    # End CPU cycle measurement and calculate results (if CPUs were detected)
-    if [[ -n "$victim_cpus" ]]; then
-        end_cycle_measurement "$exp_dir" "$iteration" "$actual_duration" "$victim_cpus"
-    fi
-    
+
     # Wait a bit more for data to be written to disk
     log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
     sleep 5
@@ -2588,9 +2521,18 @@ generate_metadata() {
         "windowed_sampling": {
             "enabled": ${ENABLE_WINDOWED_SAMPLING:-true},
             "window_interval_ms": ${WINDOW_INTERVAL_MS:-100},
-            "perf_events": "${PERF_EVENTS:-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
+            "perf_events": "${PERF_EVENTS:-cycles,ref-cycles,instructions,cache-references,cache-misses,branch-instructions,branch-misses,dtlb-load-misses,itlb-load-misses,page-faults,minor-faults,major-faults,context-switches,cpu-migrations}",
             "data_collection": "Full timeline from workload start to iteration end, including idle periods",
             "rationale": "Captures development of contention and performance changes when approaching/leaving contention"
+        },
+        "frequency_utilization": {
+            "enabled": true,
+            "tsc_freq_mhz": "${TSC_FREQ_MHZ:-auto}",
+            "c0_active_threshold": ${C0_ACTIVE_THRESHOLD},
+            "turbo_table_refresh_s": ${MSR_TURBO_REFRESH_EVERY_S},
+            "interval_ms": ${WINDOW_INTERVAL_MS:-100},
+            "msr_module_on_target_node": "${MSR_MODULE_LOADED}",
+            "rationale": "actual_freq via perf cycles/ref-cycles ratio (per-proc); current_max via MSR 0x1AD bin keyed on MSR 0x30A active core count; see noisy-neighbors/actual-frequency.md"
         },
         "cpu_pinning": {
             "enabled": ${ENABLE_CPU_PINNING:-true},
@@ -2681,14 +2623,29 @@ for iter_num in range(1, total_iterations + 1):
         try:
             with open(run_file) as f:
                 data = json.load(f)
+                aggs = data.get("aggregates", {}) or {}
+                fu = aggs.get("freq_util") or {}
                 runs.append({
                     "iteration_id": data.get("iteration_id", iter_num),
                     "run_file": os.path.basename(run_file),
                     "run_duration_ms": data.get("run_duration_ms", 0),
                     "sample_count": data.get("sample_count", 0),
-                    "total_requests": data.get("aggregates", {}).get("total_requests", 0),
-                    "cycles_total": data.get("aggregates", {}).get("perf_totals", {}).get("cycles", 0),
-                    "instructions_total": data.get("aggregates", {}).get("perf_totals", {}).get("instructions", 0)
+                    "total_requests": aggs.get("total_requests", 0),
+                    "cycles_total": (aggs.get("perf_totals") or {}).get("cycles", 0),
+                    "instructions_total": (aggs.get("perf_totals") or {}).get("instructions", 0),
+                    "freq_util": {
+                        "samples_with_freq": fu.get("samples_with_freq", 0),
+                        "samples_without_freq": fu.get("samples_without_freq", 0),
+                        "actual_freq_mhz_mean": fu.get("actual_freq_mhz_mean", 0),
+                        "freq_util_pct_mean": fu.get("freq_util_pct_mean", 0),
+                        "freq_util_pct_p50": fu.get("freq_util_pct_p50", 0),
+                        "freq_util_pct_p99": fu.get("freq_util_pct_p99", 0),
+                        "pct_samples_in_turbo": fu.get("pct_samples_in_turbo", 0),
+                        "active_n_mean": fu.get("active_n_mean", 0),
+                        "active_n_max": fu.get("active_n_max", 0),
+                        "tsc_freq_mhz": fu.get("tsc_freq_mhz", 0),
+                        "c0_active_threshold": fu.get("c0_active_threshold", 0),
+                    },
                 })
         except Exception as e:
             print(f"Error processing {run_file}: {e}")
@@ -2703,6 +2660,30 @@ total_requests = sum(r["total_requests"] for r in runs)
 cycles_mean = sum(r["cycles_total"] for r in runs) / len(runs) if runs else 0
 instructions_mean = sum(r["instructions_total"] for r in runs) / len(runs) if runs else 0
 
+# Frequency utilization rollup across iterations (mean of per-iteration means).
+# Iterations with no successful freq samples (samples_with_freq == 0) are
+# excluded from the mean to avoid pulling 0% into the average.
+fu_runs = [r["freq_util"] for r in runs if r["freq_util"]["samples_with_freq"] > 0]
+def _mean(key):
+    if not fu_runs:
+        return 0
+    return sum(r[key] for r in fu_runs) / len(fu_runs)
+
+freq_util_summary = {
+    "iterations_with_freq": len(fu_runs),
+    "total_samples_with_freq":    sum(r["freq_util"]["samples_with_freq"] for r in runs),
+    "total_samples_without_freq": sum(r["freq_util"]["samples_without_freq"] for r in runs),
+    "actual_freq_mhz_mean":  _mean("actual_freq_mhz_mean"),
+    "freq_util_pct_mean":    _mean("freq_util_pct_mean"),
+    "freq_util_pct_p50":     _mean("freq_util_pct_p50"),
+    "freq_util_pct_p99":     _mean("freq_util_pct_p99"),
+    "pct_samples_in_turbo":  _mean("pct_samples_in_turbo"),
+    "active_n_mean":         _mean("active_n_mean"),
+    "active_n_max":          max((r["freq_util"]["active_n_max"] for r in runs), default=0),
+    "tsc_freq_mhz":          fu_runs[0]["tsc_freq_mhz"] if fu_runs else 0,
+    "c0_active_threshold":   fu_runs[0]["c0_active_threshold"] if fu_runs else 0,
+}
+
 experiment_summary = {
     "service_name": service,
     "total_iterations": len(runs),
@@ -2713,7 +2694,8 @@ experiment_summary = {
         "avg_requests_per_run": total_requests / len(runs) if runs else 0,
         "cycles_mean": cycles_mean,
         "instructions_mean": instructions_mean,
-        "ipc_mean": instructions_mean / cycles_mean if cycles_mean > 0 else 0
+        "ipc_mean": instructions_mean / cycles_mean if cycles_mean > 0 else 0,
+        "freq_util": freq_util_summary,
     }
 }
 
@@ -2728,6 +2710,132 @@ EOF
             log "$exp_dir" "    Python3 not available, skipping JSON aggregation for $service"
         fi
     done
+}
+
+# write_freq_util_summary: build processed/freq_util_summary.txt from each
+# service's run_data_iter*.json. Per-iteration line + per-service rollup.
+# Quietly produces an empty-but-explanatory summary if no freq data exists,
+# so downstream tooling always finds the file.
+write_freq_util_summary() {
+    local exp_dir="$1"
+    local total_iterations="$2"
+    local services="$3"
+    local out="$exp_dir/processed/freq_util_summary.txt"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "$exp_dir" "WARNING: python3 not available, skipping freq_util_summary.txt"
+        return 0
+    fi
+
+    python3 - "$exp_dir" "$total_iterations" "$out" "$services" <<'PYEOF'
+import json
+import os
+import sys
+
+exp_dir          = sys.argv[1]
+total_iterations = int(sys.argv[2])
+out_path         = sys.argv[3]
+services         = sys.argv[4].split() if len(sys.argv) > 4 else []
+
+def load_run(svc, it):
+    path = os.path.join(exp_dir, "raw", "windowed", svc, f"run_data_iter{it}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+def fu(run):
+    if not run or "_error" in run:
+        return None
+    aggs = run.get("aggregates") or {}
+    return aggs.get("freq_util")
+
+lines = []
+lines.append("=== FREQUENCY UTILIZATION SUMMARY ===")
+import datetime
+lines.append(f"Generated: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}")
+lines.append("")
+
+# Header config (pulled from the first iteration that has freq data)
+header_done = False
+for svc in services:
+    for it in range(1, total_iterations + 1):
+        f = fu(load_run(svc, it))
+        if f and f.get("samples_with_freq", 0) > 0:
+            lines.append(f"TSC freq: {f.get('tsc_freq_mhz', 0)} MHz")
+            lines.append(f"C0 active threshold: {f.get('c0_active_threshold', 0)*100:.1f}%")
+            header_done = True
+            break
+    if header_done:
+        break
+
+lines.append("")
+lines.append("Per-service, per-iteration:")
+any_freq = False
+for svc in services:
+    for it in range(1, total_iterations + 1):
+        run = load_run(svc, it)
+        f = fu(run)
+        if not f:
+            lines.append(f"  {svc} iter{it}:  (no freq data)")
+            continue
+        if f.get("samples_with_freq", 0) == 0:
+            lines.append(
+                f"  {svc} iter{it}:  no successful MSR reads "
+                f"(samples_without_freq={f.get('samples_without_freq', 0)}; "
+                f"check 'msr' module / CAP_SYS_RAWIO / /dev/cpu mount)"
+            )
+            continue
+        any_freq = True
+        lines.append(
+            f"  {svc} iter{it}:  "
+            f"actual={f['actual_freq_mhz_mean']:.1f} MHz  "
+            f"util={f['freq_util_pct_mean']:.1f}%  "
+            f"p99={f['freq_util_pct_p99']:.1f}%  "
+            f"in_turbo={f['pct_samples_in_turbo']:.1f}%  "
+            f"active_n mean={f['active_n_mean']:.1f} max={f['active_n_max']}  "
+            f"ok_samples={f['samples_with_freq']}/{f['samples_with_freq']+f['samples_without_freq']}"
+        )
+
+lines.append("")
+lines.append("Per-service, across iterations:")
+for svc in services:
+    iters = [fu(load_run(svc, it)) for it in range(1, total_iterations + 1)]
+    iters = [f for f in iters if f and f.get("samples_with_freq", 0) > 0]
+    if not iters:
+        lines.append(f"  {svc}:  (no usable freq data)")
+        continue
+    n = len(iters)
+    def m(key):
+        return sum(f[key] for f in iters) / n
+    total_ok   = sum(f["samples_with_freq"] for f in iters)
+    total_miss = sum(f["samples_without_freq"] for f in iters)
+    total      = total_ok + total_miss
+    lines.append(
+        f"  {svc}:  "
+        f"util mean={m('freq_util_pct_mean'):.1f}  "
+        f"p99 mean={m('freq_util_pct_p99'):.1f}  "
+        f"in_turbo={m('pct_samples_in_turbo'):.1f}%  "
+        f"samples_ok={total_ok}/{total} ({100.0*total_ok/total if total else 0:.1f}%)"
+    )
+
+if not any_freq:
+    lines.append("")
+    lines.append("NOTE: No iteration produced successful MSR reads.")
+    lines.append("      Verify on the worker node:")
+    lines.append("        - 'msr' kernel module loaded (sudo modprobe msr)")
+    lines.append("        - pod has CAP_SYS_RAWIO + /dev/cpu hostPath mount")
+    lines.append("        - TSC_FREQ_MHZ env var set or readable from /proc/cpuinfo")
+
+with open(out_path, "w") as f:
+    f.write("\n".join(lines) + "\n")
+print(f"Wrote {out_path}")
+PYEOF
+
+    log "$exp_dir" "Frequency utilization summary: $out"
 }
 
 # Aggregate iteration data into summary files
@@ -2761,105 +2869,11 @@ aggregate_data() {
         } > "$exp_dir/processed/latency_summary.txt"
     fi
     
-    # Aggregate CPU cycle measurements (multi-core)
-    if ls "$exp_dir/metadata/cycles_result_iter"*.txt 1> /dev/null 2>&1; then
-        {
-            echo "=== AGGREGATED CPU CYCLE MEASUREMENTS (MULTI-CORE) ==="
-            echo "Generated: $(date -Iseconds)"
-            echo ""
-            echo "Using RDTSC (Read Time-Stamp Counter) with serialization"
-            echo "Per-core measurements from victim service CPUs"
-            echo ""
-            
-            # Show all per-iteration results
-            for i in $(seq 1 $total_iterations); do
-                local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
-                if [[ -f "$result_file" ]]; then
-                    cat "$result_file"
-                    echo ""
-                    echo "════════════════════════════════════════════════════════════"
-                    echo ""
-                fi
-            done
-            
-            # Calculate per-CPU summary statistics
-            echo "=== SUMMARY STATISTICS (PER-CPU) ==="
-            echo ""
-            
-            # Collect all unique CPUs across iterations
-            local all_cpus=$(for i in $(seq 1 $total_iterations); do
-                local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
-                if [[ -f "$result_file" ]]; then
-                    grep "^CPU [0-9]" "$result_file" | awk '{print $2}'
-                fi
-            done | sort -n | uniq)
-            
-            if [[ -z "$all_cpus" ]]; then
-                echo "No cycle measurements found"
-            else
-                echo "Monitored CPUs: $all_cpus"
-                echo ""
-                
-                # Statistics per CPU
-                for cpu in $all_cpus; do
-                    echo "────────────────────────────────────────────────────────────"
-                    echo "CPU $cpu Summary"
-                    echo "────────────────────────────────────────────────────────────"
-                    
-                    local cpu_total_cycles=0
-                    local cpu_total_duration=0
-                    local cpu_count=0
-                    local cpu_total_cycles_per_sec=0
-                    
-                    for i in $(seq 1 $total_iterations); do
-                        local result_file="$exp_dir/metadata/cycles_result_iter${i}.txt"
-                        if [[ -f "$result_file" ]]; then
-                            # Extract data for this CPU from this iteration
-                            local net_cycles=$(grep -A 10 "^CPU $cpu\$" "$result_file" | grep "Net cycles:" | awk '{print $3}')
-                            local cycles_per_sec=$(grep -A 10 "^CPU $cpu\$" "$result_file" | grep "Cycles per second:" | awk '{print $4}')
-                            local duration=$(grep "^Duration:" "$result_file" | awk '{print $2}' | sed 's/s//')
-                            
-                            if [[ -n "$net_cycles" && -n "$duration" && -n "$cycles_per_sec" ]]; then
-                                cpu_total_cycles=$((cpu_total_cycles + net_cycles))
-                                cpu_total_duration=$((cpu_total_duration + duration))
-                                cpu_total_cycles_per_sec=$((cpu_total_cycles_per_sec + cycles_per_sec))
-                                cpu_count=$((cpu_count + 1))
-                            fi
-                        fi
-                    done
-                    
-                    if [[ $cpu_count -gt 0 ]]; then
-                        local avg_cycles=$((cpu_total_cycles / cpu_count))
-                        local avg_cycles_per_sec=$((cpu_total_cycles_per_sec / cpu_count))
-                        
-                        echo "  Iterations measured: $cpu_count"
-                        echo "  Total cycles: $cpu_total_cycles"
-                        echo "  Total duration: ${cpu_total_duration}s"
-                        echo "  Average cycles per iteration: $avg_cycles"
-                        echo "  Average cycles/sec: $avg_cycles_per_sec"
-                        echo ""
-                    else
-                        echo "  No measurements for this CPU"
-                        echo ""
-                    fi
-                done
-                
-                # Overall summary
-                echo "════════════════════════════════════════════════════════════"
-                echo "OVERALL SUMMARY"
-                echo "════════════════════════════════════════════════════════════"
-                local num_cpus=$(echo "$all_cpus" | wc -w)
-                echo "Number of CPUs monitored: $num_cpus"
-                echo "Total iterations: $total_iterations"
-                echo ""
-                echo "Note: Each CPU core measured independently"
-                echo "      All cores should show similar cycles/sec ≈ CPU frequency"
-                echo "      Variations indicate frequency scaling or migration"
-            fi
-        } > "$exp_dir/processed/cycles_summary.txt"
-        
-        log "$exp_dir" "CPU cycle summary: $exp_dir/processed/cycles_summary.txt"
-    fi
+    # Frequency utilization summary (per-iteration and per-service rollup)
+    # Replaces the old cycles_summary.txt (which was based on cycle_counter.c
+    # RDTSC stamps taken on the controller node). The new summary is built
+    # from each pod's run_data_iter*.json `aggregates.freq_util` block.
+    write_freq_util_summary "$exp_dir" "$total_iterations" "$VICTIM_SERVICES"
     
     # Create experiment summary
     {
@@ -2885,29 +2899,14 @@ aggregate_data() {
             local windowed_services=$(ls -d "$exp_dir/raw/windowed/"*/ 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
             echo "  Services with windowed data: $windowed_services"
         fi
-        
-        # Check if cycle measurements were collected
-        local cycle_measurements_count=0
-        if ls "$exp_dir/metadata/cycles_result_iter"*.txt 1> /dev/null 2>&1; then
-            cycle_measurements_count=$(ls "$exp_dir/metadata/cycles_result_iter"*.txt 2>/dev/null | wc -l)
-        fi
-        
+
         echo ""
-        echo "CPU Cycle Measurements: $([[ $cycle_measurements_count -gt 0 ]] && echo "enabled" || echo "disabled")"
-        if [[ $cycle_measurements_count -gt 0 ]]; then
-            echo "  Iterations measured: $cycle_measurements_count"
-            echo "  Method: RDTSC (Read Time-Stamp Counter)"
-            
-            # Show which CPUs were monitored
-            local monitored_cpus=$(cat "$exp_dir/metadata/cycle_measurement_cpus_iter"*.txt 2>/dev/null | head -1)
-            if [[ -n "$monitored_cpus" ]]; then
-                echo "  Monitored CPUs: $monitored_cpus (victim service cores)"
-                echo "  Per-core measurements: Yes"
-            else
-                echo "  CPU detection: Failed (see experiment.log)"
-            fi
-            
-            echo "  Summary: processed/cycles_summary.txt"
+        echo "Frequency Utilization (in-pod MSR + perf cycles/ref-cycles):"
+        echo "  TSC freq: ${TSC_FREQ_MHZ:-(auto from /proc/cpuinfo)} MHz"
+        echo "  C0 active threshold: ${C0_ACTIVE_THRESHOLD}"
+        echo "  msr module on $TARGET_NODE: ${MSR_MODULE_LOADED}"
+        if [[ -f "$exp_dir/processed/freq_util_summary.txt" ]]; then
+            echo "  Summary: processed/freq_util_summary.txt"
         fi
         
         echo ""
@@ -3003,7 +3002,12 @@ run_experiment() {
     else
         log "$exp_dir" " System validation passed. Ready to start experiments."
     fi
-    
+
+    # Ensure the 'msr' kernel module is loaded on the target node so /dev/cpu/N/msr
+    # exists for the in-pod MSR reader. Soft-fails if SSH or sudo isn't available;
+    # the in-pod sampler will then emit Freq.OK=false for every sample.
+    ensure_msr_module_on_node "$TARGET_NODE" "$exp_dir" || true
+
     # Run iterations
     for iteration in $(seq 1 $total_iterations); do
         log "$exp_dir" "=== Iteration $iteration/$total_iterations ==="
@@ -3088,7 +3092,7 @@ ITERATION_DELAY=60
 # Windowed sampling
 ENABLE_WINDOWED_SAMPLING=true
 WINDOW_INTERVAL_MS=100
-PERF_EVENTS='cycles,instructions,cache-references,cache-misses,branch-misses'
+PERF_EVENTS='cycles,ref-cycles,instructions,cache-references,cache-misses,branch-misses'
 TIMING_BUFFER_SIZE=16384
 
 # CPU pinning (taskset) for no-instrumentation case only
@@ -3188,10 +3192,7 @@ EXAMPLE_EOF
     # Create experiment directory
     local exp_dir=$(create_exp_directory "$exp_id")
     echo "Experiment directory: $exp_dir"
-    
-    # Compile cycle counter
-    compile_cycle_counter "$exp_dir" || echo "WARNING: Cycle counter compilation failed, will skip cycle measurements"
-    
+
     # Generate metadata
     generate_metadata "$config_file" "$exp_dir" "$exp_id"
     

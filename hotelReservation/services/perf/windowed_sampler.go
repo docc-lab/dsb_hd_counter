@@ -1,8 +1,9 @@
 package perf
 
 /*
-#cgo LDFLAGS: -L${SRCDIR} -lperf_api_windowed
+#cgo LDFLAGS: -L${SRCDIR} -lperf_api_windowed -lmsr_reader
 #include "perf_api_windowed.h"
+#include "msr_reader.h"
 #include <stdlib.h>
 */
 import "C"
@@ -39,6 +40,13 @@ type RunConfig struct {
 	PerfEvents       []string      // Events: ["cycles", "instructions", "cache-misses", ...]
 	OutputDir        string        // Where to write run data
 	TimingStatsChannel chan *interceptor.WindowTimingStats // Channel to receive timing stats
+
+	// Frequency utilization configuration (see actual-frequency.md). When
+	// TscFreqMHz is 0 or the MSR reader fails to init, freq fields on each
+	// Sample are emitted with OK=false and the rest of the fields zeroed.
+	TscFreqMHz             float64       // CPU TSC frequency (= base frequency); read from env or /proc/cpuinfo
+	C0ActiveThreshold      float64       // Fraction in [0,1] above which a core counts as active (default 0.05)
+	MsrTurboRefreshInterval time.Duration // How often to re-read MSR 0x1AD (default 10s)
 }
 
 // Sample represents one snapshot at a window boundary
@@ -49,6 +57,23 @@ type Sample struct {
 	PerfCounters  map[string]uint64     `json:"perf_counters"`  // Cumulative values
 	PerfDeltas    map[string]uint64     `json:"perf_deltas"`    // Delta from previous sample
 	TimingWindow  *interceptor.WindowTimingStats `json:"timing_window"`  // Timing stats for this window
+	Freq          FreqSample            `json:"freq"`           // Frequency utilization for this window
+}
+
+// FreqSample carries per-window CPU frequency utilization fields.
+//
+// actual_freq_mhz is computed in-process from perf-attached cycles/ref-cycles
+// (immune to co-scheduling). current_max_mhz is looked up from MSR 0x1AD
+// indexed by the count of node-wide cores in C0 over C0ActiveThreshold,
+// derived from MSR 0x30A + MSR 0x10. See actual-frequency.md for derivation.
+type FreqSample struct {
+	OK            bool    `json:"ok"`
+	ActualFreqMHz float64 `json:"actual_freq_mhz"`
+	CurrentMaxMHz uint32  `json:"current_max_mhz"`
+	ActiveN       int     `json:"active_n"`
+	FreqUtilPct   float64 `json:"freq_util_pct"`
+	TurboOn       bool    `json:"turbo_on"`
+	TscFreqMHz    float64 `json:"tsc_freq_mhz"`
 }
 
 // Note: WindowTimingStats and WindowDurationStats are defined in interceptor package
@@ -75,6 +100,24 @@ type RunAggregates struct {
 	PerfMean      map[string]float64 `json:"perf_mean"`    // Mean delta per sample
 	PerfRate      map[string]float64 `json:"perf_rate"`    // Events per second
 	TimingOverall *DurationStats     `json:"timing_overall"` // Overall timing stats
+	FreqUtil      *FreqUtilStats     `json:"freq_util"`    // Frequency utilization rollup
+}
+
+// FreqUtilStats provides aggregated frequency utilization stats across a run.
+// Mean/p50/p99 ignore samples where Freq.OK is false. SamplesWithFreq +
+// SamplesWithoutFreq == len(samples).
+type FreqUtilStats struct {
+	SamplesWithFreq    int     `json:"samples_with_freq"`
+	SamplesWithoutFreq int     `json:"samples_without_freq"`
+	ActualFreqMHzMean  float64 `json:"actual_freq_mhz_mean"`
+	FreqUtilPctMean    float64 `json:"freq_util_pct_mean"`
+	FreqUtilPctP50     float64 `json:"freq_util_pct_p50"`
+	FreqUtilPctP99     float64 `json:"freq_util_pct_p99"`
+	PctSamplesInTurbo  float64 `json:"pct_samples_in_turbo"`
+	ActiveNMean        float64 `json:"active_n_mean"`
+	ActiveNMax         int     `json:"active_n_max"`
+	TscFreqMHz         float64 `json:"tsc_freq_mhz"`
+	C0ActiveThreshold  float64 `json:"c0_active_threshold"`
 }
 
 // DurationStats for overall timing aggregation
@@ -96,6 +139,7 @@ type DurationStats struct {
 type windowedSampler struct {
 	config         RunConfig
 	perfHandle     *C.perf_window_handle_t
+	msrReader      *C.msr_reader_t // nil if MSR access unavailable; freq fields then OK=false
 	timingChan     chan *interceptor.WindowTimingStats
 	samples        []Sample
 	sampleCounter  atomic.Int32
@@ -156,7 +200,44 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 	if ws.perfHandle == nil {
 		return fmt.Errorf("failed to initialize perf counters for events: %s on CPUs: %s", eventNamesStr, cpuSet)
 	}
-	
+
+	// Initialize the MSR reader for per-window frequency utilization. This is
+	// best-effort: if /dev/cpu/N/msr is not accessible (e.g. the host has not
+	// loaded the 'msr' kernel module, or the pod is missing CAP_SYS_RAWIO /
+	// the hostPath mount), each Sample.Freq will simply land with OK=false.
+	if ws.config.TscFreqMHz > 0 {
+		threshold := ws.config.C0ActiveThreshold
+		if threshold <= 0 {
+			threshold = 0.05
+		}
+		refreshEvery := 1
+		if ws.config.MsrTurboRefreshInterval > 0 && ws.config.WindowInterval > 0 {
+			refreshEvery = int(ws.config.MsrTurboRefreshInterval / ws.config.WindowInterval)
+			if refreshEvery < 1 {
+				refreshEvery = 1
+			}
+		}
+		ws.msrReader = C.msr_reader_init(C.double(threshold), C.int(refreshEvery))
+		if ws.msrReader == nil {
+			log.Warn().
+				Str("service", config.ServiceName).
+				Msg("MSR reader init failed; freq fields will be marked ok=false (need 'modprobe msr' on host + CAP_SYS_RAWIO + /dev/cpu hostPath)")
+		} else {
+			log.Info().
+				Str("service", config.ServiceName).
+				Int("n_cores", int(C.msr_reader_n_cores(ws.msrReader))).
+				Int("n_turbo_bins", int(C.msr_reader_n_turbo_bins(ws.msrReader))).
+				Float64("tsc_freq_mhz", ws.config.TscFreqMHz).
+				Float64("c0_active_threshold", threshold).
+				Int("turbo_refresh_every_n_calls", refreshEvery).
+				Msg("MSR reader initialized for frequency utilization")
+		}
+	} else {
+		log.Warn().
+			Str("service", config.ServiceName).
+			Msg("TSC_FREQ_MHZ not provided; frequency utilization fields disabled (set TSC_FREQ_MHZ env var)")
+	}
+
 	log.Info().
 		Str("service", config.ServiceName).
 		Int("iteration", config.IterationID).
@@ -165,6 +246,7 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 		Strs("perf_events", config.PerfEvents).
 		Int("expected_samples", int(config.RunDuration/config.WindowInterval)).
 		Bool("stream_mode", ws.streamMode).
+		Bool("msr_freq_enabled", ws.msrReader != nil).
 		Msg("Started windowed sampling")
 	
 	// Start sampling loop
@@ -264,7 +346,9 @@ func (ws *windowedSampler) takeSample() {
 			RequestCount: 0,
 		}
 	}
-	
+
+	freq := ws.readFreqSample(perfDeltas)
+
 	sample := Sample{
 		SampleID:     sampleID,
 		Timestamp:    now,
@@ -272,6 +356,7 @@ func (ws *windowedSampler) takeSample() {
 		PerfCounters: perfCounters,
 		PerfDeltas:   perfDeltas,
 		TimingWindow: timingStats,
+		Freq:         freq,
 	}
 	
 	ws.mu.Lock()
@@ -286,6 +371,54 @@ func (ws *windowedSampler) takeSample() {
 			Int64("offset_ms", sample.OffsetMs).
 			Int("requests", timingStats.RequestCount).
 			Msg("Windowed sample taken")
+	}
+}
+
+// readFreqSample reads MSR-derived per-window frequency utilization, combines
+// it with the perf cycles/ref-cycles ratio, and returns a populated FreqSample.
+// Returns FreqSample{OK:false} if the MSR reader is unavailable, the MSR reads
+// failed this tick, or ref-cycles is missing/zero.
+func (ws *windowedSampler) readFreqSample(perfDeltas map[string]uint64) FreqSample {
+	if ws.msrReader == nil || ws.config.TscFreqMHz <= 0 {
+		return FreqSample{OK: false, TscFreqMHz: ws.config.TscFreqMHz}
+	}
+
+	deltaCycles, hasCycles := perfDeltas["cycles"]
+	if !hasCycles {
+		deltaCycles, hasCycles = perfDeltas["cpu-cycles"]
+	}
+	deltaRef, hasRef := perfDeltas["ref-cycles"]
+	if !hasCycles || !hasRef || deltaRef == 0 {
+		return FreqSample{OK: false, TscFreqMHz: ws.config.TscFreqMHz}
+	}
+
+	var snap C.freq_snapshot_t
+	if rc := C.msr_reader_sample(ws.msrReader, &snap); rc != 0 {
+		return FreqSample{OK: false, TscFreqMHz: ws.config.TscFreqMHz}
+	}
+	if snap.ok == 0 {
+		// First call after init primes state, or some pread failed; ok=false
+		// is the expected and documented behavior, not a hard error.
+		return FreqSample{OK: false, TscFreqMHz: ws.config.TscFreqMHz}
+	}
+
+	tsc := ws.config.TscFreqMHz
+	actual := float64(deltaCycles) / float64(deltaRef) * tsc
+
+	currentMax := uint32(snap.current_max_mhz)
+	var utilPct float64
+	if currentMax > 0 {
+		utilPct = actual / float64(currentMax) * 100.0
+	}
+
+	return FreqSample{
+		OK:            true,
+		ActualFreqMHz: actual,
+		CurrentMaxMHz: currentMax,
+		ActiveN:       int(snap.active_n),
+		FreqUtilPct:   utilPct,
+		TurboOn:       actual > tsc*1.02, // 2% margin over base freq
+		TscFreqMHz:    tsc,
 	}
 }
 
@@ -373,6 +506,12 @@ func (ws *windowedSampler) StopRun() (*RunData, error) {
 	if ws.perfHandle != nil {
 		C.perf_window_cleanup(ws.perfHandle)
 		ws.perfHandle = nil
+	}
+
+	// Cleanup MSR reader (no-op if init failed and ws.msrReader stayed nil)
+	if ws.msrReader != nil {
+		C.msr_reader_free(ws.msrReader)
+		ws.msrReader = nil
 	}
 	
 	// Build run data
@@ -471,8 +610,87 @@ func (ws *windowedSampler) calculateAggregates() *RunAggregates {
 	
 	// Calculate overall timing stats (aggregate across all samples)
 	agg.TimingOverall = ws.aggregateTimingStats()
-	
+
+	// Calculate frequency utilization rollup
+	agg.FreqUtil = ws.aggregateFreqStats()
+
 	return agg
+}
+
+// aggregateFreqStats computes mean / p50 / p99 of freq_util_pct, mean
+// actual_freq, fraction of samples in turbo, and active_n stats. Samples
+// where Freq.OK is false are excluded from numerical means but counted in
+// SamplesWithoutFreq.
+func (ws *windowedSampler) aggregateFreqStats() *FreqUtilStats {
+	stats := &FreqUtilStats{
+		TscFreqMHz:        ws.config.TscFreqMHz,
+		C0ActiveThreshold: ws.config.C0ActiveThreshold,
+	}
+	if len(ws.samples) == 0 {
+		return stats
+	}
+
+	utils := make([]float64, 0, len(ws.samples))
+	var (
+		sumActual    float64
+		sumUtil      float64
+		sumActiveN   int
+		turboCount   int
+		activeNMax   int
+	)
+
+	for _, s := range ws.samples {
+		if !s.Freq.OK {
+			stats.SamplesWithoutFreq++
+			continue
+		}
+		stats.SamplesWithFreq++
+		sumActual += s.Freq.ActualFreqMHz
+		sumUtil += s.Freq.FreqUtilPct
+		sumActiveN += s.Freq.ActiveN
+		if s.Freq.TurboOn {
+			turboCount++
+		}
+		if s.Freq.ActiveN > activeNMax {
+			activeNMax = s.Freq.ActiveN
+		}
+		utils = append(utils, s.Freq.FreqUtilPct)
+	}
+
+	if stats.SamplesWithFreq == 0 {
+		return stats
+	}
+
+	n := float64(stats.SamplesWithFreq)
+	stats.ActualFreqMHzMean = sumActual / n
+	stats.FreqUtilPctMean = sumUtil / n
+	stats.ActiveNMean = float64(sumActiveN) / n
+	stats.ActiveNMax = activeNMax
+	stats.PctSamplesInTurbo = float64(turboCount) / n * 100.0
+
+	sort.Float64s(utils)
+	stats.FreqUtilPctP50 = percentileFloat64(utils, 0.50)
+	stats.FreqUtilPctP99 = percentileFloat64(utils, 0.99)
+
+	return stats
+}
+
+// percentileFloat64 returns a linear-interpolated percentile from a sorted slice.
+func percentileFloat64(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if len(sorted) == 1 {
+		return sorted[0]
+	}
+	rank := p * float64(len(sorted)-1)
+	lo := int(rank)
+	hi := lo + 1
+	if hi >= len(sorted) {
+		return sorted[len(sorted)-1]
+	}
+	frac := rank - float64(lo)
+	return sorted[lo] + (sorted[hi]-sorted[lo])*frac
 }
 
 // aggregateTimingStats computes overall timing statistics

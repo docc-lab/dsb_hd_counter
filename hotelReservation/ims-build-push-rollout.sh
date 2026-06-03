@@ -161,10 +161,14 @@ RUN gcc -c services/perf/perf_api.c -o services/perf/perf_api.o && \\
 RUN gcc -c services/perf/perf_api_windowed.c -o services/perf/perf_api_windowed.o && \\
     ar rcs services/perf/libperf_api_windowed.a services/perf/perf_api_windowed.o
 
+# Build msr_reader static library (per-window CPU freq utilization via MSRs)
+RUN gcc -c services/perf/msr_reader.c -o services/perf/msr_reader.o && \\
+    ar rcs services/perf/libmsr_reader.a services/perf/msr_reader.o
+
 # Build the ${service} service (CGO enabled for perf counters)
-# CRITICAL: Link against libperf_api_windowed for windowed mode to support dynamic PERF_EVENTS
+# CRITICAL: Link against libperf_api_windowed and libmsr_reader for windowed mode
 ENV CGO_ENABLED=1
-ENV CGO_LDFLAGS="-L/workspace/services/perf -lperf_api_windowed"
+ENV CGO_LDFLAGS="-L/workspace/services/perf -lperf_api_windowed -lmsr_reader"
 ENV CGO_CFLAGS="-I/workspace/services/perf"
 RUN GOOS=linux GO111MODULE=on go build -o build/${service} ./cmd/${service}/
 

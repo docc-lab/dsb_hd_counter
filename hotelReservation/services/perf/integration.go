@@ -4,6 +4,7 @@ package perf
 // Services can call SetupWindowedSampling() to initialize both perf counters and timing aggregator
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"strconv"
@@ -39,9 +40,11 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 	// Get perf events from environment
 	perfEventsStr := os.Getenv("PERF_EVENTS")
 	if perfEventsStr == "" {
-		// Default set using only universally available counters
-		// Note: Use uppercase variants to match perf list output convention
-		perfEventsStr = "cycles,instructions,cache-references,cache-misses," +
+		// Default set using only universally available counters.
+		// ref-cycles is required to compute actual_freq (see actual-frequency.md);
+		// it is a fixed counter and consumes zero programmable counter budget.
+		// Note: Use uppercase variants to match perf list output convention.
+		perfEventsStr = "cycles,ref-cycles,instructions,cache-references,cache-misses," +
 			"branch-instructions,branch-misses," +
 			"dTLB-load-misses,iTLB-load-misses," +
 			"page-faults,minor-faults,major-faults," +
@@ -59,16 +62,112 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 		outputDir = "/data"
 	}
 	
+	tscFreqMHz := parseTscFreqMHz()
+	c0Threshold := parseFloatEnv("C0_ACTIVE_THRESHOLD", 0.05)
+	msrRefresh := parseDurationSecondsEnv("MSR_TURBO_REFRESH_EVERY_S", 10*time.Second)
+
 	config := &RunConfig{
-		ServiceName:    serviceName,
-		IterationID:    iterationID,
-		RunDuration:    time.Duration(durationSec) * time.Second,
-		WindowInterval: time.Duration(intervalMs) * time.Millisecond,
-		PerfEvents:     perfEvents,
-		OutputDir:      outputDir,
+		ServiceName:             serviceName,
+		IterationID:             iterationID,
+		RunDuration:             time.Duration(durationSec) * time.Second,
+		WindowInterval:          time.Duration(intervalMs) * time.Millisecond,
+		PerfEvents:              perfEvents,
+		OutputDir:               outputDir,
+		TscFreqMHz:              tscFreqMHz,
+		C0ActiveThreshold:       c0Threshold,
+		MsrTurboRefreshInterval: msrRefresh,
 	}
-	
+
 	return config, nil
+}
+
+// parseTscFreqMHz returns the TSC (= base) frequency in MHz. Prefers the
+// TSC_FREQ_MHZ env var; falls back to /proc/cpuinfo. Returns 0 when neither
+// source produces a usable value, in which case the windowed sampler will
+// emit Freq.OK=false for every sample.
+func parseTscFreqMHz() float64 {
+	if v := os.Getenv("TSC_FREQ_MHZ"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
+		log.Warn().Str("TSC_FREQ_MHZ", v).Msg("invalid TSC_FREQ_MHZ; falling back to /proc/cpuinfo")
+	}
+
+	f, err := os.Open("/proc/cpuinfo")
+	if err != nil {
+		log.Warn().Err(err).Msg("cannot read /proc/cpuinfo for tsc_freq fallback")
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Try "model name : ... @ 2.40GHz" form first (more reliable than
+		// "cpu MHz" which reports the live frequency, not the base).
+		if strings.HasPrefix(line, "model name") {
+			at := strings.Index(line, "@")
+			if at > 0 {
+				rest := strings.TrimSpace(line[at+1:])
+				ghzStr := strings.TrimSuffix(strings.TrimSuffix(rest, "Hz"), "GHz")
+				ghzStr = strings.TrimSuffix(ghzStr, "GHZ")
+				ghzStr = strings.TrimSpace(ghzStr)
+				if ghz, err := strconv.ParseFloat(ghzStr, 64); err == nil && ghz > 0 {
+					return ghz * 1000.0
+				}
+			}
+		}
+	}
+
+	// Re-scan for "cpu MHz" as last resort. This is the live frequency on most
+	// kernels; on hosts without governor scaling it equals the base frequency.
+	if _, err := f.Seek(0, 0); err == nil {
+		scanner = bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "cpu MHz") {
+				colon := strings.Index(line, ":")
+				if colon > 0 {
+					rest := strings.TrimSpace(line[colon+1:])
+					if mhz, err := strconv.ParseFloat(rest, 64); err == nil && mhz > 0 {
+						return mhz
+					}
+				}
+				break
+			}
+		}
+	}
+
+	log.Warn().Msg("could not derive TSC freq from env or /proc/cpuinfo")
+	return 0
+}
+
+// parseFloatEnv returns the float value of the named env var or def.
+func parseFloatEnv(name string, def float64) float64 {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Warn().Str(name, v).Float64("default", def).Err(err).Msg("invalid env value, using default")
+		return def
+	}
+	return f
+}
+
+// parseDurationSecondsEnv reads an integer-seconds env var into a Duration.
+func parseDurationSecondsEnv(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Warn().Str(name, v).Dur("default", def).Msg("invalid env value, using default")
+		return def
+	}
+	return time.Duration(n) * time.Second
 }
 
 // SetupWindowedSampling initializes windowed sampling and timing interceptor
