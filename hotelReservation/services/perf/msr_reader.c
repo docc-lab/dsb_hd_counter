@@ -26,7 +26,17 @@
 #include <sys/stat.h>
 
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
-#define MSR_CORE_C0_RESIDENCY 0x30A
+#define MSR_IA32_MPERF        0xE7   /* free-running counter; ticks at TSC rate
+                                        only while core is in C0. dMPERF/dTSC
+                                        is the canonical "Busy%" used by
+                                        turbostat and the kernel cpufreq
+                                        subsystem. (Not MSR 0x30A, which is
+                                        IA32_FIXED_CTR1 -- the perf cycles
+                                        counter -- and is actively managed
+                                        by perf when our windowed sampler
+                                        attaches `cycles`/`ref-cycles` to
+                                        the proc, so direct reads of 0x30A
+                                        do not reflect C0 residency.) */
 #define MSR_TSC               0x10
 
 #define MSR_BUS_FREQ_MHZ      100  /* Multiplier for turbo ratios on Intel
@@ -42,7 +52,8 @@ struct msr_reader_t {
     int      fds[MSR_READER_MAX_CORES];        /* per-core /dev/cpu/N/msr fd */
     int      n_cores;
 
-    uint64_t prev_c0[MSR_READER_MAX_CORES];    /* last C0 residency per core */
+    uint64_t prev_mperf[MSR_READER_MAX_CORES]; /* last MPERF per core (TSC-rate
+                                                  counter that ticks only in C0) */
     uint64_t prev_tsc;                          /* last TSC (read on cores[0]) */
     int      have_prev;                         /* 0 until first sample primes */
 
@@ -243,7 +254,7 @@ int msr_reader_sample(msr_reader_t *r, freq_snapshot_t *out) {
         }
     }
 
-    uint64_t cur_c0[MSR_READER_MAX_CORES];
+    uint64_t cur_mperf[MSR_READER_MAX_CORES];
     uint64_t cur_tsc = 0;
     int      read_failed = 0;
 
@@ -252,19 +263,19 @@ int msr_reader_sample(msr_reader_t *r, freq_snapshot_t *out) {
     }
 
     for (int i = 0; i < r->n_cores; i++) {
-        cur_c0[i] = 0;
+        cur_mperf[i] = 0;
         if (r->fds[i] < 0) {
             read_failed = 1;
             continue;
         }
-        if (read_msr(r->fds[i], MSR_CORE_C0_RESIDENCY, &cur_c0[i]) != 0) {
+        if (read_msr(r->fds[i], MSR_IA32_MPERF, &cur_mperf[i]) != 0) {
             read_failed = 1;
         }
     }
 
     if (!r->have_prev) {
         /* Prime state. No delta available yet. */
-        memcpy(r->prev_c0, cur_c0, sizeof(uint64_t) * (size_t)r->n_cores);
+        memcpy(r->prev_mperf, cur_mperf, sizeof(uint64_t) * (size_t)r->n_cores);
         r->prev_tsc   = cur_tsc;
         r->have_prev  = 1;
         out->ok       = 0;
@@ -277,16 +288,18 @@ int msr_reader_sample(msr_reader_t *r, freq_snapshot_t *out) {
     int active_n = 0;
     if (tsc_delta > 0 && !read_failed) {
         for (int i = 0; i < r->n_cores; i++) {
-            uint64_t prev = r->prev_c0[i];
-            uint64_t cur  = cur_c0[i];
-            uint64_t dc0  = (cur >= prev) ? (cur - prev) : 0;
-            double busy   = (double)dc0 / (double)tsc_delta;
+            uint64_t prev   = r->prev_mperf[i];
+            uint64_t cur    = cur_mperf[i];
+            uint64_t dmperf = (cur >= prev) ? (cur - prev) : 0;
+            /* MPERF and TSC both tick at base freq; their ratio is exactly
+             * the fraction of the window the core spent in C0. */
+            double busy = (double)dmperf / (double)tsc_delta;
             if (busy > r->c0_threshold) active_n++;
         }
     }
 
     /* Persist state for next window. */
-    memcpy(r->prev_c0, cur_c0, sizeof(uint64_t) * (size_t)r->n_cores);
+    memcpy(r->prev_mperf, cur_mperf, sizeof(uint64_t) * (size_t)r->n_cores);
     r->prev_tsc = cur_tsc;
 
     out->tsc_delta       = tsc_delta;

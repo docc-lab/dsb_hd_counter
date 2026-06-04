@@ -81,18 +81,33 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 	return config, nil
 }
 
-// parseTscFreqMHz returns the TSC (= base) frequency in MHz. Prefers the
-// TSC_FREQ_MHZ env var; falls back to /proc/cpuinfo. Returns 0 when neither
-// source produces a usable value, in which case the windowed sampler will
-// emit Freq.OK=false for every sample.
+// parseTscFreqMHz returns the TSC (= base) frequency in MHz. Sources, in
+// preference order:
+//   1. TSC_FREQ_MHZ env var (operator override)
+//   2. /sys/devices/system/cpu/cpu0/cpufreq/base_frequency (intel_pstate only;
+//      missing on acpi-cpufreq hosts)
+//   3. /proc/cpuinfo "model name : ... @ X.YYGHz" (works on every Intel/AMD
+//      CPU; the @-frequency is the *base* frequency by spec)
+//   4. /proc/cpuinfo "cpu MHz" (LIVE frequency, last resort, unreliable)
+// Returns 0 when no source produces a usable value, in which case the
+// windowed sampler emits Freq.OK=false for every sample.
 func parseTscFreqMHz() float64 {
+	// 1) Operator override
 	if v := os.Getenv("TSC_FREQ_MHZ"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
 			return f
 		}
-		log.Warn().Str("TSC_FREQ_MHZ", v).Msg("invalid TSC_FREQ_MHZ; falling back to /proc/cpuinfo")
+		log.Warn().Str("TSC_FREQ_MHZ", v).Msg("invalid TSC_FREQ_MHZ; trying sysfs/cpuinfo")
 	}
 
+	// 2) intel_pstate sysfs (kHz, exact). On acpi-cpufreq this file is absent.
+	if data, err := os.ReadFile("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency"); err == nil {
+		if khz, perr := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); perr == nil && khz > 0 {
+			return khz / 1000.0
+		}
+	}
+
+	// 3) /proc/cpuinfo "model name : ... @ 2.40GHz" form. Robust suffix parse.
 	f, err := os.Open("/proc/cpuinfo")
 	if err != nil {
 		log.Warn().Err(err).Msg("cannot read /proc/cpuinfo for tsc_freq fallback")
@@ -103,42 +118,61 @@ func parseTscFreqMHz() float64 {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Try "model name : ... @ 2.40GHz" form first (more reliable than
-		// "cpu MHz" which reports the live frequency, not the base).
-		if strings.HasPrefix(line, "model name") {
-			at := strings.Index(line, "@")
-			if at > 0 {
-				rest := strings.TrimSpace(line[at+1:])
-				ghzStr := strings.TrimSuffix(strings.TrimSuffix(rest, "Hz"), "GHz")
-				ghzStr = strings.TrimSuffix(ghzStr, "GHZ")
-				ghzStr = strings.TrimSpace(ghzStr)
-				if ghz, err := strconv.ParseFloat(ghzStr, 64); err == nil && ghz > 0 {
-					return ghz * 1000.0
-				}
-			}
+		if !strings.HasPrefix(line, "model name") {
+			continue
+		}
+		at := strings.Index(line, "@")
+		if at < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(line[at+1:])
+		// Detect unit by suffix (case-insensitive) BEFORE stripping, so we
+		// don't accidentally strip "Hz" off "GHz" and break the number parse.
+		var multToMHz float64
+		var numStr string
+		restLower := strings.ToLower(rest)
+		switch {
+		case strings.HasSuffix(restLower, "ghz"):
+			multToMHz = 1000.0
+			numStr = rest[:len(rest)-3]
+		case strings.HasSuffix(restLower, "mhz"):
+			multToMHz = 1.0
+			numStr = rest[:len(rest)-3]
+		case strings.HasSuffix(restLower, "hz"):
+			multToMHz = 1.0 / 1_000_000.0
+			numStr = rest[:len(rest)-2]
+		default:
+			continue
+		}
+		if v, perr := strconv.ParseFloat(strings.TrimSpace(numStr), 64); perr == nil && v > 0 {
+			return v * multToMHz
 		}
 	}
 
-	// Re-scan for "cpu MHz" as last resort. This is the live frequency on most
-	// kernels; on hosts without governor scaling it equals the base frequency.
+	// 4) Last resort: "cpu MHz" line (LIVE frequency; varies with P-state).
+	// Logged loudly so misleading freq numbers are easy to diagnose.
 	if _, err := f.Seek(0, 0); err == nil {
 		scanner = bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, "cpu MHz") {
-				colon := strings.Index(line, ":")
-				if colon > 0 {
-					rest := strings.TrimSpace(line[colon+1:])
-					if mhz, err := strconv.ParseFloat(rest, 64); err == nil && mhz > 0 {
-						return mhz
-					}
-				}
-				break
+			if !strings.HasPrefix(line, "cpu MHz") {
+				continue
 			}
+			colon := strings.Index(line, ":")
+			if colon <= 0 {
+				continue
+			}
+			rest := strings.TrimSpace(line[colon+1:])
+			if mhz, perr := strconv.ParseFloat(rest, 64); perr == nil && mhz > 0 {
+				log.Warn().Float64("cpu_mhz_live", mhz).
+					Msg("falling back to /proc/cpuinfo 'cpu MHz' (LIVE freq, not base); set TSC_FREQ_MHZ env to fix")
+				return mhz
+			}
+			break
 		}
 	}
 
-	log.Warn().Msg("could not derive TSC freq from env or /proc/cpuinfo")
+	log.Warn().Msg("could not derive TSC freq from env, sysfs, or /proc/cpuinfo")
 	return 0
 }
 
