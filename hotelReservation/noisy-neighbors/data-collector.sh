@@ -611,19 +611,26 @@ apply_freq_util_env() {
 }
 
 # apply_msr_pod_capabilities: idempotently patch a deployment so the pod can
-# pread() MSRs from inside the container. Three things must hold:
-#   1) container has CAP_SYS_RAWIO  (kernel capability check)
-#   2) /dev/cpu hostPath mount      (so /dev/cpu/N/msr is reachable)
-#   3) AppArmor profile is Unconfined for the container (otherwise the
-#      runtime-default 'docker-default' profile silently blocks the open
-#      with EPERM, even when caps + uid + file mode all permit it).
+# pread() MSRs from inside the container. Four things must hold:
+#   1) /dev/cpu hostPath mount         (so /dev/cpu/N/msr is reachable)
+#   2) container has CAP_SYS_RAWIO     (kernel capability check)
+#   3) AppArmor profile is Unconfined  (otherwise the runtime-default
+#      'docker-default' profile silently blocks the open with EPERM)
+#   4) container is privileged         (definitive bypass for AppArmor +
+#      device-cgroup checks; also a backstop for the K8s 1.25 + Ubuntu
+#      containerd combo where the beta AppArmor annotation is recorded
+#      in the OCI spec but, for unknown reasons, doesn't take effect at
+#      process startup -- empirically observed even when /proc/1/attr/current
+#      reports unconfined and a kubectl-exec'd `dd` succeeds)
+# (1)-(3) remain in place as defense in depth and self-documentation; (4)
+# is what actually unblocks MSR opens at process start on this cluster.
 # Safe to call repeatedly: re-applying the patches on a deployment that
 # already has them is a no-op for kubectl.
 apply_msr_pod_capabilities() {
     local service="$1"
     local exp_dir="$2"
 
-    log "$exp_dir" "  Adding CAP_SYS_RAWIO + /dev/cpu hostPath + AppArmor unconfined to $service deployment"
+    log "$exp_dir" "  Configuring $service for in-pod MSR access (privileged + CAP_SYS_RAWIO + /dev/cpu hostPath + AppArmor unconfined)"
 
     # 1) Add SYS_RAWIO capability if not already present.
     local existing_caps
@@ -686,6 +693,23 @@ apply_msr_pod_capabilities() {
           }}}}
         }" >> "$exp_dir/logs/collector.log" 2>&1 || {
             log "$exp_dir" "    WARNING: failed to set AppArmor unconfined annotation for $container_name"
+        }
+    fi
+
+    # 4) Set securityContext.privileged = true. This is the empirically
+    #    required step: caps + AppArmor unconfined alone don't make
+    #    /dev/cpu/N/msr openable at process startup on K8s 1.25 + Ubuntu
+    #    22.04 containerd. Privileged bypasses AppArmor and device-cgroup
+    #    checks at the kernel level, which makes the C-side msr_reader_init
+    #    succeed reliably.
+    local existing_privileged
+    existing_privileged=$(kubectl get deployment "$service" \
+        -o jsonpath='{.spec.template.spec.containers[0].securityContext.privileged}' 2>/dev/null || echo "")
+    if [[ "$existing_privileged" != "true" ]]; then
+        kubectl patch deployment "$service" --type='json' -p='[
+          {"op":"add","path":"/spec/template/spec/containers/0/securityContext/privileged","value":true}
+        ]' >> "$exp_dir/logs/collector.log" 2>&1 || {
+            log "$exp_dir" "    WARNING: failed to set privileged=true (cluster's PodSecurityAdmission may forbid it; freq fields will then stay ok=false)"
         }
     fi
 
