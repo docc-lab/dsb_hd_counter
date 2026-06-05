@@ -32,6 +32,12 @@ type TimingConfig struct {
 	EnableWindowed     bool          // Enable windowed batching mode
 	WindowInterval     time.Duration // Window interval for batching (e.g., 100ms)
 	WindowStatsChannel chan *WindowTimingStats // Channel to send window stats
+
+	// Horizons for the trailing sliding-window arrival-rate smoothers
+	// emitted on every WindowTimingStats. Zero means "use library default"
+	// (1 s for T1, 3 s for T2). See arrival-rate notes in plan.
+	ArrivalRpsT1 time.Duration
+	ArrivalRpsT2 time.Duration
 }
 
 // TimingData represents a single timing measurement
@@ -47,9 +53,21 @@ type TimingData struct {
 }
 
 // WindowTimingStats captures timing data for requests in one window interval
+//
+// ArrivalRps1s / ArrivalRps3s are trailing sliding-window arrival rates
+// (req/s) over the last 1 s and 3 s respectively. They are computed inside
+// the timing aggregator on every window flush so the smoother sees every
+// window even if the downstream stats channel drops, and are unbiased
+// estimators of the true arrival rate over their respective horizons (i.e.
+// "how many requests per second arrived in the last T seconds"). During the
+// first T seconds of a run, the smoother divides by elapsed time so far so
+// the value is unbiased on partial buffers (option b in the design notes).
+// See arrival-rate.md for the noise/bias derivation.
 type WindowTimingStats struct {
 	ArrivalCount   int                 `json:"arrival_count"`   // Requests that arrived in this window (sampled at window boundary)
 	RequestCount   int                 `json:"request_count"`   // Requests that completed in this window
+	ArrivalRps1s   float64             `json:"arrival_rps_1s"`  // Trailing 1 s sliding-window arrival rate (req/s)
+	ArrivalRps3s   float64             `json:"arrival_rps_3s"`  // Trailing 3 s sliding-window arrival rate (req/s)
 	ProcessingTime WindowDurationStats `json:"processing_time"`
 	TotalTime      WindowDurationStats `json:"total_time"`
 	BlockingTime   WindowDurationStats `json:"blocking_time"`

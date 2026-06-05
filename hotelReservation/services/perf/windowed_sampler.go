@@ -47,6 +47,14 @@ type RunConfig struct {
 	TscFreqMHz             float64       // CPU TSC frequency (= base frequency); read from env or /proc/cpuinfo
 	C0ActiveThreshold      float64       // Fraction in [0,1] above which a core counts as active (default 0.05)
 	MsrTurboRefreshInterval time.Duration // How often to re-read MSR 0x1AD (default 10s)
+
+	// Trailing sliding-window arrival-rate horizons. Each WindowTimingStats
+	// emitted on the timing channel will carry an ArrivalRpsT1 / ArrivalRpsT2
+	// field smoothed over these horizons. Zero -> library default
+	// (1 s for T1, 3 s for T2). Operators can override via ARRIVAL_RPS_T1_SEC
+	// and ARRIVAL_RPS_T2_SEC env vars (parsed in integration.go).
+	ArrivalRpsT1 time.Duration
+	ArrivalRpsT2 time.Duration
 }
 
 // Sample represents one snapshot at a window boundary
@@ -101,6 +109,27 @@ type RunAggregates struct {
 	PerfRate      map[string]float64 `json:"perf_rate"`    // Events per second
 	TimingOverall *DurationStats     `json:"timing_overall"` // Overall timing stats
 	FreqUtil      *FreqUtilStats     `json:"freq_util"`    // Frequency utilization rollup
+	ArrivalRate   *ArrivalRateStats  `json:"arrival_rate"` // Sliding-window arrival rate rollup (T1, T2)
+}
+
+// ArrivalRateStats aggregates the per-sample sliding-window arrival rate
+// (ArrivalRps1s, ArrivalRps3s on each sample's TimingWindow) across an
+// entire run. The horizons are echoed back from the resolved smoother
+// configuration so consumers don't have to re-derive them from env vars.
+//
+// Mean / p50 / p99 are computed across all samples that have a non-nil
+// TimingWindow. Bootstrap windows (first ~T seconds of the run) ARE included
+// — they're unbiased estimates over a shorter elapsed window, not garbage.
+type ArrivalRateStats struct {
+	HorizonT1Sec float64 `json:"horizon_t1_sec"`
+	HorizonT2Sec float64 `json:"horizon_t2_sec"`
+	Rps1sMean    float64 `json:"rps_1s_mean"`
+	Rps1sP50     float64 `json:"rps_1s_p50"`
+	Rps1sP99     float64 `json:"rps_1s_p99"`
+	Rps3sMean    float64 `json:"rps_3s_mean"`
+	Rps3sP50     float64 `json:"rps_3s_p50"`
+	Rps3sP99     float64 `json:"rps_3s_p99"`
+	SampleCount  int     `json:"sample_count"`
 }
 
 // FreqUtilStats provides aggregated frequency utilization stats across a run.
@@ -614,6 +643,9 @@ func (ws *windowedSampler) calculateAggregates() *RunAggregates {
 	// Calculate frequency utilization rollup
 	agg.FreqUtil = ws.aggregateFreqStats()
 
+	// Calculate arrival-rate rollup
+	agg.ArrivalRate = ws.aggregateArrivalRateStats()
+
 	return agg
 }
 
@@ -671,6 +703,56 @@ func (ws *windowedSampler) aggregateFreqStats() *FreqUtilStats {
 	sort.Float64s(utils)
 	stats.FreqUtilPctP50 = percentileFloat64(utils, 0.50)
 	stats.FreqUtilPctP99 = percentileFloat64(utils, 0.99)
+
+	return stats
+}
+
+// aggregateArrivalRateStats computes mean / p50 / p99 of the trailing
+// sliding-window arrival rates across the run. Samples without a
+// TimingWindow (which should not happen in practice — takeSample always
+// supplies one) are skipped.
+//
+// The horizons are echoed from the run's RunConfig. They're populated from
+// integration.ParseWindowedSamplingConfig (env-var-driven), and propagated
+// into the timing aggregator's smoothers, so this is the canonical source.
+func (ws *windowedSampler) aggregateArrivalRateStats() *ArrivalRateStats {
+	stats := &ArrivalRateStats{
+		HorizonT1Sec: ws.config.ArrivalRpsT1.Seconds(),
+		HorizonT2Sec: ws.config.ArrivalRpsT2.Seconds(),
+	}
+	if len(ws.samples) == 0 {
+		return stats
+	}
+
+	rps1 := make([]float64, 0, len(ws.samples))
+	rps3 := make([]float64, 0, len(ws.samples))
+	var sum1, sum3 float64
+
+	for _, s := range ws.samples {
+		if s.TimingWindow == nil {
+			continue
+		}
+		stats.SampleCount++
+		sum1 += s.TimingWindow.ArrivalRps1s
+		sum3 += s.TimingWindow.ArrivalRps3s
+		rps1 = append(rps1, s.TimingWindow.ArrivalRps1s)
+		rps3 = append(rps3, s.TimingWindow.ArrivalRps3s)
+	}
+
+	if stats.SampleCount == 0 {
+		return stats
+	}
+
+	n := float64(stats.SampleCount)
+	stats.Rps1sMean = sum1 / n
+	stats.Rps3sMean = sum3 / n
+
+	sort.Float64s(rps1)
+	sort.Float64s(rps3)
+	stats.Rps1sP50 = percentileFloat64(rps1, 0.50)
+	stats.Rps1sP99 = percentileFloat64(rps1, 0.99)
+	stats.Rps3sP50 = percentileFloat64(rps3, 0.50)
+	stats.Rps3sP99 = percentileFloat64(rps3, 0.99)
 
 	return stats
 }

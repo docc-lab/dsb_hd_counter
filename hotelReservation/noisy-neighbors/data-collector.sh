@@ -2680,6 +2680,7 @@ for iter_num in range(1, total_iterations + 1):
                 data = json.load(f)
                 aggs = data.get("aggregates", {}) or {}
                 fu = aggs.get("freq_util") or {}
+                ar = aggs.get("arrival_rate") or {}
                 runs.append({
                     "iteration_id": data.get("iteration_id", iter_num),
                     "run_file": os.path.basename(run_file),
@@ -2700,6 +2701,17 @@ for iter_num in range(1, total_iterations + 1):
                         "active_n_max": fu.get("active_n_max", 0),
                         "tsc_freq_mhz": fu.get("tsc_freq_mhz", 0),
                         "c0_active_threshold": fu.get("c0_active_threshold", 0),
+                    },
+                    "arrival_rate": {
+                        "horizon_t1_sec": ar.get("horizon_t1_sec", 0),
+                        "horizon_t2_sec": ar.get("horizon_t2_sec", 0),
+                        "rps_1s_mean":    ar.get("rps_1s_mean", 0),
+                        "rps_1s_p50":     ar.get("rps_1s_p50", 0),
+                        "rps_1s_p99":     ar.get("rps_1s_p99", 0),
+                        "rps_3s_mean":    ar.get("rps_3s_mean", 0),
+                        "rps_3s_p50":     ar.get("rps_3s_p50", 0),
+                        "rps_3s_p99":     ar.get("rps_3s_p99", 0),
+                        "sample_count":   ar.get("sample_count", 0),
                     },
                 })
         except Exception as e:
@@ -2739,6 +2751,29 @@ freq_util_summary = {
     "c0_active_threshold":   fu_runs[0]["c0_active_threshold"] if fu_runs else 0,
 }
 
+# Arrival-rate (sliding-window) rollup across iterations. Iterations with no
+# samples_with_freq don't disqualify them here — arrival rate doesn't depend
+# on MSR success — so we include any iteration whose arrival_rate.sample_count
+# is non-zero.
+ar_runs = [r["arrival_rate"] for r in runs if r["arrival_rate"]["sample_count"] > 0]
+def _ar_mean(key):
+    if not ar_runs:
+        return 0
+    return sum(r[key] for r in ar_runs) / len(ar_runs)
+
+arrival_rate_summary = {
+    "iterations_with_data":   len(ar_runs),
+    "horizon_t1_sec":         ar_runs[0]["horizon_t1_sec"] if ar_runs else 0,
+    "horizon_t2_sec":         ar_runs[0]["horizon_t2_sec"] if ar_runs else 0,
+    "total_samples":          sum(r["arrival_rate"]["sample_count"] for r in runs),
+    "rps_1s_mean":            _ar_mean("rps_1s_mean"),
+    "rps_1s_p50":             _ar_mean("rps_1s_p50"),
+    "rps_1s_p99":             _ar_mean("rps_1s_p99"),
+    "rps_3s_mean":            _ar_mean("rps_3s_mean"),
+    "rps_3s_p50":             _ar_mean("rps_3s_p50"),
+    "rps_3s_p99":             _ar_mean("rps_3s_p99"),
+}
+
 experiment_summary = {
     "service_name": service,
     "total_iterations": len(runs),
@@ -2751,6 +2786,7 @@ experiment_summary = {
         "instructions_mean": instructions_mean,
         "ipc_mean": instructions_mean / cycles_mean if cycles_mean > 0 else 0,
         "freq_util": freq_util_summary,
+        "arrival_rate": arrival_rate_summary,
     }
 }
 

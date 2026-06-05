@@ -66,6 +66,12 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 	c0Threshold := parseFloatEnv("C0_ACTIVE_THRESHOLD", 0.05)
 	msrRefresh := parseDurationSecondsEnv("MSR_TURBO_REFRESH_EVERY_S", 10*time.Second)
 
+	// Trailing sliding-window arrival-rate horizons. Defaults are 1.0 s and
+	// 3.0 s; operators can tune via ARRIVAL_RPS_T1_SEC / ARRIVAL_RPS_T2_SEC.
+	// See timing_interceptor_ringbuffer.go arrivalRateSmoother for semantics.
+	arrivalRpsT1 := parseFloatEnv("ARRIVAL_RPS_T1_SEC", 1.0)
+	arrivalRpsT2 := parseFloatEnv("ARRIVAL_RPS_T2_SEC", 3.0)
+
 	config := &RunConfig{
 		ServiceName:             serviceName,
 		IterationID:             iterationID,
@@ -76,6 +82,8 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 		TscFreqMHz:              tscFreqMHz,
 		C0ActiveThreshold:       c0Threshold,
 		MsrTurboRefreshInterval: msrRefresh,
+		ArrivalRpsT1:            time.Duration(arrivalRpsT1 * float64(time.Second)),
+		ArrivalRpsT2:            time.Duration(arrivalRpsT2 * float64(time.Second)),
 	}
 
 	return config, nil
@@ -228,6 +236,8 @@ func SetupWindowedSampling(serviceName string, iterationID int) (WindowedSampler
 		EnableWindowed:     true,
 		WindowInterval:     config.WindowInterval,
 		WindowStatsChannel: timingStatsChannel,
+		ArrivalRpsT1:       config.ArrivalRpsT1,
+		ArrivalRpsT2:       config.ArrivalRpsT2,
 	}
 	
 	// Create ring buffer aggregator for high-performance timing collection
@@ -277,6 +287,8 @@ func SetupContinuousSampling(serviceName string, iterationID int) (WindowedSampl
 		EnableWindowed:     true,
 		WindowInterval:     config.WindowInterval,
 		WindowStatsChannel: timingStatsChannel,
+		ArrivalRpsT1:       config.ArrivalRpsT1,
+		ArrivalRpsT2:       config.ArrivalRpsT2,
 	}
 	timingAgg := interceptor.NewRingBufferTimingAggregator(timingConfig)
 	
