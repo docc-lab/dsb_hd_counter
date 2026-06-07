@@ -1140,6 +1140,72 @@ cleanup_existing_stress_pods() {
     log "$exp_dir" "Stress pod cleanup completed"
 }
 
+# Reap orphan ReplicaSets and stuck pods for the given services. Symptom we
+# defend against: a previous run patched a victim deployment (e.g. for MSR
+# /dev/cpu mounts) and a resulting pod got stuck in ContainerCreating on a
+# node that lacks the host requirement. The deployment controller normally
+# scales the old ReplicaSet to 0 during a rollout, but kubelet treats a
+# wedged ContainerCreating pod as "still being born" rather than terminating
+# it, so the old ReplicaSet keeps spec.replicas > 0 indefinitely and blocks
+# clean scheduling of the new spec. We:
+#   1) Force-delete any non-Running pods for the service (frees kubelet).
+#   2) Identify the current (latest deployment revision) ReplicaSet.
+#   3) Scale any OTHER ReplicaSet for the service with spec.replicas > 0
+#      down to 0 so only the current spec is in play.
+# Idempotent and safe to call when nothing is wrong.
+reap_orphan_replicasets() {
+    local services="$1"
+    local exp_dir="$2"
+
+    [[ -z "$services" ]] && return 0
+
+    log "$exp_dir" "Reaping orphan ReplicaSets for victim services: $services"
+
+    for service in $services; do
+        if ! kubectl get deployment "$service" -n default &>/dev/null; then
+            continue
+        fi
+
+        # 1) Force-delete pods stuck off-Running. A 22h stuck ContainerCreating
+        #    won't terminate gracefully because kubelet is looping on the mount.
+        local stuck_pods
+        stuck_pods=$(kubectl get pods -n default -l io.kompose.service="$service" \
+            --field-selector=status.phase!=Running -o name 2>/dev/null || true)
+        if [[ -n "$stuck_pods" ]]; then
+            while read -r pod; do
+                [[ -z "$pod" ]] && continue
+                log "$exp_dir" "  Force-deleting stuck pod $pod"
+                kubectl delete "$pod" -n default --grace-period=0 --force \
+                    >> "$exp_dir/logs/collector.log" 2>&1 || true
+            done <<< "$stuck_pods"
+        fi
+
+        # 2) Find the current ReplicaSet (highest deployment revision annotation).
+        local current_rs
+        current_rs=$(kubectl get rs -n default -l io.kompose.service="$service" \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
+            2>/dev/null | sort -k2 -n | tail -n1 | awk '{print $1}')
+
+        if [[ -z "$current_rs" ]]; then
+            continue
+        fi
+
+        # 3) Scale down every other RS that still claims replicas > 0.
+        local orphans
+        orphans=$(kubectl get rs -n default -l io.kompose.service="$service" \
+            -o jsonpath='{range .items[?(@.spec.replicas>0)]}{.metadata.name}{"\n"}{end}' \
+            2>/dev/null | grep -v "^${current_rs}$" || true)
+        if [[ -n "$orphans" ]]; then
+            while read -r rs; do
+                [[ -z "$rs" ]] && continue
+                log "$exp_dir" "  Scaling orphan ReplicaSet $rs to 0 (current is $current_rs)"
+                kubectl scale rs "$rs" -n default --replicas=0 \
+                    >> "$exp_dir/logs/collector.log" 2>&1 || true
+            done <<< "$orphans"
+        fi
+    done
+}
+
 # Check and untolerate existing pods on target node
 check_and_untolerate_pods() {
     local target_node="$1"
@@ -1156,6 +1222,25 @@ check_and_untolerate_pods() {
     if [[ -n "$deployments" ]]; then
         while read -r deployment; do
             if [[ -n "$deployment" ]]; then
+                # Victim services are MEANT to live on $target_node (deploy_victim_services
+                # re-pins them there immediately after this function runs). Untolerating
+                # them here patches the deployment with anti-affinity NotIn $target_node,
+                # and if any failure interrupts the pipeline between this call and
+                # deploy_victim_services, the victim is left stranded off-target and its
+                # pods get scheduled on nodes without /dev/cpu, wedging forever in
+                # ContainerCreating. Skip victims to make the operation idempotent.
+                local is_victim=false
+                for _victim in ${VICTIM_SERVICES:-}; do
+                    if [[ "$deployment" == "$_victim" ]]; then
+                        is_victim=true
+                        break
+                    fi
+                done
+                if [[ "$is_victim" == "true" ]]; then
+                    log "$exp_dir" "  Skipping victim service '$deployment' (stays on $target_node; deploy_victim_services will pin it)"
+                    continue
+                fi
+
                 # Check if this deployment has pods on the target node
                 # Try both common label patterns: app= and io.kompose.service=
                 local pods_on_node=$(kubectl get pods -n default -l io.kompose.service="$deployment" --field-selector=spec.nodeName="$target_node" -o name 2>/dev/null | wc -l)
@@ -1950,12 +2035,70 @@ refresh_consul_service_discovery() {
     log "$exp_dir" "Consul service discovery refresh completed"
 }
 
+# Deregister stale srv-* entries from Consul whose backing pod IP is no
+# longer alive in the cluster. Symptom we defend against: repeated failed
+# runs leave hundreds of stale srv-search registrations in Consul; the
+# frontend then load-balances over dead IPs and the hotels probe returns
+# HTTP 500 even though the live search pod is healthy. Idempotent.
+clean_stale_consul_services() {
+    local exp_dir="$1"
+
+    local consul_pod
+    consul_pod=$(kubectl get pods -l io.kompose.service=consul \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$consul_pod" ]]; then
+        log "$exp_dir" "  No Consul pod found; skipping stale-registration sweep"
+        return 0
+    fi
+
+    local current_ips
+    current_ips=$(kubectl get pods -o wide --no-headers 2>/dev/null | awk '{print $6}' | tr '\n' ' ')
+    if [[ -z "$current_ips" ]]; then
+        log "$exp_dir" "  Could not enumerate current pod IPs; skipping stale-registration sweep"
+        return 0
+    fi
+
+    local stale_ids
+    stale_ids=$(kubectl exec "$consul_pod" -- curl -s http://localhost:8500/v1/agent/services 2>/dev/null \
+        | python3 -c "
+import sys, json
+current_ips = set('''$current_ips'''.split())
+try:
+    services = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for sid, svc in services.items():
+    if str(svc.get('Service','')).startswith('srv-') and svc.get('Address','') not in current_ips:
+        print(sid)
+" 2>/dev/null)
+
+    if [[ -z "$stale_ids" ]]; then
+        log "$exp_dir" "  No stale Consul registrations found"
+        return 0
+    fi
+
+    local count
+    count=$(echo "$stale_ids" | wc -l)
+    log "$exp_dir" "  Deregistering $count stale Consul srv-* entr$([[ $count -eq 1 ]] && echo y || echo ies)"
+    while read -r sid; do
+        [[ -z "$sid" ]] && continue
+        kubectl exec "$consul_pod" -- consul services deregister -id="$sid" \
+            >> "$exp_dir/logs/collector.log" 2>&1 || true
+    done <<< "$stale_ids"
+}
+
 # Comprehensive system readiness validation
 validate_system_readiness() {
     local exp_dir="$1"
     
     log "$exp_dir" "=== COMPREHENSIVE SYSTEM READINESS VALIDATION ==="
-    
+
+    # Sweep dead srv-* registrations before counting / probing — otherwise
+    # the catalog count is inflated and the frontend may load-balance to a
+    # stale IP and we'll see HTTP 500 on the hotels probe even though the
+    # live search pod is healthy.
+    clean_stale_consul_services "$exp_dir"
+
     local validation_failed=false
     
     # 1. Validate all expected services are running
@@ -3047,7 +3190,12 @@ run_experiment() {
     
     # Clean up any pending pods that might be stuck
     cleanup_pending_pods "$exp_dir"
-    
+
+    # Reap any orphan ReplicaSets / wedged pods left over from a previous
+    # failed run before we start patching deployments (otherwise the new
+    # rollout will race with stale ReplicaSets that still claim replicas).
+    reap_orphan_replicasets "$VICTIM_SERVICES" "$exp_dir"
+
     # Remove any existing anti-affinity rules that might be causing issues
     log "$exp_dir" "Removing any existing anti-affinity rules from all deployments..."
     local all_deployments=$(kubectl get deployments -n default -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')
