@@ -23,14 +23,22 @@
 #
 #   TARGET_NODE defaults to node-3 (matches your current configs).
 #
+# Env vars:
+#   VICTIM_SERVICES="search frontend"   # whitespace-sep list of victim services
+#                                       # used by your configs. Orphan ReplicaSets
+#                                       # / stale Consul entries for THESE are
+#                                       # auto-healed by data-collector.sh and
+#                                       # demoted from FAIL to WARN here.
+#
 # Exit codes:
-#   0 = all checks passed
+#   0 = all checks passed (warnings are OK)
 #   1 = one or more checks failed (see PASS/FAIL summary at the end)
 # ===========================================================================
 
 set -u
 
 TARGET_NODE="${1:-node-3}"
+VICTIM_SERVICES="${VICTIM_SERVICES:-search}"
 
 # Color helpers; degrade gracefully when not a TTY.
 if [[ -t 1 ]]; then
@@ -132,8 +140,20 @@ fi
 # ---------------------------------------------------------------------------
 hdr "5. No orphan ReplicaSets"
 # For each deployment in default ns, count RSes whose spec.replicas > 0.
-# A healthy deployment has exactly 1.
-ORPHAN_REPORT=()
+# A healthy deployment has exactly 1. Orphans for victim services (search,
+# frontend, ...) are auto-healed by reap_orphan_replicasets at the top of
+# every data-collector.sh run, so demote those to WARN. Orphans for any
+# OTHER deployment indicate a real cluster-controller issue that won't
+# self-heal -- keep those as FAIL.
+ORPHAN_REPORT_FAIL=()
+ORPHAN_REPORT_WARN=()
+is_victim() {
+    local name="$1"
+    for v in $VICTIM_SERVICES; do
+        [[ "$name" == "$v" ]] && return 0
+    done
+    return 1
+}
 while read -r dep; do
     [[ -z "$dep" ]] && continue
     ACTIVE_RS=$(kubectl get rs -n default -l io.kompose.service="$dep" \
@@ -145,16 +165,22 @@ while read -r dep; do
     fi
     RS_COUNT=$(echo "$ACTIVE_RS" | wc -w)
     if (( RS_COUNT > 1 )); then
-        ORPHAN_REPORT+=("$dep has $RS_COUNT active ReplicaSets: $ACTIVE_RS")
+        if is_victim "$dep"; then
+            ORPHAN_REPORT_WARN+=("$dep has $RS_COUNT active ReplicaSets: $ACTIVE_RS")
+        else
+            ORPHAN_REPORT_FAIL+=("$dep has $RS_COUNT active ReplicaSets: $ACTIVE_RS")
+        fi
     fi
 done < <(kubectl get deployments -n default -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
-if [[ ${#ORPHAN_REPORT[@]} -eq 0 ]]; then
+if [[ ${#ORPHAN_REPORT_FAIL[@]} -eq 0 && ${#ORPHAN_REPORT_WARN[@]} -eq 0 ]]; then
     pass "Every deployment has exactly one active ReplicaSet"
 else
-    for line in "${ORPHAN_REPORT[@]}"; do
-        fail "$line"
+    for line in "${ORPHAN_REPORT_WARN[@]}"; do
+        warn "$line (auto-healed by data-collector.sh::reap_orphan_replicasets)"
     done
-    echo "         (data-collector.sh::reap_orphan_replicasets will clean these on next run)"
+    for line in "${ORPHAN_REPORT_FAIL[@]}"; do
+        fail "$line (non-victim deployment; the reaper does NOT touch this)"
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -210,8 +236,11 @@ print(n)
     if [[ "$STALE_COUNT" -eq 0 ]]; then
         pass "No stale srv-* registrations"
     else
-        fail "$STALE_COUNT stale srv-* registrations in Consul"
-        echo "         (data-collector.sh::clean_stale_consul_services will purge these inside validation)"
+        # Self-healing: data-collector.sh::clean_stale_consul_services runs
+        # inside validate_system_readiness on every experiment. Surface this
+        # as a WARN so the operator can see it accumulated, but don't block
+        # the batch.
+        warn "$STALE_COUNT stale srv-* registrations in Consul (will be purged by next experiment's validation step)"
     fi
 fi
 
