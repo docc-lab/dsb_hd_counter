@@ -1,0 +1,251 @@
+#!/bin/bash
+# ===========================================================================
+# extract-failed-exps.sh
+#
+# Scan an experiment_data/ tree produced by data-collector.sh and print the
+# setup that was used for each FAILED experiment, then try to match that
+# setup back to a config file in a configs/ directory.
+#
+# An experiment is classified as:
+#   ok       -> metadata/validation_success.txt exists
+#   failed   -> metadata/validation_failure.txt exists
+#   aborted  -> neither file exists (died before validation finished)
+#
+# For failed + aborted runs we dump the key fields from metadata/experiment.json
+# (EXPERIMENT_NAME, TARGET_NODE, VICTIM_SERVICES, NOISY_NEIGHBOR_*, contention
+# shape / burst info, ITERATIONS, WRK2_*) and grep configs/*.conf (and *.sh) for
+# a matching EXPERIMENT_NAME so you can tell which config file fed each run.
+#
+# Usage:
+#   ./extract-failed-exps.sh [EXPERIMENT_DATA_DIR] [CONFIGS_DIR]
+#
+# Defaults:
+#   EXPERIMENT_DATA_DIR = ./experiment_data
+#   CONFIGS_DIR         = ./configs
+#
+# Flags (env vars):
+#   INCLUDE_OK=1   Also print successful experiments (useful as a sanity check).
+#   ONLY=<id>      Only operate on experiments whose dir name contains <id>.
+# ===========================================================================
+
+set -u
+
+EXP_ROOT="${1:-./experiment_data}"
+CFG_ROOT="${2:-./configs}"
+
+if [[ ! -d "$EXP_ROOT" ]]; then
+    echo "ERROR: experiment data dir not found: $EXP_ROOT" >&2
+    exit 1
+fi
+
+have_configs=1
+if [[ ! -d "$CFG_ROOT" ]]; then
+    echo "WARNING: configs dir not found: $CFG_ROOT (skipping config matching)" >&2
+    have_configs=0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 is required" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Pull the fields we care about out of experiment.json. We print them as
+# TAB-separated key=value pairs so the bash wrapper can grep/show them
+# without a JSON parser of its own. Missing fields -> empty string.
+# ---------------------------------------------------------------------------
+extract_json() {
+    local json_file="$1"
+    python3 - "$json_file" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception as e:
+    print(f"__ERROR__\t{e}")
+    sys.exit(0)
+
+cfg = d.get("configuration", {}) or {}
+nn  = cfg.get("noisy_neighbor", {}) or {}
+wrk = cfg.get("wrk2_config", {}) or {}
+bur = cfg.get("contention_bursts", {}) or {}
+
+fields = [
+    ("experiment_id",      d.get("experiment_id", "")),
+    ("experiment_name",    d.get("experiment_name", "")),
+    ("timestamp",          d.get("timestamp", "")),
+    ("contention_model",   d.get("contention_model", "")),
+    ("target_node",        cfg.get("target_node", "")),
+    ("victim_services",    cfg.get("victim_services", "")),
+    ("iterations",         cfg.get("iterations", "")),
+    ("iteration_delay",    cfg.get("iteration_delay", "")),
+    ("nn_type",            nn.get("type", "")),
+    ("nn_args",            nn.get("args", "")),
+    ("burst_shape",        bur.get("shape", "")),
+    ("burst_shape_args",   bur.get("shape_args", "")),
+    ("burst_randomize",    bur.get("randomize", "")),
+    ("burst_random_seed",  bur.get("random_seed", "")),
+    ("experiment_duration", cfg.get("experiment_duration", "")),
+    ("wrk2_target_service", wrk.get("target_service", "")),
+    ("wrk2_target_ip",     wrk.get("target_ip", "")),
+    ("wrk2_target_port",   wrk.get("target_port", "")),
+    ("wrk2_script",        wrk.get("script", "")),
+    ("wrk2_rate",          wrk.get("rate", "")),
+    ("wrk2_threads",       wrk.get("threads", "")),
+    ("wrk2_connections",   wrk.get("connections", "")),
+]
+for k, v in fields:
+    print(f"{k}\t{v}")
+PY
+}
+
+# Look up the value for a TAB-separated key=value blob produced by extract_json.
+get_field() {
+    local blob="$1" key="$2"
+    awk -F '\t' -v k="$key" '$1 == k {print $2; exit}' <<<"$blob"
+}
+
+# Find configs whose EXPERIMENT_NAME (assigned via bash `EXPERIMENT_NAME=...`)
+# matches the value pulled from experiment.json. Falls back to NOISY_NEIGHBOR_TYPE
+# + TARGET_NODE + VICTIM_SERVICES if name doesn't match.
+match_config() {
+    local exp_name="$1" nn_type="$2" target_node="$3" victims="$4"
+
+    [[ $have_configs -eq 0 ]] && { echo ""; return; }
+
+    local matches=()
+    if [[ -n "$exp_name" ]]; then
+        while IFS= read -r f; do
+            matches+=("$f")
+        done < <(grep -rlF "EXPERIMENT_NAME='${exp_name}'" "$CFG_ROOT" 2>/dev/null; \
+                 grep -rlF "EXPERIMENT_NAME=\"${exp_name}\"" "$CFG_ROOT" 2>/dev/null)
+    fi
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        while IFS= read -r f; do
+            if grep -qE "NOISY_NEIGHBOR_TYPE=['\"]?${nn_type}['\"]?" "$f" 2>/dev/null && \
+               grep -qE "TARGET_NODE=['\"]?${target_node}['\"]?"     "$f" 2>/dev/null && \
+               grep -qF "VICTIM_SERVICES='${victims}'"               "$f" 2>/dev/null; then
+                matches+=("$f")
+            fi
+        done < <(find "$CFG_ROOT" -type f \( -name '*.conf' -o -name '*.sh' \) 2>/dev/null)
+    fi
+
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        # de-dup
+        printf '%s\n' "${matches[@]}" | awk '!seen[$0]++'
+    fi
+}
+
+print_exp() {
+    local exp_dir="$1" status="$2"
+    local meta="$exp_dir/metadata"
+    local json="$meta/experiment.json"
+    local id; id=$(basename "$exp_dir")
+
+    echo "============================================================"
+    echo "[$status] $id"
+    echo "  path: $exp_dir"
+
+    if [[ ! -f "$json" ]]; then
+        echo "  (no experiment.json - run died before metadata was written)"
+        # Still show whatever notes we have.
+        for f in untolerated_deployments.txt validation_failure.txt; do
+            [[ -f "$meta/$f" ]] && { echo "  --- $f ---"; sed 's/^/    /' "$meta/$f"; }
+        done
+        echo
+        return
+    fi
+
+    local blob; blob=$(extract_json "$json")
+    if [[ "$blob" == __ERROR__* ]]; then
+        echo "  WARNING: failed to parse experiment.json: ${blob#__ERROR__$'\t'}"
+        echo
+        return
+    fi
+
+    local exp_name target_node victims nn_type nn_args
+    local burst_shape burst_args duration iters
+    local wrk_svc wrk_rate wrk_script
+    exp_name=$(get_field    "$blob" experiment_name)
+    target_node=$(get_field "$blob" target_node)
+    victims=$(get_field     "$blob" victim_services)
+    nn_type=$(get_field     "$blob" nn_type)
+    nn_args=$(get_field     "$blob" nn_args)
+    burst_shape=$(get_field "$blob" burst_shape)
+    burst_args=$(get_field  "$blob" burst_shape_args)
+    duration=$(get_field    "$blob" experiment_duration)
+    iters=$(get_field       "$blob" iterations)
+    wrk_svc=$(get_field     "$blob" wrk2_target_service)
+    wrk_rate=$(get_field    "$blob" wrk2_rate)
+    wrk_script=$(get_field  "$blob" wrk2_script)
+
+    echo "  experiment_name : $exp_name"
+    echo "  target_node     : $target_node"
+    echo "  victim_services : $victims"
+    echo "  noisy_neighbor  : $nn_type $nn_args"
+    if [[ -n "$burst_shape" ]]; then
+        echo "  contention      : burst-based  shape=$burst_shape  args=$burst_args"
+    else
+        echo "  contention      : legacy single-burst  duration=${duration}s"
+    fi
+    echo "  iterations      : $iters"
+    echo "  wrk2            : svc=$wrk_svc rate=$wrk_rate script=$wrk_script"
+
+    # Also include validation-failure detail if present.
+    if [[ -f "$meta/validation_failure.txt" ]]; then
+        echo "  --- validation_failure.txt ---"
+        sed 's/^/    /' "$meta/validation_failure.txt"
+    fi
+    if [[ -f "$meta/untolerated_deployments.txt" ]]; then
+        local n; n=$(wc -l < "$meta/untolerated_deployments.txt" 2>/dev/null || echo 0)
+        echo "  untolerated_deployments.txt : ${n} line(s)"
+    fi
+
+    # Try to match a config file.
+    local cfg_matches; cfg_matches=$(match_config "$exp_name" "$nn_type" "$target_node" "$victims")
+    if [[ -n "$cfg_matches" ]]; then
+        echo "  matched configs :"
+        while IFS= read -r f; do echo "    - $f"; done <<<"$cfg_matches"
+    else
+        echo "  matched configs : (none found in $CFG_ROOT)"
+    fi
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# Walk the experiment_data dir.
+# ---------------------------------------------------------------------------
+shopt -s nullglob
+exp_dirs=("$EXP_ROOT"/exp_*)
+shopt -u nullglob
+
+if [[ ${#exp_dirs[@]} -eq 0 ]]; then
+    echo "No exp_* directories under $EXP_ROOT"
+    exit 0
+fi
+
+# Stable chronological order (dir names are exp_YYYYMMDD_HHMMSS_<hash>).
+IFS=$'\n' exp_dirs=($(printf '%s\n' "${exp_dirs[@]}" | sort))
+unset IFS
+
+failed=0; aborted=0; ok=0
+for d in "${exp_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    [[ -n "${ONLY:-}" ]] && [[ "$d" != *"$ONLY"* ]] && continue
+
+    if   [[ -f "$d/metadata/validation_success.txt" ]]; then status=ok
+    elif [[ -f "$d/metadata/validation_failure.txt" ]]; then status=failed
+    else                                                     status=aborted
+    fi
+
+    case "$status" in
+        ok)      ((ok++));      [[ "${INCLUDE_OK:-0}" == "1" ]] && print_exp "$d" "$status" ;;
+        failed)  ((failed++));  print_exp "$d" "$status" ;;
+        aborted) ((aborted++)); print_exp "$d" "$status" ;;
+    esac
+done
+
+echo "============================================================"
+echo "Summary: ok=$ok  failed=$failed  aborted=$aborted  total=$((ok+failed+aborted))"
