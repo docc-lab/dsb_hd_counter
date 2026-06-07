@@ -2550,13 +2550,31 @@ generate_metadata() {
             \"random_seed\": \"${CONTENTION_RANDOM_SEED:-auto}\",
             \"note\": \"Duration varies per iteration based on burst schedule\"
         }"
+    elif [[ -n "${CONTENTION_BURSTS:-}" ]]; then
+        # Burst schedule supplied directly (e.g. via repeat_burst /
+        # linear_intensity helpers) without setting CONTENTION_SHAPE.
+        # Emit the raw schedule and skip legacy duration fields so we
+        # don't produce invalid JSON when EXPERIMENT_DURATION is unset.
+        contention_model="burst-based"
+        # Escape backslashes and double quotes so the schedule is JSON-safe.
+        local _bursts_escaped
+        _bursts_escaped=$(printf '%s' "$CONTENTION_BURSTS" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        burst_info=",
+        \"contention_bursts\": {
+            \"shape\": \"explicit\",
+            \"shape_args\": \"\",
+            \"schedule\": \"${_bursts_escaped}\",
+            \"randomize\": ${CONTENTION_RANDOMIZE:-false},
+            \"random_seed\": \"${CONTENTION_RANDOM_SEED:-auto}\",
+            \"note\": \"Schedule provided directly via CONTENTION_BURSTS (no CONTENTION_SHAPE set)\"
+        }"
     else
         duration_info=",
-        \"experiment_duration\": $EXPERIMENT_DURATION,
+        \"experiment_duration\": ${EXPERIMENT_DURATION:-0},
         \"timing\": {
-            \"base_duration\": $EXPERIMENT_DURATION,
-            \"stressor_duration\": \"$((EXPERIMENT_DURATION + 10))\",
-            \"workload_duration\": \"$((EXPERIMENT_DURATION + 5))\",
+            \"base_duration\": ${EXPERIMENT_DURATION:-0},
+            \"stressor_duration\": \"$((${EXPERIMENT_DURATION:-0} + 10))\",
+            \"workload_duration\": \"$((${EXPERIMENT_DURATION:-0} + 5))\",
             \"startup_delays\": {
                 \"stressor_to_workload\": 15,
                 \"workload_start\": 15

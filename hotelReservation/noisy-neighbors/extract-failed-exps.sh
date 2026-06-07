@@ -212,8 +212,27 @@ match_config() {
     fi
 
     if [[ ${#matches[@]} -gt 0 ]]; then
-        # de-dup
-        printf '%s\n' "${matches[@]}" | awk '!seen[$0]++'
+        # De-dup, then drop generator-ish files when a real .conf match exists.
+        # A "generator" is any file that defines EXPERIMENT_NAME more than once
+        # (e.g. config_generate.sh emits a name per generated config) — those
+        # match every experiment and aren't the actual config used.
+        local uniq; uniq=$(printf '%s\n' "${matches[@]}" | awk '!seen[$0]++')
+        local real=()
+        local genr=()
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local n; n=$(grep -cE "^[[:space:]]*EXPERIMENT_NAME=" "$f" 2>/dev/null || echo 0)
+            if (( n > 1 )); then
+                genr+=("$f")
+            else
+                real+=("$f")
+            fi
+        done <<<"$uniq"
+        if (( ${#real[@]} > 0 )); then
+            printf '%s\n' "${real[@]}"
+        else
+            printf '%s\n' "${genr[@]}"
+        fi
     fi
 }
 
