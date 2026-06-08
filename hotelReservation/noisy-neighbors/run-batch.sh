@@ -11,19 +11,31 @@
 #   ./run-batch.sh --no-resume           # also re-run configs that already passed
 #   ./run-batch.sh --pattern 'configs/10s_*.conf'   # custom glob
 #   ./run-batch.sh --dry-run             # show what WOULD run; don't execute
+#   ./run-batch.sh --stop-file PATH      # graceful-stop sentinel (default: ./STOP_BATCH)
 #
 # Behavior:
 #   - Runs ./cluster-healthcheck.sh once at the start (must pass).
 #   - For each config:
+#       * if the stop sentinel exists, exit cleanly BEFORE the next config
 #       * skip if a successful run already exists (resume mode, default)
 #       * re-run cluster-healthcheck.sh; if it FAILs, abort the batch
 #       * invoke ./data-collector.sh "$cfg", tee output to batch_logs/<name>.run.log
 #   - At the end, calls extract-failed-exps.sh to produce batch_logs/summary.txt.
 #
+# Graceful pause / resume:
+#   To pause AFTER the current run finishes (no partial exp_* dirs):
+#       touch STOP_BATCH        # from another shell
+#   The script will exit with code 3 between configs.
+#   To resume later, simply re-run ./run-batch.sh; it'll skip whatever
+#   already has metadata/validation_success.txt. Remember to:
+#       rm -f STOP_BATCH
+#   before the new invocation.
+#
 # Logs are written under ./batch_logs/.
 # Exit codes: 0 = batch finished (with or without per-run failures),
 #             1 = initial preflight failed,
-#             2 = mid-batch preflight failed (aborted partway).
+#             2 = mid-batch preflight failed (aborted partway),
+#             3 = stopped by --stop-file sentinel.
 # ===========================================================================
 
 set -u
@@ -31,6 +43,7 @@ set -u
 PATTERN='configs/[0-9]*.conf'
 RESUME=true
 DRY_RUN=false
+STOP_FILE='./STOP_BATCH'
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,8 +51,9 @@ while [[ $# -gt 0 ]]; do
         --resume)    RESUME=true;  shift ;;
         --pattern)   PATTERN="$2"; shift 2 ;;
         --dry-run)   DRY_RUN=true; shift ;;
+        --stop-file) STOP_FILE="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,32p' "$0"
+            sed -n '2,46p' "$0"
             exit 0
             ;;
         *)
@@ -48,6 +62,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Refuse to start with a stale stop sentinel from a previous run.
+if [[ -e "$STOP_FILE" ]]; then
+    echo "Stop sentinel $STOP_FILE already exists." >&2
+    echo "Remove it before starting:  rm $STOP_FILE" >&2
+    exit 1
+fi
 
 mkdir -p batch_logs
 
@@ -110,10 +131,20 @@ total=${#configs[@]}
 ran=0; skipped=0; failed_preflights=0
 start_epoch=$(date +%s)
 
+stopped=0
 for i in "${!configs[@]}"; do
     cfg="${configs[$i]}"
     name=$(basename "$cfg" .conf)
     idx=$((i + 1))
+
+    # Check the graceful-stop sentinel BETWEEN configs so the current run
+    # (if any) is allowed to finish cleanly. Exit code 3 communicates this
+    # was an operator-requested pause, not a failure.
+    if [[ -e "$STOP_FILE" ]]; then
+        echo "=== [$idx/$total] STOP sentinel $STOP_FILE detected; pausing batch ==="
+        stopped=1
+        break
+    fi
 
     if $RESUME && already_passed "$name"; then
         echo "=== [$idx/$total] SKIP   $name (already has a successful run) ==="
@@ -160,5 +191,10 @@ fi
 
 if [[ $failed_preflights -ne 0 ]]; then
     exit 2
+fi
+if [[ $stopped -ne 0 ]]; then
+    echo "Paused. Remove the sentinel and re-run to resume:"
+    echo "    rm $STOP_FILE && ./run-batch.sh"
+    exit 3
 fi
 exit 0
