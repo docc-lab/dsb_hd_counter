@@ -19,8 +19,14 @@ help: ## Display this help.
 
 .PHONY: proto
 proto: protoc-plugins ## Generates proto buffer code
+	# Pass the plugins by absolute path so protoc doesn't depend on
+	# $(GOBIN) being on the user's $PATH. The protoc-plugins target
+	# already cp's both plugins to $(GOBIN)/protoc-gen-go{,-grpc}.
 	for f in services/**/proto/*.proto; do \
-		$(PROTOC_BIN) --go_out=. --go_opt=paths=source_relative \
+		$(PROTOC_BIN) \
+			--plugin=protoc-gen-go=$(GOBIN)/protoc-gen-go \
+			--plugin=protoc-gen-go-grpc=$(GOBIN)/protoc-gen-go-grpc \
+			--go_out=. --go_opt=paths=source_relative \
 			--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 			$$f; \
 	done
