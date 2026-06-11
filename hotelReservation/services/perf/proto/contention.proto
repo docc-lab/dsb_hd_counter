@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+// Score-side wire contract for Stage 3.
+//
+// The ScoreEvent message is what a score.Source produces (one per window
+// boundary, paired with the Sample that drove it via sample_id). Mitigation
+// systems and any other consumer subscribe to ContentionStream and act on
+// the score values.
+//
+// The score interface is decoupled from any specific producer: the
+// source_kind field tells a consumer whether the event came from the
+// ONNX predictor, a formula-based scorer, or any other implementation
+// registered with the score.Publisher.
+
+package gordion.contention;
+
+option go_package = "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/proto";
+
+// ContentionStream lets external mitigation systems (controllers, k8s
+// operators, research notebooks, ...) subscribe to the ScoreEvent stream.
+service ContentionStream {
+  // Subscribe is a server-streaming RPC. The server sends one ScoreEvent
+  // per window boundary, applying optional client-side filters from the
+  // request. Per-subscriber drop-on-overflow if the client falls behind.
+  rpc Subscribe(ScoreSubscribeReq) returns (stream ScoreEvent);
+}
+
+message ScoreSubscribeReq {
+  // Optional method-name allow-list. Empty = receive events for all
+  // methods. Filters are ANDed with the threshold filters below.
+  repeated string only_methods = 1;
+
+  // Suppress events where p50_trend_pred < min_p50_trend.
+  // Both scores are in [0, 1]; threshold of 0 means no filter.
+  float min_p50_trend = 2;
+
+  // Suppress events where tail_trend_label < min_tail_trend.
+  float min_tail_trend = 3;
+}
+
+// ScoreEvent is the score for one window. Both p50_trend_pred and
+// tail_trend_label are continuous regression outputs in [0, 1].
+// During the single-head transitional period, tail_trend_label may be
+// 0.0 with a startup warning logged on the producer side.
+message ScoreEvent {
+  int64  sample_id        = 1;   // joins to Sample.sample_id from instrumentation
+  int64  timestamp_ns     = 2;
+  string service          = 3;
+
+  float  p50_trend_pred   = 4;   // p50-side trend prediction, [0, 1]
+  float  tail_trend_label = 5;   // p90/p99-combined tail trend, [0, 1]
+
+  // Stable identifier echoing the score source's model_version (e.g. the
+  // shortlist.schema_version for ONNX). Mitigation consumers can use
+  // this to reject stale streams after a model change.
+  string model_version    = 6;
+
+  // Tag for which producer emitted this event: "onnx", "formula",
+  // "rules", etc. Lets a mitigation differentiate when multiple sources
+  // are wired up to the same Publisher.
+  string source_kind      = 7;
+}

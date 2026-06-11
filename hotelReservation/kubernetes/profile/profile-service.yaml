@@ -10,9 +10,9 @@ metadata:
   name: profile
 spec:
   ports:
-    - name: "8081"
-      port: 8081
-      targetPort: 8081
+    - {name: "8081",  port: 8081, targetPort: 8081}
+    - {name: "score", port: 7900, targetPort: 7900}   # Stage 3 ContentionStream
+    - {name: "instr", port: 7901, targetPort: 7901}   # Stage 3 InstrumentationStream
   selector:
     io.kompose.service: profile
 status:

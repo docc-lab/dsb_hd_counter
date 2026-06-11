@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+// Sample-side wire contract for Stage 3.
+//
+// The Sample message mirrors the in-process Go struct produced every
+// WINDOW_INTERVAL_MS by services/perf/windowed_sampler.go::takeSample
+// (perf counters via perf_event_open + MSR-derived freq utilization +
+// gRPC interceptor timing aggregates).
+//
+// In-binary subscribers (e.g. a score.Source running in the same Go
+// binary) consume the native Go struct directly; this proto is paid only
+// when an external client subscribes to InstrumentationStream over gRPC.
+//
+// This is the canonical wire contract for the instrumentation ->
+// score-source boundary. Any language can implement an
+// InstrumentationStream consumer.
+
+package gordion.instrumentation;
+
+option go_package = "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/proto";
+
+// InstrumentationStream lets external consumers subscribe to the Sample
+// stream produced by the windowed sampler.
+service InstrumentationStream {
+  // Subscribe is a server-streaming RPC. The server sends one Sample per
+  // window boundary (10 Hz at the default WINDOW_INTERVAL_MS=100). The
+  // server applies per-subscriber drop-on-overflow if the client falls
+  // behind.
+  rpc Subscribe(SampleSubscribeReq) returns (stream Sample);
+}
+
+message SampleSubscribeReq {
+  // Reserved for future client-side filters (e.g. service name or method
+  // glob). Empty request = receive all samples.
+}
+
+// Sample is one per-window snapshot. Field set follows the existing
+// in-process Go Sample struct (perf.Sample in services/perf/windowed_sampler.go)
+// plus offset_from_workload_ms which is populated when the sampler is
+// driven by a workload-aware harness (e.g. data-collector.sh).
+message Sample {
+  int32  sample_id               = 1;
+  int64  timestamp_ns            = 2;   // Unix ns of the window boundary
+  int64  offset_ms               = 3;   // ms since RunStart
+  int64  offset_from_workload_ms = 4;   // ms since loadgen start; 0 when not workload-aware
+  string service                 = 5;   // populated from RunConfig.ServiceName
+
+  // Cumulative perf counter values (10 keys: LLC-load-misses, LLC-loads,
+  // branch-instructions, branch-misses, cycles, dTLB-load-misses,
+  // dTLB-loads, instructions, page-faults, ref-cycles).
+  map<string, uint64> perf_counters = 6;
+
+  // Per-window deltas (same key set as perf_counters).
+  map<string, uint64> perf_deltas = 7;
+
+  WindowTimingStats timing_window = 8;
+  FreqSample        freq          = 9;
+}
+
+// WindowTimingStats mirrors interceptor.WindowTimingStats. Three percentile
+// distributions cover processing time (request-only, blocking calls
+// excluded), total time (wall clock), and blocking time (downstream
+// calls).
+message WindowTimingStats {
+  int32  arrival_count   = 1;
+  int32  request_count   = 2;
+  double arrival_rps_1s  = 3;   // trailing 1 s sliding-window arrival rate
+  double arrival_rps_3s  = 4;   // trailing 3 s sliding-window arrival rate
+  DurationStats processing_time = 5;
+  DurationStats total_time      = 6;
+  DurationStats blocking_time   = 7;
+}
+
+// DurationStats mirrors interceptor.WindowDurationStats. All stats are in
+// nanoseconds; count is the number of completions used to compute them.
+message DurationStats {
+  int64 min_ns  = 1;
+  int64 max_ns  = 2;
+  int64 mean_ns = 3;
+  int64 p50_ns  = 4;
+  int64 p60_ns  = 5;
+  int64 p70_ns  = 6;
+  int64 p75_ns  = 7;
+  int64 p80_ns  = 8;
+  int64 p90_ns  = 9;
+  int64 p99_ns  = 10;
+  int32 count   = 11;
+}
+
+// FreqSample mirrors perf.FreqSample. ok=false means the MSR reader was
+// unavailable this window (driver not loaded, capability missing, or
+// first-call priming) and the freq fields should be ignored.
+message FreqSample {
+  bool   ok               = 1;
+  double actual_freq_mhz  = 2;   // computed from cycles / ref-cycles * tsc_freq_mhz
+  uint32 current_max_mhz  = 3;   // from MSR 0x1AD indexed by active_n
+  int32  active_n         = 4;   // number of node-wide cores in C0 over threshold
+  double freq_util_pct    = 5;   // 100 * actual_freq_mhz / current_max_mhz
+  bool   turbo_on         = 6;   // actual_freq_mhz > tsc_freq_mhz * 1.02
+  double tsc_freq_mhz     = 7;
+}

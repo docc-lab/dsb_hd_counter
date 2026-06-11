@@ -29,6 +29,24 @@ type WindowedSampler interface {
 	Start(ctx context.Context) error // For continuous mode
 	Stop() error                      // For continuous mode
 	GetCurrentSample() *Sample
+
+	// AttachInstrumentationPublisher hooks the Stage 3 instrumentation
+	// fan-out into the sampler. After this is set, every Sample built in
+	// takeSample is also handed to the publisher, which fans it out to
+	// in-binary subscribers (e.g. a score.Source) and any external gRPC
+	// subscribers attached to the InstrumentationStream service.
+	//
+	// Safe to leave nil: when no publisher is attached, the sampler runs
+	// exactly as before (Stage 2 disk-dump path only).
+	AttachInstrumentationPublisher(p InstrumentationPublisher)
+}
+
+// InstrumentationPublisher is the small interface the sampler depends on
+// to avoid an import cycle between services/perf and services/perf/instrumentation.
+// Anything that satisfies Publish(Sample) is acceptable; in practice this
+// is *instrumentation.Publisher constructed by the caller (cmd/<svc>/main.go).
+type InstrumentationPublisher interface {
+	Publish(Sample)
 }
 
 // RunConfig defines one experiment iteration's sampling configuration
@@ -180,6 +198,19 @@ type windowedSampler struct {
 	wg             sync.WaitGroup
 	sampleFile     *os.File // For streaming samples to file
 	streamMode     bool     // If true, append each sample immediately
+
+	// instPub fans each Sample to Stage 3 in-binary subscribers + the
+	// InstrumentationStream gRPC server. Set via AttachInstrumentationPublisher
+	// from cmd/<svc>/main.go. Nil when Stage 3 is not configured for this run.
+	instPub InstrumentationPublisher
+}
+
+// AttachInstrumentationPublisher implements WindowedSampler.
+// Idempotent: calling twice replaces the publisher.
+func (ws *windowedSampler) AttachInstrumentationPublisher(p InstrumentationPublisher) {
+	ws.mu.Lock()
+	ws.instPub = p
+	ws.mu.Unlock()
 }
 
 // NewWindowedSampler creates a new windowed sampler instance
@@ -390,8 +421,19 @@ func (ws *windowedSampler) takeSample() {
 	
 	ws.mu.Lock()
 	ws.samples = append(ws.samples, sample)
+	instPub := ws.instPub
 	ws.mu.Unlock()
-	
+
+	// Stage 3 fan-out: hand the sample to the instrumentation publisher
+	// (in-binary subscribers + InstrumentationStream gRPC server).
+	// Read instPub under the lock above so a concurrent
+	// AttachInstrumentationPublisher call can't race; Publish itself
+	// runs without our lock so a slow Sink can't block the sampler tick
+	// (each Sink owns its own back-pressure).
+	if instPub != nil {
+		instPub.Publish(sample)
+	}
+
 	// Log sample for debugging (can be disabled in production)
 	if sampleID%10 == 0 { // Log every 10th sample
 		log.Debug().

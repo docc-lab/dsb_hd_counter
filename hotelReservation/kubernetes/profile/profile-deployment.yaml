@@ -28,10 +28,17 @@ spec:
       containers:
         - command:
             - profile
+          # Use the online image (gordion-online-profile:vN) when running
+          # with ENABLE_WINDOWED_SAMPLING=true + a model baked in. The
+          # online image extends the base via Dockerfile.online and
+          # ships /etc/gordion/{model.onnx,shortlist.json} +
+          # /usr/lib/libonnxruntime.so plus default GORDION_* env vars.
           image: deathstarbench/hotel-reservation:latest
           name: hotel-reserv-profile
           ports:
-            - containerPort: 8081
+            - {name: rpc,     containerPort: 8081}
+            - {name: score,   containerPort: 7900}   # Stage 3 ContentionStream
+            - {name: instrum, containerPort: 7901}   # Stage 3 InstrumentationStream
           resources:
             requests:
               cpu: "1"
@@ -41,5 +48,18 @@ spec:
             capabilities:
               add:
               - SYS_ADMIN
+          # Stage 3 env vars. Comment out or set GORDION_SCORE_SOURCE=none
+          # to disable Stage 3 entirely while keeping the Stage 2
+          # disk-dump path intact.
+          env:
+            - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
+            - {name: GORDION_SCORE_SOURCE,    value: "onnx"}
+            # The remaining GORDION_* env vars (paths, ports, buffers)
+            # default sensibly via Dockerfile.online ENV; uncomment below
+            # to override per-pod.
+            # - {name: GORDION_MODEL,        value: "/etc/gordion/model.onnx"}
+            # - {name: GORDION_SHORTLIST,    value: "/etc/gordion/shortlist.json"}
+            # - {name: GORDION_SCORE_PORT,   value: "7900"}
+            # - {name: GORDION_INSTRUMENTATION_PORT, value: "7901"}
       restartPolicy: Always
 status: {}

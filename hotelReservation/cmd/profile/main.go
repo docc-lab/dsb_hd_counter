@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/cmd/internal/stage3wire"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/registry"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/profile"
@@ -86,6 +87,15 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to setup continuous sampling")
 		}
 
+		// Stage 3: wire publishers + gRPC servers (InstrumentationStream :7901,
+		// ContentionStream :7900). Score source (M7+) is selected internally
+		// based on GORDION_SCORE_SOURCE / GORDION_MODEL.
+		stage3, err := stage3wire.Setup("profile", sampler, log.Logger)
+		if err != nil {
+			log.Error().Err(err).Msg("Stage 3 wireup failed; continuing without Stage 3")
+			stage3 = nil
+		}
+
 		// Cleanup handlers (will run when pod terminates)
 		defer func() {
 			log.Info().Msg("Pod terminating, stopping sampler")
@@ -99,6 +109,11 @@ func main() {
 					Msg("Sampling stopped on termination")
 			}
 			timingAgg.Stop()
+			if stage3 != nil {
+				if err := stage3.Close(); err != nil {
+					log.Error().Err(err).Msg("Stage 3 wireup close error")
+				}
+			}
 		}()
 
 		srv := &profile.Server{
