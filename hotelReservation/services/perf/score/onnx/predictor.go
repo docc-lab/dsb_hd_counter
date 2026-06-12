@@ -3,7 +3,6 @@ package onnx
 import (
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/score"
