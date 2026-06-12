@@ -21,6 +21,12 @@ spec:
         kompose.version: 1.22.0 (955b78124)
         sidecar.istio.io/statsInclusionPrefixes: cluster.outbound,cluster_manager,listener_manager,http_mixer_filter,tcp_mixer_filter,server,cluster.xds-grp,listener,connection_manager
         sidecar.istio.io/statsInclusionRegexps: http.*
+        # AppArmor's docker-default profile blocks /dev/cpu/N/msr access
+        # even with CAP_SYS_RAWIO; opt this container out so the MSR-based
+        # freq sampler in services/perf/msr_reader.c can pread the device.
+        # The container name (right of the slash) MUST match the
+        # spec.containers[].name below.
+        container.apparmor.security.beta.kubernetes.io/hotel-reserv-search: unconfined
       creationTimestamp: null
       labels:
         io.kompose.service: search
@@ -45,10 +51,15 @@ spec:
             limits:
               cpu: "3"
           securityContext:
-            capabilities:
-              add:
-              - SYS_ADMIN
-              - SYS_RAWIO   # required to pread() /dev/cpu/N/msr for freq utilization
+            # privileged is broader than strictly needed but works on every
+            # CRI / kubelet config. The narrower alternative is:
+            #   capabilities: { add: [SYS_ADMIN, SYS_RAWIO] }
+            # but on many self-managed clusters (CloudLab, kind, k3s) the
+            # CRI runtime silently filters SYS_RAWIO out of the allow-list,
+            # leaving /dev/cpu/N/msr reads as EPERM. privileged sidesteps
+            # that. Restrict back to specific capabilities if your cluster
+            # operator gets nervous about privileged pods.
+            privileged: true
           # /dev/cpu/<N>/msr device files for the MSR-based freq sampler
           # (services/perf/msr_reader.c). Requires `modprobe msr` on the
           # host node (Daemonset or one-time setup); without these mounts
