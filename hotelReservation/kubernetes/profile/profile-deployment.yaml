@@ -48,6 +48,13 @@ spec:
             capabilities:
               add:
               - SYS_ADMIN
+              - SYS_RAWIO   # required to pread() /dev/cpu/N/msr for freq utilization
+          # /dev/cpu/<N>/msr device files for the MSR-based freq sampler
+          # (services/perf/msr_reader.c). Requires `modprobe msr` on the
+          # host node (Daemonset or one-time setup); without these mounts
+          # the freq fields land with ok=false and the rest zeroed.
+          volumeMounts:
+            - {name: cpu-devices, mountPath: /dev/cpu, readOnly: true}
           # Stage 3 env vars. Comment out or set GORDION_SCORE_SOURCE=none
           # to disable Stage 3 entirely while keeping the Stage 2
           # disk-dump path intact.
@@ -61,5 +68,10 @@ spec:
             # - {name: GORDION_SHORTLIST,    value: "/etc/gordion/shortlist.json"}
             # - {name: GORDION_SCORE_PORT,   value: "7900"}
             # - {name: GORDION_INSTRUMENTATION_PORT, value: "7901"}
+      volumes:
+        - name: cpu-devices
+          hostPath:
+            path: /dev/cpu
+            type: Directory
       restartPolicy: Always
 status: {}
