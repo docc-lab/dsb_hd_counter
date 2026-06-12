@@ -8,6 +8,7 @@ import (
 	pb "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/proto"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // GRPCSink exposes the ContentionStream gRPC service. Symmetric to
@@ -77,6 +78,9 @@ func (g *GRPCSink) Serve() error {
 
 	srv := grpc.NewServer()
 	pb.RegisterContentionStreamServer(srv, &grpcServer{sink: g})
+	// Register the gRPC reflection service so tools like grpcurl can list
+	// methods and decode messages without an out-of-band .proto file.
+	reflection.Register(srv)
 	g.server = srv
 
 	g.logger.Info().
