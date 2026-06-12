@@ -10,5 +10,10 @@ wrk2/wrk
 wrk2/*.[oa]
 wrk2/obj/
 
+# C build artifacts produced by hotelReservation/services/perf's gcc step
+# (perf_api, perf_api_windowed, msr_reader). Rebuilt fresh on every Docker
+# / make build run; should not live in git.
+hotelReservation/services/perf/*.[oa]
+
 daprApps_v1/test/socialnet/tmp/tester-0*1645152149690-img-0
 daprApps_v1/test/socialnet/tmp/tester-0*1645152265090-img-0
