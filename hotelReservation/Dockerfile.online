@@ -1,10 +1,18 @@
-# Online predictor image template.
+# Online predictor image template (Stage 3).
 #
-# Builds a per-service image with the gRPC service binary plus an
-# in-pod ONNX score source baked in. The "online" tag distinguishes
-# this image from the base image (no predictor) and from the deferred
-# aggressor / co-located workload manifests; this Dockerfile produces
-# only the victim-side predictor image.
+# Builds a per-service image with the gRPC service binary plus an in-pod
+# windowed sampler + ONNX score source baked in. This Dockerfile is the
+# Stage 3 superset of what --mode-windowed previously produced: it builds
+# all the perf C libraries (perf_api, perf_api_windowed, msr_reader),
+# links them into the Go binary, AND adds libonnxruntime + the
+# per-service .onnx/shortlist artifacts. ENABLE_WINDOWED_SAMPLING is set
+# by default so the sampler boots, which is what the stage3wire wire-up
+# in cmd/<svc>/main.go gates on.
+#
+# Use this image for any service that has been wired through
+# stage3wire.Setup. Service mains that haven't been wired yet still
+# build (the binary just won't expose :7900/:7901), but the score source
+# would be a no-op.
 #
 # Build args:
 #   SVC          - which service binary to package (e.g. "search")
@@ -19,20 +27,28 @@
 #       --build-arg SVC=search \
 #       -f Dockerfile.online .
 #
-# This is a multi-stage build:
-#   1. base-build: same as the original Dockerfile, builds all Go binaries.
-#   2. online:     adds libonnxruntime.so + per-service .onnx/shortlist
-#                  on top, sets GORDION_* env vars.
+# Or via the deployment script (preferred, also pushes + rolls out):
+#   ./ims-build-push-rollout.sh --mode-online search v1.0
 #
-# Per the plan (M8), the runtime image is one container, one process,
-# one image per service. New model = new image tag = rolling restart.
+# Multi-stage:
+#   1. base-build: gcc + go install of just the named service.
+#   2. online:     debian:bookworm-slim runtime with libonnxruntime + the
+#                  per-service .onnx/shortlist on top of the binary.
 
 ARG ONNX_RT_VER=1.18.0
+ARG SVC
 
-# ── Stage 1: Go build (mirrors existing Dockerfile) ──────────────────────
+# ── Stage 1: Go build ────────────────────────────────────────────────────
 FROM golang:1.21 AS base-build
 
-RUN apt-get update && apt-get install -y gcc
+# Re-declare ARGs in this stage's scope.
+ARG SVC
+
+# linux-perf is needed by perf_event_open at build smoke-test time on some
+# distros; keep it for parity with --mode-windowed's generated Dockerfile.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc make binutils linux-perf \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
@@ -51,17 +67,28 @@ COPY tune/ tune/
 
 COPY config.json config.json
 
-# Build perf C library (existing)
-WORKDIR /workspace/services/perf
-RUN gcc -std=c11 -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o
+# Build the three perf C libraries that services/perf links against:
+#   - libperf_api.a:           legacy, kept for source-compat with code
+#                              that hasn't migrated to the windowed API.
+#   - libperf_api_windowed.a:  what services/perf/windowed_sampler.go
+#                              actually links via its #cgo LDFLAGS.
+#   - libmsr_reader.a:         per-window CPU freq utilization via MSR.
+RUN cd services/perf && \
+    gcc -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o && \
+    gcc -c perf_api_windowed.c -o perf_api_windowed.o && ar rcs libperf_api_windowed.a perf_api_windowed.o && \
+    gcc -c msr_reader.c -o msr_reader.o && ar rcs libmsr_reader.a msr_reader.o
 
-WORKDIR /workspace
-
+# CRITICAL: link the windowed + MSR libs (perf_api alone is insufficient;
+# the windowed_sampler.go #cgo line references both). CGO finds them via
+# -L/workspace/services/perf and the static archives we just built.
 ENV CGO_ENABLED=1 \
-    CGO_LDFLAGS="-L/workspace/services/perf -lperf_api" \
+    CGO_LDFLAGS="-L/workspace/services/perf -lperf_api_windowed -lmsr_reader" \
     CGO_CFLAGS="-I/workspace/services/perf"
 
-RUN GOOS=linux GO111MODULE=on go install -mod=vendor ./cmd/...
+# Build only the requested service binary (faster + smaller than
+# go install ./cmd/...). Output: /workspace/build/${SVC}.
+RUN GOOS=linux GO111MODULE=on \
+    go build -mod=vendor -o build/${SVC} ./cmd/${SVC}/
 
 # ── Stage 2: Online predictor runtime image ──────────────────────────────
 FROM debian:bookworm-slim AS online
@@ -69,10 +96,12 @@ FROM debian:bookworm-slim AS online
 ARG SVC
 ARG ONNX_RT_VER
 
-# wget + ca-certificates for the ONNX Runtime download; tini for clean
-# signal handling; libgcc for CGO.
+# tini for proper PID 1 / signal forwarding (gRPC GracefulStop relies on
+# SIGTERM reaching the Go process). linux-perf gives us the perf
+# subsystem userspace tooling at runtime; libgcc-s1 is needed by the
+# CGO-built binary; ca-certificates + wget for the ONNX Runtime download.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates wget tini libgcc-s1 \
+        ca-certificates wget tini linux-perf libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pull ONNX Runtime 1.18.0 (paired with github.com/yalue/onnxruntime_go@v1.10.0;
@@ -83,14 +112,33 @@ RUN wget -q "https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_
     && cp /opt/onnxruntime-linux-x64-${ONNX_RT_VER}/lib/libonnxruntime.so* /usr/lib/ \
     && rm -rf /opt/onnxruntime-linux-x64-${ONNX_RT_VER} /tmp/ort.tgz
 
-# The Go binary built in stage 1.
-COPY --from=base-build /go/bin/${SVC} /usr/local/bin/${SVC}
+# Per-service Go binary from stage 1.
+COPY --from=base-build /workspace/build/${SVC} /usr/local/bin/${SVC}
+COPY --from=base-build /workspace/config.json /config.json
+RUN chmod +x /usr/local/bin/${SVC}
 
-# Per-service online-predictor artifacts (model + shortlist).
+# Per-service Stage 3 artifacts (model + shortlist).
 COPY artifacts/${SVC}.onnx              /etc/gordion/model.onnx
 COPY artifacts/${SVC}-shortlist.json    /etc/gordion/shortlist.json
 
-# Online predictor env defaults; cmd/internal/stage3wire/setup.go reads these.
+# /data is where windowed_sampler.go's writeRunData drops Stage 2 JSON
+# dumps. World-writable so rootless container modes still work.
+RUN mkdir -p /data && chmod 777 /data
+
+# Bake the service name into the runtime env so the shell-form CMD below
+# can dispatch without per-build templating of the CMD line.
+ENV SVC=${SVC}
+
+# Windowed-sampler env (mirrors what --mode-windowed previously set; the
+# k8s Deployment can override any of these per pod).
+ENV ENABLE_WINDOWED_SAMPLING=true \
+    ITERATION_ID=1 \
+    EXPERIMENT_DURATION=30 \
+    WINDOW_INTERVAL_MS=100 \
+    CPU_SET=0,1,2 \
+    OUTPUT_DIR=/data
+
+# Stage 3 online-predictor env defaults; cmd/internal/stage3wire/setup.go reads these.
 ENV GORDION_MODEL=/etc/gordion/model.onnx \
     GORDION_SHORTLIST=/etc/gordion/shortlist.json \
     GORDION_LIBONNXRUNTIME=/usr/lib/libonnxruntime.so \
@@ -100,21 +148,16 @@ ENV GORDION_MODEL=/etc/gordion/model.onnx \
     GORDION_INFLIGHT_DEPTH=16 \
     GORDION_SUBSCRIBER_BUFFER=64
 
-# Run as the same process the original image runs (one binary per image
-# in the online layout). Using tini for proper PID 1 / signal handling
-# of the gRPC servers' graceful shutdown.
-EXPOSE 8082 7900 7901
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["${SVC}"]
+# Business RPC port + Stage 3 stream ports.
+EXPOSE 8081 8082 7900 7901
 
-# Note: the CMD literal interpolation above doesn't work in plain CMD.
-# To set the CMD per-svc at build time, use a small entrypoint script
-# OR override the CMD at deploy time:
+# tini as PID 1 -> shell -> taskset (if CPU_SET set) -> the Go binary.
+# Shell form is needed so $SVC and $CPU_SET expand at runtime; the JSON-
+# array exec form would treat them as literals.
 #
-#   spec:
-#     containers:
-#       - command: ["search"]
-#
-# (which the existing kubernetes/search/search-deployment.yaml already
-# does). The CMD line above is documentation; the actual command comes
-# from the Deployment manifest.
+# kubernetes Deployments override this with `command: [<svc>]` — both the
+# tini wrapper and the taskset CPU pin get bypassed in that case (the
+# k8s scheduler handles CPU affinity instead). For local docker run
+# testing the wrapper is what makes perf-counter sampling reproducible.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", "if [ -n \"$CPU_SET\" ]; then exec taskset -c $CPU_SET /usr/local/bin/$SVC; else exec /usr/local/bin/$SVC; fi"]

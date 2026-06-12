@@ -5,6 +5,7 @@ REGISTRY="docclabgroup"
 IMAGE_NAME="hotelreservation"
 TIMING_MODE=false
 WINDOWED_MODE=false
+ONLINE_MODE=false       # Stage 3: in-pod online predictor (windowed sampling + ONNX score source)
 
 # List of services that have kubernetes deployment files
 VALID_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
@@ -19,8 +20,21 @@ show_usage() {
     echo "  • Applies updated deployments to Kubernetes"
     echo ""
     echo "Options:"
-    echo "  --mode-timer           Enable basic timing mode (timing only, no perf counters)"
-    echo "  --mode-windowed        Enable windowed sampling mode (timing + perf counters)"
+    echo "  --mode-online          Stage 3: windowed sampling + in-pod ONNX online predictor."
+    echo "                         Strict superset of --mode-windowed (also builds the perf"
+    echo "                         counter and MSR libs and links them into the binary)."
+    echo "                         Uses Dockerfile.online. Requires artifacts/<svc>.onnx +"
+    echo "                         artifacts/<svc>-shortlist.json checked in beside the build."
+    echo "                         (Recommended for any service wired through stage3wire.Setup.)"
+    echo ""
+    echo "  --mode-windowed        Windowed sampling only (timing + perf counters), no ONNX"
+    echo "                         predictor. Use this when you don't have a trained model"
+    echo "                         yet but still want Stage 2 JSON dumps."
+    echo ""
+    echo "  --mode-timer           [LEGACY] basic timing only, no perf counters. Kept for"
+    echo "                         backward compat with older experiment scripts; new work"
+    echo "                         should use --mode-windowed or --mode-online instead."
+    echo ""
     echo "  --registry=REGISTRY    Set Docker registry (default: docclabgroup)"
     echo "  --image-prefix=PREFIX  Set image name prefix (default: hotelreservation)"
     echo ""
@@ -35,6 +49,8 @@ show_usage() {
     echo "  $0 all debug0.1                                          # Deploy all valid services"
     echo "  $0 --mode-timer search v1-timer                          # Deploy search with basic timing"
     echo "  $0 --mode-windowed search v1-windowed                    # Deploy search with windowed sampling"
+    echo "  $0 --mode-online   search v1.0                           # Deploy search with Stage 3 online predictor"
+    echo "  $0 --mode-online   search profile v1.0                   # Stage 3 for both search and profile"
     echo "  $0 --mode-windowed --registry=royno7 search v1-windowed  # Deploy to custom registry"
     echo "  $0 all                                                   # Deploy all (default tag)"
     echo ""
@@ -208,7 +224,11 @@ build_and_push_docker() {
     local service=$2
     local image_full_name="${REGISTRY}/${IMAGE_NAME}:${tag}"
 
-    if [[ "$WINDOWED_MODE" == "true" ]]; then
+    if [[ "$ONLINE_MODE" == "true" ]]; then
+        # Stage 3: per-service image with windowed sampling + ONNX online predictor.
+        image_full_name="${REGISTRY}/${service}-online:${tag}"
+        log_info "Building Stage 3 online predictor Docker image for $service"
+    elif [[ "$WINDOWED_MODE" == "true" ]]; then
         # In windowed sampling mode, build service-specific image
         image_full_name="${REGISTRY}/${service}-windowed:${tag}"
         log_info "Building windowed sampling Docker image for $service"
@@ -242,8 +262,36 @@ build_and_push_docker() {
     if ! sudo docker image inspect "${image_full_name}" >/dev/null 2>&1; then
         log_info "Building Docker image: ${image_full_name}"
         log_info "Platform: ${PLATFORM}"
-        
-        if [[ "$WINDOWED_MODE" == "true" ]]; then
+
+        if [[ "$ONLINE_MODE" == "true" ]]; then
+            # Stage 3 online predictor: use the static Dockerfile.online with
+            # SVC build arg. Requires artifacts/${service}.onnx and
+            # artifacts/${service}-shortlist.json to exist relative to the
+            # build context (i.e. cwd = hotelReservation).
+            if [[ ! -f "artifacts/${service}.onnx" ]]; then
+                log_error "Missing artifacts/${service}.onnx; copy the trained model into artifacts/ before building (see STAGE3.md)"
+                return 1
+            fi
+            if [[ ! -f "artifacts/${service}-shortlist.json" ]]; then
+                log_error "Missing artifacts/${service}-shortlist.json; check that the per-service shortlist is in artifacts/"
+                return 1
+            fi
+
+            log_info "Using Dockerfile.online with --build-arg SVC=${service}"
+            if ! sudo docker build --no-cache \
+                    -t "${image_full_name}" \
+                    --build-arg "SVC=${service}" \
+                    -f Dockerfile.online .; then
+                log_error "Docker build failed for $service"
+                return 1
+            fi
+
+            log_info "Pushing image: ${image_full_name}"
+            if ! sudo docker push "${image_full_name}"; then
+                log_error "Docker push failed for $service"
+                return 1
+            fi
+        elif [[ "$WINDOWED_MODE" == "true" ]]; then
             # Generate windowed sampling Dockerfile for specific service
             log_info "Generating windowed sampling Dockerfile for $service"
             local dockerfile_path=$(generate_timing_dockerfile "$service" "windowed")
@@ -354,7 +402,9 @@ update_yaml_files() {
         fi
     done
     
-    if [[ "$WINDOWED_MODE" == "true" ]]; then
+    if [[ "$ONLINE_MODE" == "true" ]]; then
+        log_info "Updating YAML files for Stage 3 online mode (service-specific images)"
+    elif [[ "$WINDOWED_MODE" == "true" ]]; then
         log_info "Updating YAML files for windowed sampling mode (service-specific images)"
     elif [[ "$TIMING_MODE" == "true" ]]; then
         log_info "Updating YAML files for timing mode (service-specific images)"
@@ -384,7 +434,9 @@ update_yaml_files() {
             
             # Determine the correct image name for this service
             local service_image_name="${image_full_name}"
-            if [[ "$WINDOWED_MODE" == "true" ]]; then
+            if [[ "$ONLINE_MODE" == "true" ]]; then
+                service_image_name="${REGISTRY}/${service}-online:${tag}"
+            elif [[ "$WINDOWED_MODE" == "true" ]]; then
                 service_image_name="${REGISTRY}/${service}-windowed:${tag}"
             elif [[ "$TIMING_MODE" == "true" ]]; then
                 service_image_name="${REGISTRY}/${service}-withtimer:${tag}"
@@ -434,19 +486,21 @@ deploy_multiple_services() {
         fi
     done
     
-    # Check timing/windowed mode restrictions
-    if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]]; then
-        # In timing/windowed mode, check if "all" is specified
+    # Check timing/windowed/online mode restrictions
+    if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]] || [[ "$ONLINE_MODE" == "true" ]]; then
+        # In any per-service mode, check if "all" is specified
         for service in "${services[@]}"; do
             if [[ "$service" == "all" ]]; then
-                log_error "Timing/Windowed mode does not support 'all' services. Please specify individual services."
+                log_error "Timing/Windowed/Online mode does not support 'all' services. Please specify individual services."
                 return 1
             fi
         done
     fi
-    
+
     echo "=========================================="
-    if [[ "$WINDOWED_MODE" == "true" ]]; then
+    if [[ "$ONLINE_MODE" == "true" ]]; then
+        echo "Deploying Stage 3 Online Predictor Hotel Reservation Services"
+    elif [[ "$WINDOWED_MODE" == "true" ]]; then
         echo "Deploying Windowed Sampling Hotel Reservation Services"
     elif [[ "$TIMING_MODE" == "true" ]]; then
         echo "Deploying Timing-Enabled Hotel Reservation Services"
@@ -455,7 +509,9 @@ deploy_multiple_services() {
     fi
     echo "Services: ${services[*]}"
     echo "Tag: $tag"
-    if [[ "$WINDOWED_MODE" == "true" ]]; then
+    if [[ "$ONLINE_MODE" == "true" ]]; then
+        echo "Mode: Stage 3 online predictor (windowed sampling + ONNX score source)"
+    elif [[ "$WINDOWED_MODE" == "true" ]]; then
         echo "Mode: Windowed sampling (timing + perf counters)"
     elif [[ "$TIMING_MODE" == "true" ]]; then
         echo "Mode: Basic timing (service-specific images)"
@@ -466,11 +522,13 @@ deploy_multiple_services() {
     
     # Phase 1: Build and push image(s)
     log_info "Phase 1: Building and pushing Docker image(s)"
-    if [[ "$WINDOWED_MODE" == "true" ]] || [[ "$TIMING_MODE" == "true" ]]; then
-        # In timing/windowed mode, build each service individually
+    if [[ "$ONLINE_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]] || [[ "$TIMING_MODE" == "true" ]]; then
+        # In any per-service mode, build each service individually
         for service in "${services[@]}"; do
             if ! build_and_push_docker "$tag" "$service"; then
-                if [[ "$WINDOWED_MODE" == "true" ]]; then
+                if [[ "$ONLINE_MODE" == "true" ]]; then
+                    log_error "Failed to build/push Stage 3 online image for $service"
+                elif [[ "$WINDOWED_MODE" == "true" ]]; then
                     log_error "Failed to build/push windowed sampling image for $service"
                 else
                     log_error "Failed to build/push timing image for $service"
@@ -479,7 +537,7 @@ deploy_multiple_services() {
                 continue
             fi
         done
-        
+
         if [[ ${#failed_services[@]} -gt 0 ]]; then
             log_error "Failed to build images for: ${failed_services[*]}"
             return 1
@@ -584,6 +642,10 @@ while [[ $# -gt 0 ]]; do
             WINDOWED_MODE=true
             shift
             ;;
+        --mode-online)
+            ONLINE_MODE=true
+            shift
+            ;;
         --registry=*)
             REGISTRY="${1#*=}"
             shift
@@ -597,8 +659,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         all)
-            if [[ "$TIMING_MODE" == "true" ]]; then
-                log_error "Timing mode does not support 'all' services. Please specify individual services."
+            if [[ "$TIMING_MODE" == "true" ]] || [[ "$ONLINE_MODE" == "true" ]]; then
+                log_error "Timing/Online mode does not support 'all' services. Please specify individual services."
                 echo ""
                 show_usage
                 exit 1
@@ -635,19 +697,21 @@ if [[ ${#services_to_deploy[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Check timing/windowed mode restrictions
-if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]]; then
-    # In timing/windowed mode, check if "all" is specified
+# Check timing/windowed/online mode restrictions
+if [[ "$TIMING_MODE" == "true" ]] || [[ "$WINDOWED_MODE" == "true" ]] || [[ "$ONLINE_MODE" == "true" ]]; then
+    # In any per-service mode, check if "all" is specified
     for service in "${services_to_deploy[@]}"; do
         if [[ "$service" == "all" ]]; then
-            log_error "Timing/Windowed mode does not support 'all' services. Please specify individual services."
+            log_error "Timing/Windowed/Online mode does not support 'all' services. Please specify individual services."
             exit 1
         fi
     done
 fi
 
 log_info "Deploying services: ${services_to_deploy[*]} with tag: $tag"
-if [[ "$WINDOWED_MODE" == "true" ]]; then
+if [[ "$ONLINE_MODE" == "true" ]]; then
+    log_info "Stage 3 online mode enabled - building per-service images via Dockerfile.online (libonnxruntime + .onnx + shortlist baked in)"
+elif [[ "$WINDOWED_MODE" == "true" ]]; then
     log_info "Windowed sampling mode enabled - building service-specific images with perf counters"
 elif [[ "$TIMING_MODE" == "true" ]]; then
     log_info "Timing mode enabled - building service-specific images"
