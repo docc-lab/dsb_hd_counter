@@ -13,6 +13,7 @@ require (
 	github.com/opentracing/opentracing-go v1.2.0
 	github.com/rs/zerolog v1.31.0
 	github.com/uber/jaeger-client-go v2.30.0+incompatible
+	github.com/yalue/onnxruntime_go v1.10.0
 	go.mongodb.org/mongo-driver v1.12.2
 	golang.org/x/net v0.17.0
 	google.golang.org/grpc v1.56.3

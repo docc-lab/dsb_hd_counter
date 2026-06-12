@@ -141,6 +141,9 @@ github.com/xdg-go/scram
 # github.com/xdg-go/stringprep v1.0.4
 ## explicit; go 1.11
 github.com/xdg-go/stringprep
+# github.com/yalue/onnxruntime_go v1.10.0
+## explicit; go 1.19
+github.com/yalue/onnxruntime_go
 # github.com/youmark/pkcs8 v0.0.0-20181117223130-1be2e3e5546d
 ## explicit
 github.com/youmark/pkcs8
