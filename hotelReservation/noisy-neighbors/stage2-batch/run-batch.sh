@@ -13,14 +13,22 @@
 # from.
 #
 # Usage (from anywhere):
-#   ./stage2-batch/run-batch.sh                       # all configs/[0-9]*.conf, resume mode
+#   ./stage2-batch/run-batch.sh                       # show plan + interactively confirm before running
+#   ./stage2-batch/run-batch.sh -y                    # skip confirmation (for tmux/automation)
 #   ./stage2-batch/run-batch.sh --no-resume           # also re-run configs that already passed
 #   ./stage2-batch/run-batch.sh --pattern 'configs/10s_*.conf'   # custom glob
-#   ./stage2-batch/run-batch.sh --dry-run             # show what WOULD run; don't execute
+#   ./stage2-batch/run-batch.sh --dry-run             # print plan and exit; do NOT execute
 #   ./stage2-batch/run-batch.sh --stop-file PATH      # graceful-stop sentinel (default: ./STOP_BATCH)
+#
+# Default UX:
+#   By default, run-batch.sh prints the full plan (configs that will run vs
+#   skip, estimated wall time) and waits for an interactive "yes" before
+#   touching the cluster. Use -y / --yes to skip the prompt (required when
+#   stdin isn't a TTY, e.g. inside tmux send-keys, nohup, CI).
 #
 # Behavior:
 #   - Runs stage2-batch/cluster-healthcheck.sh once at the start (must pass).
+#   - Prints the batch plan; asks for confirmation unless -y or --dry-run.
 #   - For each config:
 #       * if the stop sentinel exists, exit cleanly BEFORE the next config
 #       * skip if a successful run already exists (resume mode, default)
@@ -42,7 +50,8 @@
 # Exit codes: 0 = batch finished (with or without per-run failures),
 #             1 = initial preflight failed,
 #             2 = mid-batch preflight failed (aborted partway),
-#             3 = stopped by --stop-file sentinel.
+#             3 = stopped by --stop-file sentinel,
+#             4 = user declined the confirmation prompt.
 # ===========================================================================
 
 set -u
@@ -64,6 +73,7 @@ fi
 PATTERN='configs/[0-9]*.conf'
 RESUME=true
 DRY_RUN=false
+ASSUME_YES=false
 STOP_FILE='./STOP_BATCH'
 
 while [[ $# -gt 0 ]]; do
@@ -72,9 +82,10 @@ while [[ $# -gt 0 ]]; do
         --resume)    RESUME=true;  shift ;;
         --pattern)   PATTERN="$2"; shift 2 ;;
         --dry-run)   DRY_RUN=true; shift ;;
+        -y|--yes)    ASSUME_YES=true; shift ;;
         --stop-file) STOP_FILE="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,49p' "$0"
+            sed -n '2,55p' "$0"
             exit 0
             ;;
         *)
@@ -139,11 +150,91 @@ if [[ ${#configs[@]} -eq 0 ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Plan preview: classify each config as WILL-RUN / WILL-SKIP, so the operator
+# can see exactly what's about to happen before committing the cluster to
+# ~hours of work.
+# ---------------------------------------------------------------------------
+to_run=()
+to_skip=()
+for cfg in "${configs[@]}"; do
+    name=$(basename "$cfg" .conf)
+    if $RESUME && already_passed "$name"; then
+        to_skip+=("$name")
+    else
+        to_run+=("$name")
+    fi
+done
+
+# Estimate wall time. ~3 iterations * (45s startup + 90s avg run + cleanup)
+# ~= 7 min/config. Plus ~30s preflight between runs. Crude but useful.
+secs_per_cfg=$((7 * 60 + 30))
+est_secs=$(( ${#to_run[@]} * secs_per_cfg ))
+est_h=$(( est_secs / 3600 ))
+est_m=$(( (est_secs % 3600) / 60 ))
+
 echo
-echo "Found ${#configs[@]} config(s) matching '$PATTERN'"
-$RESUME && echo "Resume mode: ON (configs with a successful run will be skipped)"
-$DRY_RUN && echo "Dry-run: ON (data-collector.sh will NOT be invoked)"
+echo "============================================================"
+echo "Batch plan"
+echo "============================================================"
+echo "  Pattern:        $PATTERN"
+echo "  Matched:        ${#configs[@]} config(s)"
+echo "  Will run:       ${#to_run[@]}"
+echo "  Will skip:      ${#to_skip[@]}  (already have validation_success.txt)"
+echo "  Resume mode:    $($RESUME && echo ON || echo OFF)"
+echo "  Dry-run:        $($DRY_RUN && echo ON || echo OFF)"
+echo "  Stop sentinel:  $STOP_FILE"
+echo "  Logs dir:       $(pwd)/batch_logs/"
+echo "  Est. wall time: ~${est_h}h ${est_m}m (very rough, ${secs_per_cfg}s/config)"
+echo "------------------------------------------------------------"
+
+if (( ${#to_run[@]} == 0 )); then
+    echo "Nothing to do; all matched configs already have a successful run."
+    echo "Use --no-resume to force-rerun them."
+    exit 0
+fi
+
+# Show the actual list. Cap noise at ~20 entries; print a tail count if longer.
+PREVIEW_MAX=20
+echo "Will run (first $PREVIEW_MAX of ${#to_run[@]}):"
+for ((i = 0; i < ${#to_run[@]} && i < PREVIEW_MAX; i++)); do
+    printf '    [%2d] %s\n' "$((i + 1))" "${to_run[$i]}"
+done
+if (( ${#to_run[@]} > PREVIEW_MAX )); then
+    echo "    ... and $(( ${#to_run[@]} - PREVIEW_MAX )) more"
+fi
+if (( ${#to_skip[@]} > 0 )); then
+    echo "Will skip: ${#to_skip[@]} config(s) (passing runs already on disk)"
+fi
+echo "============================================================"
 echo
+
+# ---------------------------------------------------------------------------
+# Confirmation gate.
+#   --dry-run     : print plan, exit 0 (no cluster mutation)
+#   -y / --yes    : skip prompt
+#   non-TTY stdin : require --yes (refuse to launch unattended)
+#   otherwise     : interactive "yes" prompt
+# ---------------------------------------------------------------------------
+if $DRY_RUN; then
+    echo "Dry-run: exiting before any data-collector.sh invocation."
+    exit 0
+fi
+
+if ! $ASSUME_YES; then
+    if [[ ! -t 0 ]]; then
+        echo "ERROR: stdin is not a TTY and -y / --yes was not given." >&2
+        echo "       Refusing to launch ${#to_run[@]} experiments unattended." >&2
+        echo "       Re-run with -y to bypass the prompt." >&2
+        exit 1
+    fi
+    read -r -p "Proceed with batch of ${#to_run[@]} run(s)? Type 'yes' to confirm: " reply
+    if [[ "$reply" != "yes" ]]; then
+        echo "Aborted by user (got '$reply', expected 'yes')."
+        exit 4
+    fi
+    echo
+fi
 
 # ---------------------------------------------------------------------------
 # Batch loop.
@@ -174,11 +265,6 @@ for i in "${!configs[@]}"; do
     fi
 
     echo "=== [$idx/$total] [$(date -Iseconds)] START  $name ==="
-
-    if $DRY_RUN; then
-        echo "  (dry-run: would run ./data-collector.sh $cfg)"
-        continue
-    fi
 
     if ! "$SCRIPT_DIR/cluster-healthcheck.sh" > "batch_logs/${name}.preflight.log" 2>&1; then
         echo "  PREFLIGHT FAILED before $name — aborting batch"
