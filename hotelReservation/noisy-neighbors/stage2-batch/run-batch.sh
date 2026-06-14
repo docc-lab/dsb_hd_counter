@@ -1,20 +1,26 @@
 #!/bin/bash
 # ===========================================================================
-# run-batch.sh
+# stage2-batch/run-batch.sh
 #
 # Drive a batch of data-collector.sh experiments end-to-end with pre-flight
 # cluster health checks between every run and resume-from-where-we-left-off
 # semantics across re-invocations.
 #
-# Usage:
-#   ./run-batch.sh                       # all configs/[0-9]*.conf, resume mode
-#   ./run-batch.sh --no-resume           # also re-run configs that already passed
-#   ./run-batch.sh --pattern 'configs/10s_*.conf'   # custom glob
-#   ./run-batch.sh --dry-run             # show what WOULD run; don't execute
-#   ./run-batch.sh --stop-file PATH      # graceful-stop sentinel (default: ./STOP_BATCH)
+# This script LIVES in noisy-neighbors/stage2-batch/ but always operates
+# with noisy-neighbors/ as its working directory, so relative paths like
+# configs/, experiment_data/, batch_logs/, and STOP_BATCH always anchor on
+# the noisy-neighbors directory regardless of where you invoke the script
+# from.
+#
+# Usage (from anywhere):
+#   ./stage2-batch/run-batch.sh                       # all configs/[0-9]*.conf, resume mode
+#   ./stage2-batch/run-batch.sh --no-resume           # also re-run configs that already passed
+#   ./stage2-batch/run-batch.sh --pattern 'configs/10s_*.conf'   # custom glob
+#   ./stage2-batch/run-batch.sh --dry-run             # show what WOULD run; don't execute
+#   ./stage2-batch/run-batch.sh --stop-file PATH      # graceful-stop sentinel (default: ./STOP_BATCH)
 #
 # Behavior:
-#   - Runs ./cluster-healthcheck.sh once at the start (must pass).
+#   - Runs stage2-batch/cluster-healthcheck.sh once at the start (must pass).
 #   - For each config:
 #       * if the stop sentinel exists, exit cleanly BEFORE the next config
 #       * skip if a successful run already exists (resume mode, default)
@@ -23,15 +29,16 @@
 #   - At the end, calls extract-failed-exps.sh to produce batch_logs/summary.txt.
 #
 # Graceful pause / resume:
-#   To pause AFTER the current run finishes (no partial exp_* dirs):
-#       touch STOP_BATCH        # from another shell
+#   To pause AFTER the current run finishes (no partial exp_* dirs), from
+#   another shell, in the noisy-neighbors directory:
+#       touch STOP_BATCH
 #   The script will exit with code 3 between configs.
-#   To resume later, simply re-run ./run-batch.sh; it'll skip whatever
-#   already has metadata/validation_success.txt. Remember to:
+#   To resume later, simply re-run ./stage2-batch/run-batch.sh; it'll skip
+#   whatever already has metadata/validation_success.txt. Remember to:
 #       rm -f STOP_BATCH
 #   before the new invocation.
 #
-# Logs are written under ./batch_logs/.
+# Logs are written under ./batch_logs/ (relative to noisy-neighbors).
 # Exit codes: 0 = batch finished (with or without per-run failures),
 #             1 = initial preflight failed,
 #             2 = mid-batch preflight failed (aborted partway),
@@ -39,6 +46,20 @@
 # ===========================================================================
 
 set -u
+
+# Resolve this script's directory, then anchor cwd on noisy-neighbors/ so
+# every relative path below (configs/, experiment_data/, batch_logs/,
+# STOP_BATCH, ./data-collector.sh) means the same thing regardless of where
+# the user invoked us from.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PARENT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+cd "$PARENT_DIR" || { echo "Cannot cd to $PARENT_DIR" >&2; exit 1; }
+
+if [[ ! -x ./data-collector.sh ]]; then
+    echo "ERROR: ./data-collector.sh not found or not executable in $PARENT_DIR" >&2
+    echo "       (expected stage2-batch/ to live alongside data-collector.sh)" >&2
+    exit 1
+fi
 
 PATTERN='configs/[0-9]*.conf'
 RESUME=true
@@ -53,7 +74,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)   DRY_RUN=true; shift ;;
         --stop-file) STOP_FILE="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,46p' "$0"
+            sed -n '2,49p' "$0"
             exit 0
             ;;
         *)
@@ -100,7 +121,7 @@ already_passed() {
 # Initial cluster gate.
 # ---------------------------------------------------------------------------
 echo "=== Initial cluster preflight ==="
-if ! ./cluster-healthcheck.sh; then
+if ! "$SCRIPT_DIR/cluster-healthcheck.sh"; then
     echo "Aborting: cluster unhealthy at start of batch" >&2
     exit 1
 fi
@@ -159,7 +180,7 @@ for i in "${!configs[@]}"; do
         continue
     fi
 
-    if ! ./cluster-healthcheck.sh > "batch_logs/${name}.preflight.log" 2>&1; then
+    if ! "$SCRIPT_DIR/cluster-healthcheck.sh" > "batch_logs/${name}.preflight.log" 2>&1; then
         echo "  PREFLIGHT FAILED before $name — aborting batch"
         echo "  see batch_logs/${name}.preflight.log"
         failed_preflights=1
@@ -182,9 +203,9 @@ echo "  Skipped (resume):   $skipped"
 echo "  Total configs:      $total"
 echo "============================================================"
 
-if [[ -x ./extract-failed-exps.sh ]]; then
+if [[ -x "$SCRIPT_DIR/extract-failed-exps.sh" ]]; then
     echo "Generating classification summary..."
-    ./extract-failed-exps.sh ./experiment_data ./configs > batch_logs/summary.txt 2>&1 || true
+    "$SCRIPT_DIR/extract-failed-exps.sh" ./experiment_data ./configs > batch_logs/summary.txt 2>&1 || true
     tail -1 batch_logs/summary.txt
     echo "Full summary: batch_logs/summary.txt"
 fi
@@ -194,7 +215,7 @@ if [[ $failed_preflights -ne 0 ]]; then
 fi
 if [[ $stopped -ne 0 ]]; then
     echo "Paused. Remove the sentinel and re-run to resume:"
-    echo "    rm $STOP_FILE && ./run-batch.sh"
+    echo "    rm $STOP_FILE && ./stage2-batch/run-batch.sh"
     exit 3
 fi
 exit 0
