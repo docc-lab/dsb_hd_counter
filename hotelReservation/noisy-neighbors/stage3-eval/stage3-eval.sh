@@ -215,6 +215,7 @@ main() {
     deploy_testbeds
     deploy_victim
     place_all_aggressors
+    recover_consul_state
 
     s3_log "Warmup: sleeping ${EXPERIMENT_WARMUP_S}s before run 1"
     sleep "$EXPERIMENT_WARMUP_S"
@@ -365,6 +366,55 @@ place_all_aggressors() {
         wait_aggressor_ready "$ns" "$deploy" 180 \
             || s3_log "WARNING: $ns/$deploy did not become Ready in 180s; proceeding"
     done
+}
+
+# ---------------------------------------------------------------------------
+# Heal Consul state after victim + aggressor rolls.
+#
+# Why: the orchestrator's deploy_victim + place_all_aggressors roll the
+# search / geo / profile pods so they get new pod IPs. HR's grpc clients
+# (frontend in particular, but also the chained services) use a Consul
+# resolver. After Consul itself was ever rolled in this session, the
+# resolver's watch is stuck in "bad resolver state" and never re-pulls
+# fresh srv-* registrations. Symptom: 100 % non-2xx responses on wrk.
+#
+# Mitigation we port from batch-perf's data-collector.sh (which is
+# already sourced at the top of this file):
+#   1. clean_stale_consul_services       - sweep srv-* entries whose
+#                                          backing pod IP no longer
+#                                          exists in the cluster.
+#   2. kubectl rollout restart frontend  - force the grpc client to
+#                                          re-establish the resolver.
+#   3. monitor_consul_service_registration - wait until all expected
+#                                          srv-* are back in the
+#                                          catalog before warmup.
+#
+# All three are best-effort: warnings, never die. If the cluster is
+# already healthy (no stale entries, frontend resolver fine), this is
+# essentially a no-op.
+# ---------------------------------------------------------------------------
+recover_consul_state() {
+    s3_log "Consul recovery: clean stale srv-* + bounce frontend (heals 'bad resolver state' from prior rolls)"
+
+    if declare -F clean_stale_consul_services >/dev/null 2>&1; then
+        clean_stale_consul_services "$EXP_DIR" \
+            >> "$EXP_DIR/logs/stage3-eval.log" 2>&1 || true
+    else
+        s3_log "  WARNING: clean_stale_consul_services not available (data-collector.sh not sourced?)"
+    fi
+
+    s3_log "  Restarting frontend to refresh grpc-consul resolver"
+    kubectl rollout restart deployment/frontend >/dev/null 2>&1 || true
+    kubectl rollout status  deployment/frontend --timeout=120s >/dev/null 2>&1 \
+        || s3_log "  WARNING: frontend rollout did not complete in 120s; proceeding"
+
+    if declare -F monitor_consul_service_registration >/dev/null 2>&1; then
+        monitor_consul_service_registration "$EXP_DIR" 60 5 \
+            >> "$EXP_DIR/logs/stage3-eval.log" 2>&1 \
+            || s3_log "  WARNING: not all srv-* registered in Consul within 60s; proceeding (warmup will absorb some)"
+    fi
+
+    s3_log "Consul recovery complete"
 }
 
 # _resolve_ns <testbed-name>     -> namespace
