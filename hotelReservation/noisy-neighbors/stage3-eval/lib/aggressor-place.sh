@@ -1,0 +1,131 @@
+#!/bin/bash
+# ===========================================================================
+# aggressor-place.sh
+#
+# Patches `nodeSelector: { kubernetes.io/hostname: <target_node> }` plus
+# the standard `dedicated=special:NoSchedule` toleration onto a chosen
+# aggressor deployment so it lands on the victim's node. Idempotent.
+#
+# Why we don't reuse ../node-taint.sh:
+#   - node-taint.sh adds a node taint + rolls out the deployment.
+#   - We don't want to taint the aggressor's node (the victim's
+#     existing pinning already establishes the taint).
+#   - We don't want each aggressor placement to trigger an immediate
+#     rollout restart -- the testbed-*.sh modules handle waiting once,
+#     after all aggressor placements are queued.
+#   - node-taint.sh is namespace-unaware; SN ships into 'aggressor-sn'.
+#
+# The patches here mirror node-taint.sh's manifest exactly so the same
+# taint/toleration semantics apply -- no cluster-side surprises.
+# ===========================================================================
+
+set -u
+
+# Mirror node-taint.sh constants so tolerations align with any existing
+# tainted nodes the cluster might have.
+PLACE_TAINT_KEY="${PLACE_TAINT_KEY:-dedicated}"
+PLACE_TAINT_VALUE="${PLACE_TAINT_VALUE:-special}"
+PLACE_TAINT_EFFECT="${PLACE_TAINT_EFFECT:-NoSchedule}"
+
+# ---------------------------------------------------------------------------
+# place_aggressor <namespace> <deployment> <target_node>
+#
+# Adds nodeSelector + toleration to the deployment template spec.
+# Does NOT trigger a rollout restart -- caller is responsible for
+# kubectl rollout restart + kubectl rollout status if needed.
+# Returns 0 on success.
+# ---------------------------------------------------------------------------
+place_aggressor() {
+    local ns="$1"
+    local deploy="$2"
+    local node="$3"
+
+    if ! kubectl -n "$ns" get deployment "$deploy" >/dev/null 2>&1; then
+        echo "ERROR [aggressor-place]: deployment '$deploy' not found in namespace '$ns'" >&2
+        return 1
+    fi
+
+    # Merge-patch is fine here because nodeSelector + tolerations are
+    # top-level pod template fields that don't need positional ops.
+    kubectl -n "$ns" patch deployment "$deploy" --type='merge' -p "{
+      \"spec\": {
+        \"template\": {
+          \"spec\": {
+            \"nodeSelector\": { \"kubernetes.io/hostname\": \"$node\" },
+            \"tolerations\": [
+              {
+                \"key\":      \"$PLACE_TAINT_KEY\",
+                \"operator\": \"Equal\",
+                \"value\":    \"$PLACE_TAINT_VALUE\",
+                \"effect\":   \"$PLACE_TAINT_EFFECT\"
+              }
+            ]
+          }
+        }
+      }
+    }" >/dev/null 2>&1 || {
+        echo "ERROR [aggressor-place]: failed to patch $ns/$deploy" >&2
+        return 1
+    }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# unplace_aggressor <namespace> <deployment>
+#
+# Removes nodeSelector + tolerations from the deployment template spec.
+# Idempotent. Used by stage3-eval.sh's cleanup trap so the cluster
+# returns to the same shape it had pre-experiment.
+# ---------------------------------------------------------------------------
+unplace_aggressor() {
+    local ns="$1"
+    local deploy="$2"
+
+    if ! kubectl -n "$ns" get deployment "$deploy" >/dev/null 2>&1; then
+        return 0  # nothing to undo
+    fi
+
+    # Setting fields to null via merge patch deletes them.
+    kubectl -n "$ns" patch deployment "$deploy" --type='merge' -p '{
+      "spec": {
+        "template": {
+          "spec": {
+            "nodeSelector": null,
+            "tolerations":  null
+          }
+        }
+      }
+    }' >/dev/null 2>&1 || true
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# wait_aggressor_ready <namespace> <deployment> [timeout-seconds]
+#
+# Triggers a rollout restart so the new nodeSelector takes effect, then
+# waits for the deployment to be Ready on the new node. Separated from
+# place_aggressor so the caller can place all aggressors first (cheap
+# patches) and then wait for them in parallel.
+# ---------------------------------------------------------------------------
+wait_aggressor_ready() {
+    local ns="$1"
+    local deploy="$2"
+    local timeout="${3:-180}"
+
+    kubectl -n "$ns" rollout restart deployment "$deploy" >/dev/null 2>&1 || true
+    kubectl -n "$ns" rollout status  deployment "$deploy" --timeout="${timeout}s"
+}
+
+# ---------------------------------------------------------------------------
+# aggressor_pod_name <namespace> <deployment-label-selector>
+#
+# Echoes the first matching pod name (or empty if none). Used by
+# write-run-manifest.sh to record live pod identity at run time so the
+# mitigation side can resolve which container produced a given counter.
+# ---------------------------------------------------------------------------
+aggressor_pod_name() {
+    local ns="$1"
+    local selector="$2"
+    kubectl -n "$ns" get pods -l "$selector" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+}

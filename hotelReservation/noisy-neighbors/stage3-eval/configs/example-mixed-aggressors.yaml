@@ -1,0 +1,65 @@
+# Stage 3 Aggressor Eval -- Mixed cross-testbed example
+#
+# Demonstrates the heterogeneous aggressor list: a single experiment
+# pulls aggressors from multiple testbeds (HR + socialNetwork + sockshop)
+# and runs one independent wrk2 driver per testbed in parallel.
+#
+# This is the shape any "good vs bad with realistic mix of co-tenants"
+# experiment will take. The bad-vs-good role labels are pure metadata
+# for the mitigation-side eval-report fetcher to slice on.
+#
+# Pre-requisite: the sockshop testbed integration must be implemented
+# first (see ../TODO_SOCKSHOP.md) for the sockshop entries to work.
+# Until then, comment out the sockshop aggressor below and the
+# orchestrator runs cleanly with HR + SN only.
+#
+# To run (after editing target_node + image tag):
+#   ./stage3-eval.sh configs/example-mixed-aggressors.yaml
+#
+# Output lands in data/<experiment_id>/. See ../configs/schema.md for
+# the full schema and ../README.md for the mitigation-side contract.
+
+experiment:
+  name:        mixed-aggressors-cross-testbed
+  duration_s:  300
+  warmup_s:    30
+  cooldown_s:  30
+  runs:        3
+  target_node: node-3
+
+testbeds:
+  hotelReservation:
+    loadgen: { rps: 200, shape: fixed }
+  socialNetwork:
+    loadgen: { rps: 150, shape: fixed }
+  sockshop:
+    loadgen: { rps: 100, shape: fixed }
+
+victim:
+  testbed:   hotelReservation
+  service:   search
+  image:     docclabgroup/search-online:v1.0
+  score_log: false
+
+aggressors:
+  # HR co-tenants colocated with the victim on target_node.
+  - testbed: hotelReservation
+    service: profile
+    role:    bad
+
+  - testbed: hotelReservation
+    service: geo
+    role:    good
+
+  # SN co-tenant from a different testbed. The compose-post service
+  # lives on the victim's node; other SN services schedule wherever
+  # k8s puts them. Independent wrk2 drives SN via nginx-thrift.
+  - testbed: socialNetwork
+    service: compose-post
+    role:    bad
+
+  # sockshop co-tenant (requires testbed-ss.sh to be implemented;
+  # comment out the entry below until sockshop ships).
+  - testbed: sockshop
+    service: carts
+    role:    bad

@@ -1,0 +1,42 @@
+# Stage 3 Aggressor Eval -- Default starter example
+#
+# A minimal HR-only experiment: search victim plus one "good" HR
+# aggressor (geo) and one "bad" HR aggressor (profile), both colocated
+# on the victim's node. All three sit in HR's call chain and get
+# traffic from the single HR wrk2 driver below.
+#
+# This is intended as a starting template, not a baseline comparison
+# point -- copy + edit for your own experiments.
+#
+# To run:
+#   ./stage3-eval.sh configs/example-default.yaml
+#
+# Output lands in data/<experiment_id>/. See ../configs/schema.md for
+# the full schema and ../README.md for what the mitigation side reads.
+
+experiment:
+  name:        default-good-vs-bad
+  duration_s:  300
+  warmup_s:    30
+  cooldown_s:  30
+  runs:        3
+  target_node: node-3
+
+testbeds:
+  hotelReservation:
+    loadgen: { rps: 200, shape: fixed }
+
+victim:
+  testbed:   hotelReservation
+  service:   search
+  image:     docclabgroup/search-online:v1.0
+  score_log: false                                # GORDION_SCORE_LOG=false in pod env
+
+aggressors:
+  - testbed: hotelReservation
+    service: geo
+    role:    good
+
+  - testbed: hotelReservation
+    service: profile
+    role:    bad
