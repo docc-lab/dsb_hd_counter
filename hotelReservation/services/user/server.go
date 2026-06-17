@@ -55,15 +55,10 @@ func (s *Server) Run() error {
 
 	// Configure timing interceptor (can be controlled via environment variables)
 	enableTiming := os.Getenv("ENABLE_TIMING") == "true"
-	statsFile := os.Getenv("STATS_FILE")
-	if statsFile == "" {
-		statsFile = "timing_stats_user.json"
-	}
 
 	timingConfig := interceptor.TimingConfig{
 		EnableTiming: enableTiming,
 		ServiceName:  name,
-		StatsFile:    statsFile,
 	}
 
 	serverOpts := interceptor.ServerOptions{
@@ -82,7 +77,7 @@ func (s *Server) Run() error {
 	}
 
 	if enableTiming {
-		log.Info().Str("service", name).Str("stats_file", statsFile).Msg("Timing interceptor ENABLED")
+		log.Info().Str("service", name).Msg("Timing interceptor ENABLED")
 	} else {
 		log.Info().Str("service", name).Msg("Timing interceptor DISABLED")
 	}
