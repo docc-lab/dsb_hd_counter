@@ -1,0 +1,30 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-pod
+  labels:
+    blueprint.service: order-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: order-pod
+  template:
+    metadata:
+      name: order-pod
+      labels:
+        blueprint.service: order-pod
+    spec:
+      containers:
+      
+        - name: order-ctr
+          image: docclabgroup/sockshop_order_ctr
+          imagePullPolicy: Always
+          env:
+            - name: ORDER_SERVICE_GRPC_BIND_ADDR
+              value: "0.0.0.0:12345"
+          ports:
+            - containerPort: 12345
+      restartPolicy: Always
+      hostname: order-pod

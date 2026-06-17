@@ -1,0 +1,32 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalogue-db-pod
+  labels:
+    blueprint.service: catalogue-db-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: catalogue-db-pod
+  template:
+    metadata:
+      name: catalogue-db-pod
+      labels:
+        blueprint.service: catalogue-db-pod
+    spec:
+      containers:
+      
+        - name: catalogue-db-ctr
+          image: mysql/mysql-server
+          imagePullPolicy: Always
+          env:
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+            - name: MYSQL_ROOT_PASSWORD
+              value: "pass"
+          ports:
+            - containerPort: 3306
+      restartPolicy: Always
+      hostname: catalogue-db-pod

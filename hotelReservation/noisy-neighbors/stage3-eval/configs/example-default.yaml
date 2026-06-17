@@ -15,28 +15,24 @@
 # the full schema and ../README.md for what the mitigation side reads.
 
 experiment:
-  name:        default-good-vs-bad
-  duration_s:  300
-  warmup_s:    30
-  cooldown_s:  30
-  runs:        3
+  name: default-good-vs-bad
+  duration_s: 180
+  warmup_s: 10
+  cooldown_s: 10
+  runs: 1
   target_node: node-3
-
 testbeds:
   hotelReservation:
-    loadgen: { rps: 200, shape: fixed }
-
+    loadgen: {rps: 200, shape: fixed}
 victim:
-  testbed:   hotelReservation
-  service:   search
-  image:     docclabgroup/search-online:v1.2.1
-  score_log: false                                # GORDION_SCORE_LOG=false in pod env
-
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v1.2.1
+  score_log: true # GORDION_SCORE_LOG=false in pod env
 aggressors:
   - testbed: hotelReservation
     service: geo
-    role:    good
-
+    role: good
   - testbed: hotelReservation
     service: profile
-    role:    bad
+    role: bad

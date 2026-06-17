@@ -1,0 +1,27 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-db-pod
+  labels:
+    blueprint.service: order-db-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: order-db-pod
+  template:
+    metadata:
+      name: order-db-pod
+      labels:
+        blueprint.service: order-db-pod
+    spec:
+      containers:
+      
+        - name: order-db-ctr
+          image: mongo
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 27017
+      restartPolicy: Always
+      hostname: order-db-pod

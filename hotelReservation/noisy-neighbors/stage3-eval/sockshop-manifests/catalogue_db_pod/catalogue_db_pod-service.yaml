@@ -1,0 +1,13 @@
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogue-db-pod
+spec:
+  selector:
+    blueprint.service: catalogue-db-pod
+  ports:
+  
+    - name: catalogue-db-addr
+      port: 3306
+      targetPort: 3306

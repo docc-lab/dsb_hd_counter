@@ -1,0 +1,27 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zipkin-pod
+  labels:
+    blueprint.service: zipkin-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: zipkin-pod
+  template:
+    metadata:
+      name: zipkin-pod
+      labels:
+        blueprint.service: zipkin-pod
+    spec:
+      containers:
+      
+        - name: zipkin-ctr
+          image: openzipkin/zipkin
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9411
+      restartPolicy: Always
+      hostname: zipkin-pod

@@ -1,0 +1,133 @@
+syntax="proto3";
+option go_package="./;grpc";
+package grpc;
+
+
+message UserService_Address {
+    string Street = 1;
+    string Number = 2;
+    string Country = 3;
+    string City = 4;
+    string PostCode = 5;
+    string ID = 6;
+}
+
+message UserService_Card {
+    string LongNum = 1;
+    string Expires = 2;
+    string CCV = 3;
+    string ID = 4;
+}
+
+message UserService_OTServerWrapperInterface_Delete_Request {
+    string entity = 1;
+    string id = 2;
+    string traceCtx = 3;
+}
+
+message UserService_OTServerWrapperInterface_Delete_Response {
+}
+
+message UserService_OTServerWrapperInterface_GetAddresses_Request {
+    string id = 1;
+    string traceCtx = 2;
+}
+
+message UserService_OTServerWrapperInterface_GetAddresses_Response {
+    repeated UserService_Address ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_GetCards_Request {
+    string cardid = 1;
+    string traceCtx = 2;
+}
+
+message UserService_OTServerWrapperInterface_GetCards_Response {
+    repeated UserService_Card ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_GetUsers_Request {
+    string id = 1;
+    string traceCtx = 2;
+}
+
+message UserService_OTServerWrapperInterface_GetUsers_Response {
+    repeated UserService_User ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_Login_Request {
+    string username = 1;
+    string password = 2;
+    string traceCtx = 3;
+}
+
+message UserService_OTServerWrapperInterface_Login_Response {
+    UserService_User ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_PostAddress_Request {
+    string userid = 1;
+    UserService_Address address = 2;
+    string traceCtx = 3;
+}
+
+message UserService_OTServerWrapperInterface_PostAddress_Response {
+    string ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_PostCard_Request {
+    string userid = 1;
+    UserService_Card card = 2;
+    string traceCtx = 3;
+}
+
+message UserService_OTServerWrapperInterface_PostCard_Response {
+    string ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_PostUser_Request {
+    UserService_User user = 1;
+    string traceCtx = 2;
+}
+
+message UserService_OTServerWrapperInterface_PostUser_Response {
+    string ret0 = 1;
+}
+
+message UserService_OTServerWrapperInterface_Register_Request {
+    string username = 1;
+    string password = 2;
+    string email = 3;
+    string first = 4;
+    string last = 5;
+    string traceCtx = 6;
+}
+
+message UserService_OTServerWrapperInterface_Register_Response {
+    string ret0 = 1;
+}
+
+message UserService_User {
+    string FirstName = 1;
+    string LastName = 2;
+    string Email = 3;
+    string Username = 4;
+    string Password = 5;
+    repeated UserService_Address Addresses = 6;
+    repeated UserService_Card Cards = 7;
+    string UserID = 8;
+    string Salt = 9;
+}
+
+service UserService_OTServerWrapperInterface {
+    rpc Delete (UserService_OTServerWrapperInterface_Delete_Request) returns (UserService_OTServerWrapperInterface_Delete_Response) {}
+    rpc GetAddresses (UserService_OTServerWrapperInterface_GetAddresses_Request) returns (UserService_OTServerWrapperInterface_GetAddresses_Response) {}
+    rpc GetCards (UserService_OTServerWrapperInterface_GetCards_Request) returns (UserService_OTServerWrapperInterface_GetCards_Response) {}
+    rpc GetUsers (UserService_OTServerWrapperInterface_GetUsers_Request) returns (UserService_OTServerWrapperInterface_GetUsers_Response) {}
+    rpc Login (UserService_OTServerWrapperInterface_Login_Request) returns (UserService_OTServerWrapperInterface_Login_Response) {}
+    rpc PostAddress (UserService_OTServerWrapperInterface_PostAddress_Request) returns (UserService_OTServerWrapperInterface_PostAddress_Response) {}
+    rpc PostCard (UserService_OTServerWrapperInterface_PostCard_Request) returns (UserService_OTServerWrapperInterface_PostCard_Response) {}
+    rpc PostUser (UserService_OTServerWrapperInterface_PostUser_Request) returns (UserService_OTServerWrapperInterface_PostUser_Response) {}
+    rpc Register (UserService_OTServerWrapperInterface_Register_Request) returns (UserService_OTServerWrapperInterface_Register_Response) {}
+}
+

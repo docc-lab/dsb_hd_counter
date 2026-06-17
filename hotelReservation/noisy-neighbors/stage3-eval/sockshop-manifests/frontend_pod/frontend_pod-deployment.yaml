@@ -1,0 +1,30 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-pod
+  labels:
+    blueprint.service: frontend-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: frontend-pod
+  template:
+    metadata:
+      name: frontend-pod
+      labels:
+        blueprint.service: frontend-pod
+    spec:
+      containers:
+      
+        - name: frontend-ctr
+          image: docclabgroup/sockshop_frontend_ctr
+          imagePullPolicy: Always
+          env:
+            - name: FRONTEND_HTTP_BIND_ADDR
+              value: "0.0.0.0:2000"
+          ports:
+            - containerPort: 2000
+      restartPolicy: Always
+      hostname: frontend-pod

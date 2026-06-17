@@ -1,0 +1,91 @@
+syntax="proto3";
+option go_package="./;grpc";
+package grpc;
+
+
+message CatalogueService_OTServerWrapperInterface_AddSock_Request {
+    CatalogueService_Sock sock = 1;
+    string traceCtx = 2;
+}
+
+message CatalogueService_OTServerWrapperInterface_AddSock_Response {
+    string ret0 = 1;
+}
+
+message CatalogueService_OTServerWrapperInterface_AddTags_Request {
+    repeated string tags = 1;
+    string traceCtx = 2;
+}
+
+message CatalogueService_OTServerWrapperInterface_AddTags_Response {
+}
+
+message CatalogueService_OTServerWrapperInterface_Count_Request {
+    repeated string tags = 1;
+    string traceCtx = 2;
+}
+
+message CatalogueService_OTServerWrapperInterface_Count_Response {
+    sint64 ret0 = 1;
+}
+
+message CatalogueService_OTServerWrapperInterface_DeleteSock_Request {
+    string id = 1;
+    string traceCtx = 2;
+}
+
+message CatalogueService_OTServerWrapperInterface_DeleteSock_Response {
+}
+
+message CatalogueService_OTServerWrapperInterface_Get_Request {
+    string id = 1;
+    string traceCtx = 2;
+}
+
+message CatalogueService_OTServerWrapperInterface_Get_Response {
+    CatalogueService_Sock ret0 = 1;
+}
+
+message CatalogueService_OTServerWrapperInterface_List_Request {
+    repeated string tags = 1;
+    string order = 2;
+    sint64 pageNum = 3;
+    sint64 pageSize = 4;
+    string traceCtx = 5;
+}
+
+message CatalogueService_OTServerWrapperInterface_List_Response {
+    repeated CatalogueService_Sock ret0 = 1;
+}
+
+message CatalogueService_OTServerWrapperInterface_Tags_Request {
+    string traceCtx = 1;
+}
+
+message CatalogueService_OTServerWrapperInterface_Tags_Response {
+    repeated string ret0 = 1;
+}
+
+message CatalogueService_Sock {
+    string ID = 1;
+    string Name = 2;
+    string Description = 3;
+    repeated string ImageURL = 4;
+    string ImageURL_1 = 5;
+    string ImageURL_2 = 6;
+    float Price = 7;
+    sint64 Quantity = 8;
+    repeated string Tags = 9;
+    string TagString = 10;
+}
+
+service CatalogueService_OTServerWrapperInterface {
+    rpc AddSock (CatalogueService_OTServerWrapperInterface_AddSock_Request) returns (CatalogueService_OTServerWrapperInterface_AddSock_Response) {}
+    rpc AddTags (CatalogueService_OTServerWrapperInterface_AddTags_Request) returns (CatalogueService_OTServerWrapperInterface_AddTags_Response) {}
+    rpc Count (CatalogueService_OTServerWrapperInterface_Count_Request) returns (CatalogueService_OTServerWrapperInterface_Count_Response) {}
+    rpc DeleteSock (CatalogueService_OTServerWrapperInterface_DeleteSock_Request) returns (CatalogueService_OTServerWrapperInterface_DeleteSock_Response) {}
+    rpc Get (CatalogueService_OTServerWrapperInterface_Get_Request) returns (CatalogueService_OTServerWrapperInterface_Get_Response) {}
+    rpc List (CatalogueService_OTServerWrapperInterface_List_Request) returns (CatalogueService_OTServerWrapperInterface_List_Response) {}
+    rpc Tags (CatalogueService_OTServerWrapperInterface_Tags_Request) returns (CatalogueService_OTServerWrapperInterface_Tags_Response) {}
+}
+

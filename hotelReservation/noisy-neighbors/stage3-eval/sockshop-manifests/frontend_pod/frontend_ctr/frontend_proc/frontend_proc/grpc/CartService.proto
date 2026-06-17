@@ -1,0 +1,85 @@
+syntax="proto3";
+option go_package="./;grpc";
+package grpc;
+
+
+message CartService_Item {
+    string ID = 1;
+    sint64 Quantity = 2;
+    float UnitPrice = 3;
+}
+
+message CartService_OTServerWrapperInterface_AddItem_Request {
+    string customerID = 1;
+    CartService_Item item = 2;
+    string traceCtx = 3;
+}
+
+message CartService_OTServerWrapperInterface_AddItem_Response {
+    CartService_Item ret0 = 1;
+}
+
+message CartService_OTServerWrapperInterface_DeleteCart_Request {
+    string customerID = 1;
+    string traceCtx = 2;
+}
+
+message CartService_OTServerWrapperInterface_DeleteCart_Response {
+}
+
+message CartService_OTServerWrapperInterface_GetCart_Request {
+    string customerID = 1;
+    string traceCtx = 2;
+}
+
+message CartService_OTServerWrapperInterface_GetCart_Response {
+    repeated CartService_Item ret0 = 1;
+}
+
+message CartService_OTServerWrapperInterface_GetItem_Request {
+    string customerID = 1;
+    string itemID = 2;
+    string traceCtx = 3;
+}
+
+message CartService_OTServerWrapperInterface_GetItem_Response {
+    CartService_Item ret0 = 1;
+}
+
+message CartService_OTServerWrapperInterface_MergeCarts_Request {
+    string customerID = 1;
+    string sessionID = 2;
+    string traceCtx = 3;
+}
+
+message CartService_OTServerWrapperInterface_MergeCarts_Response {
+}
+
+message CartService_OTServerWrapperInterface_RemoveItem_Request {
+    string customerID = 1;
+    string itemID = 2;
+    string traceCtx = 3;
+}
+
+message CartService_OTServerWrapperInterface_RemoveItem_Response {
+}
+
+message CartService_OTServerWrapperInterface_UpdateItem_Request {
+    string customerID = 1;
+    CartService_Item item = 2;
+    string traceCtx = 3;
+}
+
+message CartService_OTServerWrapperInterface_UpdateItem_Response {
+}
+
+service CartService_OTServerWrapperInterface {
+    rpc AddItem (CartService_OTServerWrapperInterface_AddItem_Request) returns (CartService_OTServerWrapperInterface_AddItem_Response) {}
+    rpc DeleteCart (CartService_OTServerWrapperInterface_DeleteCart_Request) returns (CartService_OTServerWrapperInterface_DeleteCart_Response) {}
+    rpc GetCart (CartService_OTServerWrapperInterface_GetCart_Request) returns (CartService_OTServerWrapperInterface_GetCart_Response) {}
+    rpc GetItem (CartService_OTServerWrapperInterface_GetItem_Request) returns (CartService_OTServerWrapperInterface_GetItem_Response) {}
+    rpc MergeCarts (CartService_OTServerWrapperInterface_MergeCarts_Request) returns (CartService_OTServerWrapperInterface_MergeCarts_Response) {}
+    rpc RemoveItem (CartService_OTServerWrapperInterface_RemoveItem_Request) returns (CartService_OTServerWrapperInterface_RemoveItem_Response) {}
+    rpc UpdateItem (CartService_OTServerWrapperInterface_UpdateItem_Request) returns (CartService_OTServerWrapperInterface_UpdateItem_Response) {}
+}
+

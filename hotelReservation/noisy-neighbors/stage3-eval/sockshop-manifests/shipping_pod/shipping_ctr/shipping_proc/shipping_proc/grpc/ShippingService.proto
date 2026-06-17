@@ -1,0 +1,44 @@
+syntax="proto3";
+option go_package="./;grpc";
+package grpc;
+
+
+message ShippingService_OTServerWrapperInterface_GetShipment_Request {
+    string id = 1;
+    string traceCtx = 2;
+}
+
+message ShippingService_OTServerWrapperInterface_GetShipment_Response {
+    ShippingService_Shipment ret0 = 1;
+}
+
+message ShippingService_OTServerWrapperInterface_PostShipping_Request {
+    ShippingService_Shipment shipment = 1;
+    string traceCtx = 2;
+}
+
+message ShippingService_OTServerWrapperInterface_PostShipping_Response {
+    ShippingService_Shipment ret0 = 1;
+}
+
+message ShippingService_OTServerWrapperInterface_UpdateStatus_Request {
+    string id = 1;
+    string status = 2;
+    string traceCtx = 3;
+}
+
+message ShippingService_OTServerWrapperInterface_UpdateStatus_Response {
+}
+
+message ShippingService_Shipment {
+    string ID = 1;
+    string Name = 2;
+    string Status = 3;
+}
+
+service ShippingService_OTServerWrapperInterface {
+    rpc GetShipment (ShippingService_OTServerWrapperInterface_GetShipment_Request) returns (ShippingService_OTServerWrapperInterface_GetShipment_Response) {}
+    rpc PostShipping (ShippingService_OTServerWrapperInterface_PostShipping_Request) returns (ShippingService_OTServerWrapperInterface_PostShipping_Response) {}
+    rpc UpdateStatus (ShippingService_OTServerWrapperInterface_UpdateStatus_Request) returns (ShippingService_OTServerWrapperInterface_UpdateStatus_Response) {}
+}
+

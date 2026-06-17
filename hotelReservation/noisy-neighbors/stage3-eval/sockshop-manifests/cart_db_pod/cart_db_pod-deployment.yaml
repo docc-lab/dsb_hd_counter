@@ -1,0 +1,27 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart-db-pod
+  labels:
+    blueprint.service: cart-db-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: cart-db-pod
+  template:
+    metadata:
+      name: cart-db-pod
+      labels:
+        blueprint.service: cart-db-pod
+    spec:
+      containers:
+      
+        - name: cart-db-ctr
+          image: mongo
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 27017
+      restartPolicy: Always
+      hostname: cart-db-pod

@@ -1,0 +1,13 @@
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogue-pod
+spec:
+  selector:
+    blueprint.service: catalogue-pod
+  ports:
+  
+    - name: catalogue-service-grpc-addr
+      port: 12345
+      targetPort: 12345

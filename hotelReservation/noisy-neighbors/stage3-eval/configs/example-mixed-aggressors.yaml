@@ -20,46 +20,40 @@
 # the full schema and ../README.md for the mitigation-side contract.
 
 experiment:
-  name:        mixed-aggressors-cross-testbed
-  duration_s:  300
-  warmup_s:    30
-  cooldown_s:  30
-  runs:        3
+  name: mixed-aggressors-cross-testbed
+  duration_s: 120
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
   target_node: node-3
-
 testbeds:
   hotelReservation:
-    loadgen: { rps: 200, shape: fixed }
+    loadgen: {rps: 200, shape: fixed}
   socialNetwork:
-    loadgen: { rps: 150, shape: fixed }
+    loadgen: {rps: 150, shape: fixed}
   sockshop:
-    loadgen: { rps: 100, shape: fixed }
-
+    loadgen: {rps: 100, shape: fixed}
 victim:
-  testbed:   hotelReservation
-  service:   search
-  image:     docclabgroup/search-online:v1.2.1
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v1.2.1
   score_log: false
-
 aggressors:
   # HR co-tenants colocated with the victim on target_node.
   - testbed: hotelReservation
     service: profile
-    role:    bad
-
+    role: bad
   - testbed: hotelReservation
     service: geo
-    role:    good
-
+    role: good
   # SN co-tenant from a different testbed. The compose-post service
   # lives on the victim's node; other SN services schedule wherever
   # k8s puts them. Independent wrk2 drives SN via nginx-thrift.
   - testbed: socialNetwork
     service: compose-post
-    role:    bad
-
+    role: bad
   # sockshop co-tenant (requires testbed-ss.sh to be implemented;
   # comment out the entry below until sockshop ships).
   - testbed: sockshop
     service: carts
-    role:    bad
+    role: bad

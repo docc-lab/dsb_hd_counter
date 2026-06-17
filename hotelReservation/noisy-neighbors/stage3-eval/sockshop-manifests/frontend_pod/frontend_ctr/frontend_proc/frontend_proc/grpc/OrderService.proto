@@ -1,0 +1,93 @@
+syntax="proto3";
+option go_package="./;grpc";
+package grpc;
+
+
+message OrderService_Address {
+    string Street = 1;
+    string Number = 2;
+    string Country = 3;
+    string City = 4;
+    string PostCode = 5;
+    string ID = 6;
+}
+
+message OrderService_Card {
+    string LongNum = 1;
+    string Expires = 2;
+    string CCV = 3;
+    string ID = 4;
+}
+
+message OrderService_Item {
+    string ID = 1;
+    sint64 Quantity = 2;
+    float UnitPrice = 3;
+}
+
+message OrderService_OTServerWrapperInterface_GetOrder_Request {
+    string orderID = 1;
+    string traceCtx = 2;
+}
+
+message OrderService_OTServerWrapperInterface_GetOrder_Response {
+    OrderService_Order ret0 = 1;
+}
+
+message OrderService_OTServerWrapperInterface_GetOrders_Request {
+    string customerID = 1;
+    string traceCtx = 2;
+}
+
+message OrderService_OTServerWrapperInterface_GetOrders_Response {
+    repeated OrderService_Order ret0 = 1;
+}
+
+message OrderService_OTServerWrapperInterface_NewOrder_Request {
+    string customerID = 1;
+    string addressID = 2;
+    string cardID = 3;
+    string cartID = 4;
+    string traceCtx = 5;
+}
+
+message OrderService_OTServerWrapperInterface_NewOrder_Response {
+    OrderService_Order ret0 = 1;
+}
+
+message OrderService_Order {
+    string ID = 1;
+    string CustomerID = 2;
+    OrderService_User Customer = 3;
+    OrderService_Address Address = 4;
+    OrderService_Card Card = 5;
+    repeated OrderService_Item Items = 6;
+    OrderService_Shipment Shipment = 7;
+    string Date = 8;
+    float Total = 9;
+}
+
+message OrderService_Shipment {
+    string ID = 1;
+    string Name = 2;
+    string Status = 3;
+}
+
+message OrderService_User {
+    string FirstName = 1;
+    string LastName = 2;
+    string Email = 3;
+    string Username = 4;
+    string Password = 5;
+    repeated OrderService_Address Addresses = 6;
+    repeated OrderService_Card Cards = 7;
+    string UserID = 8;
+    string Salt = 9;
+}
+
+service OrderService_OTServerWrapperInterface {
+    rpc GetOrder (OrderService_OTServerWrapperInterface_GetOrder_Request) returns (OrderService_OTServerWrapperInterface_GetOrder_Response) {}
+    rpc GetOrders (OrderService_OTServerWrapperInterface_GetOrders_Request) returns (OrderService_OTServerWrapperInterface_GetOrders_Response) {}
+    rpc NewOrder (OrderService_OTServerWrapperInterface_NewOrder_Request) returns (OrderService_OTServerWrapperInterface_NewOrder_Response) {}
+}
+

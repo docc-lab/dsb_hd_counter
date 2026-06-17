@@ -1,0 +1,27 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping-db-pod
+  labels:
+    blueprint.service: shipping-db-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      blueprint.service: shipping-db-pod
+  template:
+    metadata:
+      name: shipping-db-pod
+      labels:
+        blueprint.service: shipping-db-pod
+    spec:
+      containers:
+      
+        - name: shipping-db-ctr
+          image: mongo
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 27017
+      restartPolicy: Always
+      hostname: shipping-db-pod
