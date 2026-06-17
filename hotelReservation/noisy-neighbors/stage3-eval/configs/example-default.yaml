@@ -29,7 +29,7 @@ testbeds:
 victim:
   testbed:   hotelReservation
   service:   search
-  image:     docclabgroup/search-online:v1.0
+  image:     docclabgroup/search-online:v1.2.1
   score_log: false                                # GORDION_SCORE_LOG=false in pod env
 
 aggressors:
