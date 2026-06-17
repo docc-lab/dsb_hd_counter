@@ -378,16 +378,21 @@ place_all_aggressors() {
 # resolver's watch is stuck in "bad resolver state" and never re-pulls
 # fresh srv-* registrations. Symptom: 100 % non-2xx responses on wrk.
 #
-# Mitigation we port from batch-perf's data-collector.sh (which is
-# already sourced at the top of this file):
+# Mitigation, ported in spirit from batch-perf's data-collector.sh
+# (already sourced at the top of this file). We deliberately do NOT call
+# monitor_consul_service_registration / validate_and_ensure_service_registration
+# from data-collector.sh: those use `kubectl exec -it`, which fails with
+# SIGTTOU when stage3-eval.sh is run with `&` (Phase 3 backgrounds it for
+# the manual grpcurl subscribe). The TTY-safe equivalents we run here:
 #   1. clean_stale_consul_services       - sweep srv-* entries whose
 #                                          backing pod IP no longer
-#                                          exists in the cluster.
+#                                          exists in the cluster (uses
+#                                          plain `kubectl exec` -- safe).
 #   2. kubectl rollout restart frontend  - force the grpc client to
 #                                          re-establish the resolver.
-#   3. monitor_consul_service_registration - wait until all expected
+#   3. inline poll without -t            - wait until all expected
 #                                          srv-* are back in the
-#                                          catalog before warmup.
+#                                          Consul catalog.
 #
 # All three are best-effort: warnings, never die. If the cluster is
 # already healthy (no stale entries, frontend resolver fine), this is
@@ -408,10 +413,42 @@ recover_consul_state() {
     kubectl rollout status  deployment/frontend --timeout=120s >/dev/null 2>&1 \
         || s3_log "  WARNING: frontend rollout did not complete in 120s; proceeding"
 
-    if declare -F monitor_consul_service_registration >/dev/null 2>&1; then
-        monitor_consul_service_registration "$EXP_DIR" 60 5 \
-            >> "$EXP_DIR/logs/stage3-eval.log" 2>&1 \
-            || s3_log "  WARNING: not all srv-* registered in Consul within 60s; proceeding (warmup will absorb some)"
+    # TTY-safe Consul catalog poll. Runs `kubectl exec` (no -t), so it's
+    # immune to SIGTTOU when stage3-eval is run in the background.
+    local expected_services=(srv-search srv-geo srv-profile srv-rate \
+                             srv-recommendation srv-reservation srv-user)
+    local max_wait=60   # seconds
+    local interval=5
+    local elapsed=0
+    local registered=0
+    local missing=()
+
+    while (( elapsed < max_wait )); do
+        local svc_list
+        svc_list=$(kubectl exec deployment/consul -- \
+                    consul catalog services 2>/dev/null \
+                    | tr -d '\r' \
+                    | grep -E '^srv-' || true)
+        registered=0
+        missing=()
+        local expected
+        for expected in "${expected_services[@]}"; do
+            if echo "$svc_list" | grep -qx "$expected"; then
+                ((registered++))
+            else
+                missing+=("$expected")
+            fi
+        done
+        if (( registered == ${#expected_services[@]} )); then
+            s3_log "  All ${#expected_services[@]} srv-* registered in Consul (${elapsed}s)"
+            break
+        fi
+        sleep "$interval"
+        elapsed=$(( elapsed + interval ))
+    done
+
+    if (( registered < ${#expected_services[@]} )); then
+        s3_log "  WARNING: only ${registered}/${#expected_services[@]} srv-* registered after ${max_wait}s (missing: ${missing[*]:-none}); proceeding"
     fi
 
     s3_log "Consul recovery complete"
