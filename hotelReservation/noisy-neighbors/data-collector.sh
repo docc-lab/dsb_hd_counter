@@ -733,11 +733,29 @@ deploy_timing_service() {
         return 1
     fi
     
-    # Update deployment to use timing configuration
+    # Update deployment to use timing configuration.
+    #
+    # update_deployment_for_timing applies ~a dozen template mutations
+    # (set image, remove command, ~10x set env, + MSR securityContext
+    # patches). With the default RollingUpdate strategy each one bumps the
+    # pod template and spawns its own ReplicaSet, so k8s instantiates pods
+    # from HALF-configured intermediate templates -- e.g. the windowed image
+    # with the command removed and env set but the privileged/MSR patch (the
+    # LAST mutation) not yet applied. Those partial pods fail MSR init and
+    # exit 0 immediately -> CrashLoopBackOff -> the final `kubectl rollout
+    # status` blocks on a Ready that never comes until its 300s timeout.
+    #
+    # Pausing the rollout makes the deployment controller hold off until
+    # every mutation lands; resume then does ONE rollout of the final,
+    # complete template (which comes up healthy). Resume on every exit path
+    # so we never leave the deployment paused.
+    kubectl rollout pause "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
     if ! update_deployment_for_timing "$service" "$exp_dir"; then
+        kubectl rollout resume "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
         log "$exp_dir" "ERROR: Failed to update deployment for timing"
         return 1
     fi
+    kubectl rollout resume "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
     
     # Wait for rollout to complete
     log "$exp_dir" "Waiting for $service rollout to complete"
@@ -948,19 +966,27 @@ update_iteration_id() {
     for service in $victim_services; do
         if validate_timing_service "$service"; then
             log "$exp_dir" "  Setting ITERATION_ID=$iteration for $service"
-            
+
+            # Same rationale as deploy_timing_service: pause the rollout so the
+            # set-env mutations below collapse into ONE rollout instead of a
+            # cascade of ReplicaSets. Resume on every exit path so we never
+            # leave the deployment paused (a paused deployment would also make
+            # the next iteration's `kubectl rollout restart` error out).
+            kubectl rollout pause "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
+
             if ! kubectl set env "deployment/$service" "ITERATION_ID=${iteration}"; then
                 log "$exp_dir" "WARNING: Failed to set ITERATION_ID for $service"
+                kubectl rollout resume "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
                 continue
             fi
-            
+
             # Also update EXPERIMENT_DURATION if provided
             if [[ -n "$experiment_duration" ]]; then
                 if ! kubectl set env "deployment/$service" "EXPERIMENT_DURATION=${experiment_duration}"; then
                     log "$exp_dir" "WARNING: Failed to set EXPERIMENT_DURATION for $service"
                 fi
             fi
-            
+
             # Update PERF_EVENTS to ensure it matches current config (fixes issue where it might be unset)
             if [[ -n "${PERF_EVENTS:-}" ]]; then
                 log "$exp_dir" "  Setting PERF_EVENTS for $service"
@@ -968,10 +994,12 @@ update_iteration_id() {
                     log "$exp_dir" "WARNING: Failed to set PERF_EVENTS for $service"
                 fi
             fi
-            
-            # Restart pods to pick up new iteration ID
-            log "$exp_dir" "  Restarting $service pods for new iteration"
-            kubectl rollout restart "deployment/$service" 2>/dev/null || true
+
+            # Resume -> a single rollout picks up the new env. The template
+            # change already forces fresh pods, so no explicit `rollout
+            # restart` is needed (and it errors on a paused deployment).
+            log "$exp_dir" "  Rolling $service to pick up new iteration ID"
+            kubectl rollout resume "deployment/$service" >> "$exp_dir/logs/collector.log" 2>&1 || true
             kubectl rollout status "deployment/$service" --timeout=60s 2>/dev/null || log "$exp_dir" "WARNING: Timeout waiting for $service restart"
         fi
     done
