@@ -1424,7 +1424,7 @@ reset_non_victim_services() {
             
             if kubectl set image "deployment/$service" "$container_name=$default_image" 2>/dev/null; then
                 log "$exp_dir" "    Successfully reset $service to default image"
-                ((reset_count++))
+                reset_count=$((reset_count + 1))
                 
                 # Remove windowed sampling env vars if present
                 kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- ITERATION_ID- 2>/dev/null || true
@@ -1620,7 +1620,7 @@ configure_jaeger_tracing() {
                 log "$exp_dir" "   WARNING: Failed to remove JAEGER_AGENT_HOST for $service (may not exist)"
             fi
             
-            ((configured_count++))
+            configured_count=$((configured_count + 1))
         else
             log "$exp_dir" "Service $service not found, skipping Jaeger configuration"
         fi
@@ -1933,7 +1933,7 @@ manual_register_all_services() {
                 -id="manual-$service_name" 2>/dev/null; then
                 
                 log "$exp_dir" "    Successfully registered $consul_name"
-                ((registered_count++))
+                registered_count=$((registered_count + 1))
             else
                 log "$exp_dir" "    Failed to register $consul_name"
             fi
@@ -2487,7 +2487,11 @@ execute_burst_schedule() {
     local burst_num=0
     for burst_spec in "${bursts[@]}"; do
         IFS=':' read -r start_time duration intensity <<< "$burst_spec"
-        ((burst_num++))
+        # NB: must be an assignment, not ((burst_num++)). Post-increment from 0
+        # evaluates to 0, making the (( )) command return exit status 1, which
+        # under `set -e` silently kills this backgrounded subshell before any
+        # burst launches (raw/stress/ ends up empty, no contention applied).
+        burst_num=$((burst_num + 1))
         
         # Skip bursts with zero intensity
         if [[ "$intensity" == "0" || -z "$intensity" ]]; then
