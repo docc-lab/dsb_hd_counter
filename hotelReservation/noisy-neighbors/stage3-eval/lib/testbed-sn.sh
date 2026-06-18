@@ -20,6 +20,32 @@ set -u
 SN_NAMESPACE="${SN_NAMESPACE:-aggressor-sn}"
 SN_RELEASE="${SN_RELEASE:-sn-aggressor}"
 SN_CHART_DIR="${SN_CHART_DIR:-../../../socialNetwork/helm-chart/socialnetwork}"
+# Override for the SN nginx `resolver` directive. The chart defaults to the
+# hostname 'kube-dns.kube-system.svc.cluster.local', which the old
+# yg397/openresty-thrift:xenial nginx resolves at config-parse time -- if the
+# cluster's DNS Service isn't literally named 'kube-dns' that lookup fails with
+# `[emerg] host not found in resolver` and nginx-thrift/media-frontend
+# CrashLoopBackOff. Setting SN_DNS_RESOLVER to the DNS ClusterIP (an IP literal,
+# which is what nginx's resolver actually wants) sidesteps the name lookup.
+# Empty -> sn_deploy auto-detects the ClusterIP at deploy time.
+SN_DNS_RESOLVER="${SN_DNS_RESOLVER:-}"
+
+# ---------------------------------------------------------------------------
+# sn_dns_resolver
+#   Echo the cluster DNS ClusterIP to use for nginx's resolver directive.
+#   Honors an explicit SN_DNS_RESOLVER override; otherwise looks up the
+#   kube-system DNS Service by its standard k8s-app=kube-dns label (works for
+#   both kube-dns and CoreDNS, which keep that label for compatibility).
+#   Echoes nothing on failure so the caller can fall back to the chart default.
+# ---------------------------------------------------------------------------
+sn_dns_resolver() {
+    if [[ -n "$SN_DNS_RESOLVER" ]]; then
+        echo "$SN_DNS_RESOLVER"
+        return 0
+    fi
+    kubectl get svc -n kube-system -l k8s-app=kube-dns \
+        -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null
+}
 
 # Human-friendly service name -> deployment name as the helm chart
 # renders it. Most are `<chart>-<release>` or `<release>-<chart>` depending
@@ -81,9 +107,22 @@ sn_deploy() {
             echo "WARNING $log_prefix: helm dep update failed; proceeding with whatever's already in charts/" >&2
         }
 
+    # Resolve the cluster DNS ClusterIP so the SN nginx `resolver` directive
+    # gets an IP literal instead of the chart's hardcoded hostname (see
+    # SN_DNS_RESOLVER note above). Fall back to the chart default if lookup fails.
+    local dns_resolver helm_dns_args=()
+    dns_resolver="$(sn_dns_resolver)"
+    if [[ -n "$dns_resolver" ]]; then
+        echo "$log_prefix Using DNS resolver ClusterIP '$dns_resolver' for nginx"
+        helm_dns_args=(--set "global.nginx.resolverName=$dns_resolver")
+    else
+        echo "WARNING $log_prefix: could not detect kube-dns ClusterIP; using chart default resolverName (nginx may CrashLoop if it isn't named 'kube-dns')" >&2
+    fi
+
     echo "$log_prefix Deploying release '$SN_RELEASE' into namespace '$SN_NAMESPACE'"
     helm upgrade --install "$SN_RELEASE" "$SN_CHART_DIR" \
         --namespace "$SN_NAMESPACE" --create-namespace \
+        "${helm_dns_args[@]}" \
         --wait --timeout 5m \
         >> "$exp_dir/logs/testbed-sn.log" 2>&1 || {
             echo "ERROR $log_prefix: helm upgrade --install failed; see $exp_dir/logs/testbed-sn.log" >&2
