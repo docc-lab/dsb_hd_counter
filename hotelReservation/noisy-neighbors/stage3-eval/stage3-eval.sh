@@ -363,8 +363,25 @@ place_all_aggressors() {
     for entry in "${RUN_PLACED_AGGRESSORS[@]:-}"; do
         ns="${entry%%|*}"
         deploy="${entry#*|}"
-        wait_aggressor_ready "$ns" "$deploy" 180 \
-            || s3_log "WARNING: $ns/$deploy did not become Ready in 180s; proceeding"
+        if wait_aggressor_ready "$ns" "$deploy" 180; then
+            s3_log "  $ns/$deploy rollout converged; aggressor active"
+        else
+            # `rollout status` timing out is commonly BENIGN: the new
+            # nodeSelector'd pod is already Ready, but the prior replica is
+            # still terminating (slow SIGTERM handler / default 30s grace),
+            # which prevents `rollout status` from reporting full convergence.
+            # Check readyReplicas so the log states whether the aggressor is
+            # actually active rather than implying it failed.
+            local ready
+            ready=$(kubectl -n "$ns" get deployment "$deploy" \
+                -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+            ready="${ready:-0}"
+            if [[ "$ready" -ge 1 ]]; then
+                s3_log "  NOTE: $ns/$deploy did not fully converge in 180s, but $ready replica(s) Ready (old replica still terminating) -- aggressor IS active; proceeding"
+            else
+                s3_log "  WARNING: $ns/$deploy has 0 Ready replicas after 180s -- aggressor is NOT active; this testbed's contention may be absent for the run; proceeding"
+            fi
+        fi
     done
 }
 

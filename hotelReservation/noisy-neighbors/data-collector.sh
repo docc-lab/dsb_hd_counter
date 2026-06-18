@@ -632,15 +632,29 @@ apply_msr_pod_capabilities() {
 
     log "$exp_dir" "  Configuring $service for in-pod MSR access (privileged + CAP_SYS_RAWIO + /dev/cpu hostPath + AppArmor unconfined)"
 
+    local container_name
+    container_name=$(get_container_name "$service")
+
     # 1) Add SYS_RAWIO capability if not already present.
+    #    Use a strategic-merge patch keyed by container name rather than a JSON
+    #    `add` to /securityContext/capabilities/add/- : the JSON-patch form fails
+    #    when the container has no capabilities.add array yet (the common case --
+    #    you then see only {"privileged":true} on the deployment and a spurious
+    #    "failed to add CAP_SYS_RAWIO" warning). Strategic merge initializes the
+    #    path if absent and merges (preserving privileged) if present. Note:
+    #    privileged=true (step 4) is what actually unblocks MSR opens; this cap
+    #    is defense-in-depth, so a failure here is non-fatal to freq sampling.
     local existing_caps
     existing_caps=$(kubectl get deployment "$service" \
         -o jsonpath='{.spec.template.spec.containers[0].securityContext.capabilities.add}' 2>/dev/null || echo "")
     if [[ "$existing_caps" != *"SYS_RAWIO"* ]]; then
-        kubectl patch deployment "$service" --type='json' -p='[
-          {"op":"add","path":"/spec/template/spec/containers/0/securityContext/capabilities/add/-","value":"SYS_RAWIO"}
-        ]' >> "$exp_dir/logs/collector.log" 2>&1 || {
-            log "$exp_dir" "    WARNING: failed to add CAP_SYS_RAWIO (may already exist or be denied by PSA)"
+        kubectl patch deployment "$service" --type='strategic' -p="{
+          \"spec\":{\"template\":{\"spec\":{\"containers\":[{
+            \"name\":\"${container_name}\",
+            \"securityContext\":{\"capabilities\":{\"add\":[\"SYS_RAWIO\"]}}
+          }]}}}
+        }" >> "$exp_dir/logs/collector.log" 2>&1 || {
+            log "$exp_dir" "    WARNING: failed to add CAP_SYS_RAWIO (defense-in-depth only; privileged=true below is the load-bearing grant). If this and privileged both fail, the namespace PodSecurityAdmission is blocking -- freq.ok will be false."
         }
     fi
 
@@ -680,8 +694,6 @@ apply_msr_pod_capabilities() {
     #    blocks open() of /dev/cpu/N/msr with EPERM even when CAP_SYS_RAWIO
     #    is present and the file mode allows it. Annotation key includes the
     #    container name. Pre-1.30 annotation form is kept for compatibility.
-    local container_name
-    container_name=$(get_container_name "$service")
     local annotation_key="container.apparmor.security.beta.kubernetes.io/${container_name}"
     local existing_annotation
     existing_annotation=$(kubectl get deployment "$service" \
