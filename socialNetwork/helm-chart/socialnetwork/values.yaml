@@ -44,6 +44,18 @@ global:
         password: &mongodb-sharded-password "password"
         port: 27017
   nginx:
+    # nginx's `resolver` directive. The xenial openresty image resolves this at
+    # config-parse time, so on a cluster whose kube-system DNS Service is NOT
+    # named 'kube-dns' (e.g. it's named 'coredns'), this hostname has no A record
+    # and nginx-thrift / media-frontend die with
+    #   [emerg] host not found in resolver "kube-dns.kube-system..." -> CrashLoopBackOff.
+    # The hostname below works on standard kubeadm clusters. If yours differs,
+    # override with the DNS ClusterIP literal (what `resolver` actually wants):
+    #   helm install ... --set global.nginx.resolverName=<DNS_ClusterIP>
+    # Find it: kubectl get svc -n kube-system -l k8s-app=kube-dns \
+    #            -o jsonpath='{.items[0].spec.clusterIP}'
+    # The stage3-eval harness auto-detects and injects this; see SN_DNS_RESOLVER
+    # in noisy-neighbors/stage3-eval/lib/testbed-sn.sh.
     resolverName: kube-dns.kube-system.svc.cluster.local
   jaeger:
     localAgentHostPort: jaeger:6831
