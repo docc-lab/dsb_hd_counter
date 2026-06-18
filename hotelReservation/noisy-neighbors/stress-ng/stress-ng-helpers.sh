@@ -49,16 +49,26 @@ create_kubectl_cmd() {
     local args="$3"
     local node="$4"
     
+    # `kubectl run --restart=Never` pods are NOT deleted when stress-ng exits
+    # at --timeout; they linger in Completed. A second burst in the same
+    # iteration (e.g. schedule "0:30:30 40:30:30") then hits
+    # "AlreadyExists" and never runs, silently truncating every repeated/
+    # linear contention shape to its first burst. Delete any prior pod of
+    # this name first so each burst gets a fresh pod. Safe here because the
+    # generated schedules are non-overlapping (the previous burst's pod is
+    # already Completed); --force --grace-period=0 makes removal immediate.
+    local del="kubectl delete pod $pod_name --ignore-not-found --grace-period=0 --force >/dev/null 2>&1"
+
     local cmd="kubectl run $pod_name --image=$image --restart=Never"
-    
+
     if [[ -n "$node" ]]; then
         # Add both nodeSelector and toleration for tainted nodes
         local overrides="{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},\"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Equal\",\"value\":\"special\",\"effect\":\"NoSchedule\"}]}}"
         cmd="$cmd --overrides='$overrides'"
     fi
-    
+
     cmd="$cmd -- $args"
-    echo "$cmd"
+    echo "$del; $cmd"
 }
 
 # Main command function
