@@ -55,5 +55,5 @@ aggressors:
   # sockshop co-tenant (requires testbed-ss.sh to be implemented;
   # comment out the entry below until sockshop ships).
   - testbed: sockshop
-    service: carts
+    service: cart
     role: bad
