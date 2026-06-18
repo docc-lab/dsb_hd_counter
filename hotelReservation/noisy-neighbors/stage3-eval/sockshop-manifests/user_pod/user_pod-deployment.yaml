@@ -24,6 +24,10 @@ spec:
           env:
             - name: USER_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"
+            - name: USER_DB_DIAL_ADDR
+              value: "user-db-pod:27017"
+            - name: ZIPKIN_DIAL_ADDR
+              value: "zipkin-pod:9411"
           ports:
             - containerPort: 12345
       restartPolicy: Always

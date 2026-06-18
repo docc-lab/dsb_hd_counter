@@ -24,6 +24,16 @@ spec:
           env:
             - name: FRONTEND_HTTP_BIND_ADDR
               value: "0.0.0.0:2000"
+            - name: CART_SERVICE_GRPC_DIAL_ADDR
+              value: "cart-pod:12345"
+            - name: CATALOGUE_SERVICE_GRPC_DIAL_ADDR
+              value: "catalogue-pod:12345"
+            - name: ORDER_SERVICE_GRPC_DIAL_ADDR
+              value: "order-pod:12345"
+            - name: USER_SERVICE_GRPC_DIAL_ADDR
+              value: "user-pod:12345"
+            - name: ZIPKIN_DIAL_ADDR
+              value: "zipkin-pod:9411"
           ports:
             - containerPort: 2000
       restartPolicy: Always

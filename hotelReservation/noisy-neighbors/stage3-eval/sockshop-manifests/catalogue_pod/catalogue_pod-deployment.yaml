@@ -24,6 +24,10 @@ spec:
           env:
             - name: CATALOGUE_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"
+            - name: CATALOGUE_DB_DIAL_ADDR
+              value: "catalogue-db-pod:3306"
+            - name: ZIPKIN_DIAL_ADDR
+              value: "zipkin-pod:9411"
           ports:
             - containerPort: 12345
       restartPolicy: Always

@@ -27,6 +27,12 @@ set -u
 
 SS_NAMESPACE="${SS_NAMESPACE:-aggressor-ss}"
 SS_MANIFESTS_DIR="${SS_MANIFESTS_DIR:-$STAGE3_EVAL_DIR/sockshop-manifests}"
+# How long to wait for every sockshop deployment to report Available after
+# apply. Sockshop services crash-loop until their dependencies are up, so the
+# convergence can take a couple minutes on a cold deploy (image pulls + retry
+# backoff). A timeout here means a genuinely broken testbed -- better to fail
+# loud at deploy than drive an empty run.
+SS_READY_TIMEOUT="${SS_READY_TIMEOUT:-300}"
 
 # Human-friendly service name -> deployment name as our Blueprint build
 # emits (each container becomes a separate pod named <ctr>_pod; our
@@ -102,6 +108,23 @@ ss_deploy() {
             echo "ERROR $log_prefix: kubectl apply failed; see $exp_dir/logs/testbed-ss.log" >&2
             return 1
         }
+
+    # Gate on readiness. kubectl apply returns as soon as the objects are
+    # accepted, not when pods serve -- without this wait a fully crash-looped
+    # sockshop (e.g. missing inter-service *_DIAL_ADDR env) sails through and the
+    # run drives an unreachable frontend ("connection refused"), producing a
+    # "COMPLETE" experiment with zero sockshop load. Fail loud instead.
+    echo "$log_prefix Waiting up to ${SS_READY_TIMEOUT}s for all sockshop deployments to become Available"
+    if ! kubectl wait --for=condition=Available deployment --all \
+            -n "$SS_NAMESPACE" --timeout="${SS_READY_TIMEOUT}s" \
+            >> "$exp_dir/logs/testbed-ss.log" 2>&1; then
+        echo "ERROR $log_prefix: sockshop deployments did not all become Available within ${SS_READY_TIMEOUT}s" >&2
+        echo "       Inspect: kubectl -n $SS_NAMESPACE get pods" >&2
+        echo "       Likely a crash-looping service -- check its logs, e.g.:" >&2
+        echo "                kubectl -n $SS_NAMESPACE logs deploy/frontend-pod" >&2
+        kubectl -n "$SS_NAMESPACE" get pods >> "$exp_dir/logs/testbed-ss.log" 2>&1 || true
+        return 1
+    fi
 
     return 0
 }

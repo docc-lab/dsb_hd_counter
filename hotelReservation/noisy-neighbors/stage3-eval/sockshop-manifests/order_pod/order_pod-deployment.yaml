@@ -24,6 +24,18 @@ spec:
           env:
             - name: ORDER_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"
+            - name: ORDER_DB_DIAL_ADDR
+              value: "order-db-pod:27017"
+            - name: CART_SERVICE_GRPC_DIAL_ADDR
+              value: "cart-pod:12345"
+            - name: PAYMENT_SERVICE_GRPC_DIAL_ADDR
+              value: "payment-pod:12345"
+            - name: SHIPPING_SERVICE_GRPC_DIAL_ADDR
+              value: "shipping-pod:12345"
+            - name: USER_SERVICE_GRPC_DIAL_ADDR
+              value: "user-pod:12345"
+            - name: ZIPKIN_DIAL_ADDR
+              value: "zipkin-pod:9411"
           ports:
             - containerPort: 12345
       restartPolicy: Always

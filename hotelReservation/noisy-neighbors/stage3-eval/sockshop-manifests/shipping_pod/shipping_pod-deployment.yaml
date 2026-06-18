@@ -26,6 +26,10 @@ spec:
               value: "0.0.0.0:12345"
             - name: SHIPPING_SERVICE_GRPC_DIAL_ADDR
               value: "localhost:12345"
+            - name: SHIPPING_DB_DIAL_ADDR
+              value: "shipping-db-pod:27017"
+            - name: ZIPKIN_DIAL_ADDR
+              value: "zipkin-pod:9411"
           ports:
             - containerPort: 12345
       restartPolicy: Always
