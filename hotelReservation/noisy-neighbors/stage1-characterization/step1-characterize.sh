@@ -19,8 +19,10 @@ set -o pipefail
 
 STEP1_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source data-collector.sh for shared deployment utility functions
-source "$STEP1_SCRIPTS_DIR/data-collector.sh"
+# Source data-collector.sh for shared deployment utility functions.
+# This script lives in stage1-characterization/; data-collector.sh is one
+# level up in noisy-neighbors/.
+source "$STEP1_SCRIPTS_DIR/../data-collector.sh"
 
 # ===========================================================================
 # Default configuration (overridable via config file)
@@ -1505,7 +1507,7 @@ step1_validate_config() {
     # ghz binary precheck
     if ! command -v "$LOADGEN_BIN" >/dev/null 2>&1 && [[ ! -x "$LOADGEN_BIN" ]]; then
         echo "ERROR: ghz binary not found at LOADGEN_BIN='$LOADGEN_BIN'" >&2
-        echo "       Install with: $STEP1_SCRIPTS_DIR/loadgen/install-ghz.sh" >&2
+        echo "       Install with: $STEP1_SCRIPTS_DIR/../loadgen/install-ghz.sh" >&2
         exit 1
     fi
 
@@ -2104,7 +2106,7 @@ step1_cleanup() {
 step1_main() {
     if [[ $# -eq 0 ]]; then
         cat <<'USAGE'
-Usage: ./step1-characterize.sh <config-file> [<char-rps>]
+Usage (run from noisy-neighbors/): ./stage1-characterization/step1-characterize.sh <config-file> [<char-rps>]
 
   <config-file>  per-service config (e.g. configs/step1-search.conf)
   <char-rps>     OPTIONAL.  If given, skip Stage 1 (saturation sweep)
@@ -2236,6 +2238,20 @@ USAGE
             exit 1
         fi
     fi
+
+    # Resolve the config path to absolute BEFORE we change directory, so a
+    # relative path given on the command line still works.
+    case "$config_file" in
+        /*) : ;;
+        *)  config_file="$(pwd)/$config_file" ;;
+    esac
+
+    # Anchor CWD to noisy-neighbors/ (the parent of this script's dir). The
+    # project uses CWD-relative paths throughout (../services, ../kubernetes,
+    # ./loadgen, ../../wrk2, ./step1_data and data-collector.sh's own
+    # relative paths), so the script must run from there regardless of where
+    # it was invoked.
+    cd "$STEP1_SCRIPTS_DIR/.." || { echo "ERROR: cannot cd to noisy-neighbors dir" >&2; exit 1; }
 
     # Source contention-shapes.sh (needed by data-collector.sh internals)
     [[ -f "$SHAPES_SCRIPT" ]] && source "$SHAPES_SCRIPT"
