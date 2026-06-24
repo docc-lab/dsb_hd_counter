@@ -52,106 +52,14 @@ CURVE_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$CURVE_SCRIPTS_DIR/step1-characterize.sh"
 
 # ---------------------------------------------------------------------------
-# Per-level windowed-sample aggregator.
-#
-# Reads the single full-sweep run_data and prints a CSV fragment for ONE
-# level, computed over that level's "active" windows -- samples whose
-# offset_ms falls in [start_off,end_off] (this level's measured ghz window)
-# AND whose timing_window.request_count > 0 (so the idle warmup/cooldown
-# never dilutes the numbers):
-#
-#   arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,
-#   svc_mean_us,svc_p50_us,svc_p99_us,ipc,llc_mpki,
-#   freq_mhz,freq_util_pct,active_windows,total_requests
-#
-# Arrival rate is the interceptor's trailing-1s sliding window
-# (timing_window.arrival_rps_1s). Service-time columns are request-weighted
-# means of the per-window processing_time stats (we only have per-window
-# percentiles, not pooled raw durations, when slicing one shared run_data);
-# svc_p99_us is therefore the request-weighted mean of window p99s -- a tail
-# proxy, not a globally-pooled p99. IPC/LLC-MPKI are summed from per-window
-# perf_deltas over the active windows.
-#
-# Args: run_data_json [start_off_ms] [end_off_ms]
-# ===========================================================================
+# Per-level windowed-sample aggregator (shared with reslice-curve.sh).
+# Slices the single full-sweep run_data to ONE level by absolute sample
+# timestamp in [start_epoch,end_epoch] and prints a curve.csv fragment.
+# See curve_aggregate.py for the column list and method.
+# Args: run_data_json [start_epoch_s] [end_epoch_s]
+# ---------------------------------------------------------------------------
 curve_aggregate_level() {
-    python3 - "$@" <<'PYEOF'
-import json, sys
-
-def pct(xs, q):
-    if not xs:
-        return 0.0
-    xs = sorted(xs)
-    if len(xs) == 1:
-        return float(xs[0])
-    pos = (len(xs) - 1) * q
-    lo = int(pos); hi = min(lo + 1, len(xs) - 1); frac = pos - lo
-    return xs[lo] * (1 - frac) + xs[hi] * frac
-
-def mean(xs):
-    return (sum(xs) / len(xs)) if xs else 0.0
-
-def us(ns):
-    return (ns or 0) / 1000.0
-
-try:
-    path = sys.argv[1]
-    start_off = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "" else None
-    end_off   = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else None
-    with open(path) as f:
-        d = json.load(f)
-except Exception:
-    print("0,0,0,0,0,0,0,0,0,0,0,0")
-    sys.exit(0)
-
-def in_window(s):
-    o = s.get("offset_ms")
-    if start_off is not None and (o is None or o < start_off):
-        return False
-    if end_off is not None and (o is None or o > end_off):
-        return False
-    return True
-
-samples = d.get("samples") or []
-active = [s for s in samples
-          if in_window(s) and s.get("timing_window")
-          and (s["timing_window"].get("request_count") or 0) > 0]
-
-arr = [(s["timing_window"].get("arrival_rps_1s") or 0.0) for s in active]
-
-def wmean(field):
-    num = 0.0; den = 0
-    for s in active:
-        ptw = (s["timing_window"].get("processing_time") or {})
-        c = ptw.get("count") or 0
-        num += (ptw.get(field) or 0) * c
-        den += c
-    return (num / den) if den else 0.0
-
-svc_mean = us(wmean("mean_ns"))
-svc_p50  = us(wmean("p50_ns"))
-svc_p99  = us(wmean("p99_ns"))
-
-def perf_sum(key):
-    return sum((s.get("perf_deltas") or {}).get(key, 0) for s in active)
-instr = perf_sum("instructions")
-cyc   = perf_sum("cycles")
-llcm  = perf_sum("LLC-load-misses")
-ipc      = (instr / cyc) if cyc else 0.0
-llc_mpki = (llcm / instr * 1000.0) if instr else 0.0
-
-fr = [s["freq"]["actual_freq_mhz"] for s in active if s.get("freq", {}).get("ok")]
-fu = [s["freq"]["freq_util_pct"]   for s in active if s.get("freq", {}).get("ok")]
-freq_mhz  = mean(fr)
-freq_util = mean(fu)
-
-total_req = sum((s["timing_window"].get("request_count") or 0) for s in active)
-
-print("%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
-    mean(arr), pct(arr, 0.5), pct(arr, 0.99),
-    svc_mean, svc_p50, svc_p99, ipc, llc_mpki,
-    freq_mhz, freq_util, len(active), total_req))
-PYEOF
+    python3 "$CURVE_SCRIPTS_DIR/curve_aggregate.py" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -385,29 +293,19 @@ curve_sweep() {
         sleep 5
     done
     kubectl exec "$pod" -- cat "$run_file" > "$raw" 2>/dev/null || true
+    step1_log "$exp_dir" "Slicing run_data per level by measured wall-clock window (sample timestamp)"
 
-    # run_start epoch (RFC3339 -> epoch) so we can map per-level wall-clock
-    # bounds to sample offset_ms.
-    local run_start_epoch=0
-    if [[ -s "$raw" ]] && command -v jq >/dev/null 2>&1; then
-        local rs; rs=$(jq -r '.run_start // ""' "$raw" 2>/dev/null)
-        [[ -n "$rs" ]] && run_start_epoch=$(date -d "$rs" +%s 2>/dev/null || echo 0)
-    fi
-    step1_log "$exp_dir" "run_start epoch=${run_start_epoch}; slicing per level"
-
-    # Build curve.csv from the single run_data, sliced per level.
+    # Build curve.csv from the single run_data, sliced per level by the
+    # level's measured [start,end] epoch. curve_aggregate.py parses each
+    # sample's absolute timestamp itself -- no jq / date -d dependency
+    # (those silently produced run-wide aggregates when jq was missing).
     echo "target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,svc_mean_us,svc_p50_us,svc_p99_us,ipc,llc_mpki,freq_mhz,freq_util_pct,active_windows,total_requests,ghz_actual_rps,ghz_p50_ms,ghz_p99_ms,ghz_errors,saturated" > "$csv_file"
 
     local ln=0
     while IFS=, read -r m_level m_rps m_start m_end m_actual m_p50 m_p99 m_err m_sat; do
         ln=$((ln + 1)); [[ $ln -eq 1 ]] && continue   # skip manifest header
-        local start_off="" end_off=""
-        if [[ "$run_start_epoch" != "0" ]]; then
-            start_off=$(( (m_start - run_start_epoch) * 1000 )); [[ $start_off -lt 0 ]] && start_off=0
-            end_off=$(( (m_end - run_start_epoch) * 1000 ))
-        fi
         local agg
-        agg=$(curve_aggregate_level "$raw" "$start_off" "$end_off" 2>/dev/null || echo "0,0,0,0,0,0,0,0,0,0,0,0")
+        agg=$(curve_aggregate_level "$raw" "$m_start" "$m_end" 2>/dev/null || echo "0,0,0,0,0,0,0,0,0,0,0,0")
         echo "${m_rps},${agg},${m_actual},${m_p50},${m_p99},${m_err},${m_sat}" >> "$csv_file"
     done < "$manifest"
 
