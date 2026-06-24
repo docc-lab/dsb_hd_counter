@@ -352,7 +352,11 @@ curve_size_window() {
     [[ $n_levels -lt 1 ]] && n_levels=1
     # +10s/level slack for ghz spin-up + parsing between phases
     per_level=$(( SATURATION_WARMUP + SATURATION_DURATION + SATURATION_COOLDOWN + 10 ))
-    pre_settle=25                          # update_iteration_id rollout-ready + 15s stabilize
+    # The sampler window starts at pod start, but the windowed-image rollout
+    # (image pull + taskset + MSR patches + readiness) plus update_iteration_id's
+    # 15s stabilize burn a chunk of the window before level 1. Under-counting
+    # this clips the LAST level (observed: row N truncated). Budget generously.
+    pre_settle=90                          # windowed pod rollout-to-ready + 15s stabilize
     sweep_est=$(( pre_settle + n_levels * per_level ))
     # window = estimate + user margin + 20% safety
     EXPERIMENT_DURATION=$(( sweep_est + CURVE_WINDOW_MARGIN + sweep_est / 5 ))
