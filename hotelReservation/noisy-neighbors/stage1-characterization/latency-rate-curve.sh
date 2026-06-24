@@ -146,6 +146,13 @@ curve_deploy() {
 
     configure_jaeger_tracing "$exp_dir"
 
+    # Sweep dead srv-* entries from Consul before probing. Prior runs and the
+    # windowed-image pod restarts leave stale registrations pointing at dead
+    # pod IPs; the frontend then load-balances onto them and the readiness
+    # probe flaps with HTTP 500, and search's downstream discovery (geo/rate)
+    # can hit dead IPs. Reuses data-collector.sh's idempotent sweep.
+    clean_stale_consul_services "$exp_dir"
+
     step1_log "$exp_dir" "Validating readiness ..."
     if ! step1_validate_readiness "$exp_dir"; then
         step1_log "$exp_dir" "WARNING: validation failed — attempting Consul re-registration ..."
@@ -260,6 +267,10 @@ curve_sweep() {
     # (ITERATION_ID=1) with EXPERIMENT_DURATION covering the whole sweep.
     step1_log "$exp_dir" "Starting single sampler window (one restart) ..."
     update_iteration_id "$exp_dir" 1 "$svc" "$EXPERIMENT_DURATION"
+    # That restart orphaned the previous search pod's Consul entry; sweep
+    # stale srv-* so downstream discovery and any frontend-routed probe see
+    # only live IPs for the whole sweep.
+    clean_stale_consul_services "$exp_dir"
     local window_start; window_start=$(date +%s)
 
     local rps=$SATURATION_START_RPS level=0
