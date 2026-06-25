@@ -304,24 +304,13 @@ curve_sweep() {
         sleep 5
     done
     kubectl exec "$pod" -- cat "$run_file" > "$raw" 2>/dev/null || true
-    step1_log "$exp_dir" "Slicing run_data per level by measured wall-clock window (sample timestamp)"
+    step1_log "$exp_dir" "Building curve.csv from run_data in one pass (curve_aggregate.py --build)"
 
-    # Build curve.csv from the single run_data, sliced per level by the
-    # level's measured [start,end] epoch. curve_aggregate.py parses each
-    # sample's absolute timestamp itself -- no jq / date -d dependency
-    # (those silently produced run-wide aggregates when jq was missing).
-    echo "target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,freq_mhz,freq_util_pct,active_windows,total_requests,ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated" > "$csv_file"
-
-    local ln=0
-    while IFS=, read -r m_level m_rps m_start m_end m_actual m_p50 m_p99 m_err m_sat; do
-        ln=$((ln + 1)); [[ $ln -eq 1 ]] && continue   # skip manifest header
-        local agg ghz_p90
-        agg=$(curve_aggregate_level "$raw" "$m_start" "$m_end" 2>/dev/null || echo "0,0,0,0,0,0,0,0,0,0,0,0,0")
-        # ghz_p90 isn't in the manifest; re-parse it from the saved per-level
-        # ghz JSON (same source step1_run_ghz wrote).
-        ghz_p90=$(step1_parse_ghz_pct "$sweep_dir/L${m_level}_rps${m_rps}.json" 90 2>/dev/null); : "${ghz_p90:=0}"
-        echo "${m_rps},${agg},${m_actual},${m_p50},${ghz_p90},${m_p99},${m_err},${m_sat}" >> "$csv_file"
-    done < "$manifest"
+    # Single-pass build: loads run_data once, slices every level by its
+    # measured [start,end] epoch (from the manifest), and pulls ghz_p90 from
+    # each level's saved ghz JSON. Same code path as reslice-curve.sh.
+    python3 "$CURVE_SCRIPTS_DIR/curve_aggregate.py" --build "$exp_dir" \
+        || step1_log "$exp_dir" "WARNING: curve build failed"
 
     cat > "$exp_dir/curve_summary.json" <<-EOJSON
 	{

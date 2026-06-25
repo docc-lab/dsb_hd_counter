@@ -1,32 +1,50 @@
 #!/usr/bin/env python3
 """
-Aggregate ONE RPS level's windowed samples into a curve.csv fragment.
+Aggregate windowed samples into curve.csv rows.
 
-Usage: curve_aggregate.py <run_data.json> [start_epoch] [end_epoch]
+Two modes:
 
-Selects the level's "active" windows: samples whose absolute `timestamp`
-falls in [start_epoch, end_epoch] (epoch seconds; either may be empty to
-leave that side unbounded) AND whose timing_window.request_count > 0 -- so
-the idle warmup/cooldown around the measured ghz window never dilutes the
-numbers. Slicing is done here (in Python, on the sample timestamp) rather
-than in bash via `date -d` + run_start/offset_ms, which depended on jq and
-GNU date being present and parsing RFC3339Nano.
+  curve_aggregate.py <run_data.json> [start_epoch] [end_epoch]
+      Print ONE level's 13-field fragment (the per-level interface).
 
-Prints one CSV line:
-  arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,
-  svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,
-  freq_mhz,freq_util_pct,active_windows,total_requests
+  curve_aggregate.py --build <exp_dir>
+      Build the WHOLE curve.csv for a finished experiment in a single pass:
+      load <exp_dir>/raw/windowed/<svc>/run_data_full_raw.json ONCE, read
+      <exp_dir>/saturation/levels.csv, slice per level in memory, pull
+      ghz_p90 from each level's saturation/L<level>_rps<rps>.json, and write
+      <exp_dir>/curve.csv. This avoids re-parsing the (large) run_data once
+      per level -- for an hours-long run that's the difference between one
+      ~seconds load and dozens of them.
 
-Arrival rate is the interceptor's trailing-1s sliding window
-(timing_window.arrival_rps_1s). Service-time columns are request-weighted
-means of the per-window processing_time stats (no pooled raw durations are
-available when slicing one shared run_data), so svc_p99_us is a
-request-weighted mean of window p99s -- a tail proxy, not a global p99.
+A level's "active" windows are samples whose absolute `timestamp` falls in
+[start_epoch,end_epoch] AND whose timing_window.request_count > 0 (so the
+idle warmup/cooldown never dilutes the numbers). Slicing is done on the
+sample timestamp in Python -- no jq / GNU date dependency.
+
+curve.csv columns:
+  target_rps, arrival_rps_mean, arrival_rps_p50, arrival_rps_p99,
+  svc_mean_us, svc_p50_us, svc_p90_us, svc_p99_us, ipc, llc_mpki,
+  freq_mhz, freq_util_pct, active_windows, total_requests,
+  ghz_actual_rps, ghz_p50_ms, ghz_p90_ms, ghz_p99_ms, ghz_errors, saturated
+
+Service-time columns are request-weighted means of per-window processing_time
+stats (no pooled raw durations exist in one shared run_data), so svc_p90/p99
+are tail proxies, not globally-pooled percentiles.
 """
+import csv
+import glob
 import json
+import os
 import re
 import sys
 from datetime import datetime
+
+CSV_HEADER = ("target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,"
+              "svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,"
+              "freq_mhz,freq_util_pct,active_windows,total_requests,"
+              "ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated")
+
+ZERO_FRAG = "0,0,0,0,0,0,0,0,0,0,0,0,0"
 
 
 def pct(xs, q):
@@ -65,17 +83,8 @@ def to_epoch(ts):
         return None
 
 
-def main():
-    try:
-        path = sys.argv[1]
-        start_epoch = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "" else None
-        end_epoch = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else None
-        with open(path) as f:
-            d = json.load(f)
-    except Exception:
-        print("0,0,0,0,0,0,0,0,0,0,0,0,0")
-        return
-
+def aggregate(samples, start_epoch, end_epoch):
+    """Return the 13-field curve fragment string for one level slice."""
     def in_window(s):
         if start_epoch is None and end_epoch is None:
             return True
@@ -88,7 +97,6 @@ def main():
             return False
         return True
 
-    samples = d.get("samples") or []
     active = [s for s in samples
               if in_window(s) and s.get("timing_window")
               and (s["timing_window"].get("request_count") or 0) > 0]
@@ -125,10 +133,89 @@ def main():
 
     total_req = sum((s["timing_window"].get("request_count") or 0) for s in active)
 
-    print("%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
+    return "%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
         mean(arr), pct(arr, 0.5), pct(arr, 0.99),
         svc_mean, svc_p50, svc_p90, svc_p99, ipc, llc_mpki,
-        freq_mhz, freq_util, len(active), total_req))
+        freq_mhz, freq_util, len(active), total_req)
+
+
+def parse_ghz_pct(path, target_pct):
+    """Read a percentile (ms) from a ghz --format json output file."""
+    try:
+        with open(path) as f:
+            text = f.read()
+        i = text.find("{")
+        data = json.loads(text[i:]) if i >= 0 else {}
+        for entry in data.get("latencyDistribution", []) or []:
+            if abs(float(entry.get("percentage", -1)) - target_pct) < 0.001:
+                return "%.2f" % (float(entry.get("latency", 0)) / 1e6)
+    except Exception:
+        pass
+    return "0"
+
+
+def build(exp_dir):
+    manifest = os.path.join(exp_dir, "saturation", "levels.csv")
+    raws = glob.glob(os.path.join(exp_dir, "raw", "windowed", "*", "run_data_full_raw.json"))
+    if not os.path.isfile(manifest):
+        sys.stderr.write("ERROR: no manifest at %s\n" % manifest)
+        return 1
+    if not raws:
+        sys.stderr.write("ERROR: no run_data_full_raw.json under %s/raw/windowed/*/\n" % exp_dir)
+        return 1
+    raw = raws[0]
+
+    # Load the (potentially large) run_data ONCE.
+    with open(raw) as f:
+        samples = (json.load(f).get("samples")) or []
+
+    out = os.path.join(exp_dir, "curve.csv")
+    n = 0
+    with open(manifest, newline="") as mf, open(out, "w") as of:
+        of.write(CSV_HEADER + "\n")
+        reader = csv.reader(mf)
+        header_seen = False
+        for row in reader:
+            if not header_seen:
+                header_seen = True
+                continue
+            if len(row) < 9:
+                continue
+            level, rps, mstart, mend, actual, p50, p99, err, sat = row[:9]
+            try:
+                s_ep = float(mstart) if mstart else None
+                e_ep = float(mend) if mend else None
+            except ValueError:
+                s_ep = e_ep = None
+            try:
+                frag = aggregate(samples, s_ep, e_ep)
+            except Exception:
+                frag = ZERO_FRAG
+            ghz_json = os.path.join(exp_dir, "saturation", "L%s_rps%s.json" % (level, rps))
+            ghz_p90 = parse_ghz_pct(ghz_json, 90)
+            of.write("%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+                rps, frag, actual, p50, ghz_p90, p99, err, sat))
+            n += 1
+
+    sys.stderr.write("Rewrote %s (%d levels) from %s\n" % (out, n, os.path.basename(raw)))
+    return 0
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--build":
+        sys.exit(build(sys.argv[2]))
+
+    # Single-level mode (per-level interface).
+    try:
+        path = sys.argv[1]
+        start_epoch = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "" else None
+        end_epoch = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else None
+        with open(path) as f:
+            samples = (json.load(f).get("samples")) or []
+    except Exception:
+        print(ZERO_FRAG)
+        return
+    print(aggregate(samples, start_epoch, end_epoch))
 
 
 if __name__ == "__main__":
