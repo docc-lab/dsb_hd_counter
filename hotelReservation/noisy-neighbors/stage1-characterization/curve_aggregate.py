@@ -14,7 +14,7 @@ GNU date being present and parsing RFC3339Nano.
 
 Prints one CSV line:
   arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,
-  svc_mean_us,svc_p50_us,svc_p99_us,ipc,llc_mpki,
+  svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,
   freq_mhz,freq_util_pct,active_windows,total_requests
 
 Arrival rate is the interceptor's trailing-1s sliding window
@@ -73,7 +73,7 @@ def main():
         with open(path) as f:
             d = json.load(f)
     except Exception:
-        print("0,0,0,0,0,0,0,0,0,0,0,0")
+        print("0,0,0,0,0,0,0,0,0,0,0,0,0")
         return
 
     def in_window(s):
@@ -107,6 +107,7 @@ def main():
 
     svc_mean = us(wmean("mean_ns"))
     svc_p50 = us(wmean("p50_ns"))
+    svc_p90 = us(wmean("p90_ns"))
     svc_p99 = us(wmean("p99_ns"))
 
     def perf_sum(key):
@@ -124,9 +125,9 @@ def main():
 
     total_req = sum((s["timing_window"].get("request_count") or 0) for s in active)
 
-    print("%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
+    print("%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
         mean(arr), pct(arr, 0.5), pct(arr, 0.99),
-        svc_mean, svc_p50, svc_p99, ipc, llc_mpki,
+        svc_mean, svc_p50, svc_p90, svc_p99, ipc, llc_mpki,
         freq_mhz, freq_util, len(active), total_req))
 
 
