@@ -1721,7 +1721,7 @@ configure_jaeger_tracing() {
     done
     
     # Check Jaeger service registration
-    local jaeger_services=$(kubectl exec -it deployment/jaeger -- wget -qO- "http://localhost:16686/api/services" 2>/dev/null | grep -o '"[^"]*"' | grep -v "data\|total\|limit\|offset\|errors" | head -5)
+    local jaeger_services=$(kubectl exec deployment/jaeger -- wget -qO- "http://localhost:16686/api/services" 2>/dev/null | grep -o '"[^"]*"' | grep -v "data\|total\|limit\|offset\|errors" | head -5)
     if [[ -n "$jaeger_services" ]]; then
         log "$exp_dir" "  Registered services in Jaeger: $jaeger_services"
     else
@@ -1729,7 +1729,7 @@ configure_jaeger_tracing() {
     fi
     
     # Test connectivity with a simple request
-    local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    local connectivity_test=$(kubectl exec deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$connectivity_test" == "200" ]]; then
         log "$exp_dir" "  Frontend connectivity test passed (HTTP 200)"
     else
@@ -1778,7 +1778,7 @@ monitor_consul_service_registration() {
     
     while [[ $wait_time -lt $max_wait_time && "$all_registered" == "false" ]]; do
         # Get current service registrations
-        local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+        local consul_services=$(kubectl exec deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
         local registered_count=0
         local missing_services=()
         
@@ -1817,7 +1817,7 @@ monitor_consul_service_registration() {
         
         # Log final state for debugging
         log "$exp_dir" "Final Consul service state:"
-        kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | while read -r service; do
+        kubectl exec deployment/consul -- consul catalog services 2>/dev/null | while read -r service; do
             log "$exp_dir" "    $service"
         done
         
@@ -1838,7 +1838,7 @@ validate_and_ensure_service_registration() {
         log "$exp_dir" "Validation attempt $attempt/$max_attempts"
         
         # Check current registrations
-        local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+        local consul_services=$(kubectl exec deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
         local missing_services=()
         
         if [[ -n "$consul_services" ]]; then
@@ -1857,7 +1857,7 @@ validate_and_ensure_service_registration() {
                 
                 # Test connectivity to ensure services are actually reachable
                 log "$exp_dir" "  Testing service connectivity..."
-                local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+                local connectivity_test=$(kubectl exec deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
                 if [[ "$connectivity_test" == "200" ]]; then
                     log "$exp_dir" "   Service connectivity test passed (HTTP 200)"
                     return 0
@@ -1942,7 +1942,7 @@ manual_register_all_services() {
             log "$exp_dir" "  Registering $consul_name at $service_ip:$port"
             
             # Register service without health checks to avoid deregistration
-            if kubectl exec -it "$consul_pod" -- consul services register \
+            if kubectl exec "$consul_pod" -- consul services register \
                 -name="$consul_name" \
                 -port="$port" \
                 -address="$service_ip" \
@@ -1964,7 +1964,7 @@ manual_register_all_services() {
     sleep 10
     
     # Verify registration
-    local final_services=$(kubectl exec -it "$consul_pod" -- consul catalog services 2>/dev/null | grep -E "srv-" | wc -l)
+    local final_services=$(kubectl exec "$consul_pod" -- consul catalog services 2>/dev/null | grep -E "srv-" | wc -l)
     log "$exp_dir" "  Final service count in Consul: $final_services"
     
     if [[ $final_services -ge 7 ]]; then
@@ -2042,7 +2042,7 @@ refresh_consul_service_discovery() {
     
     # Final connectivity verification
     log "$exp_dir" "Verifying service connectivity after refresh..."
-    local connectivity_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    local connectivity_test=$(kubectl exec deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$connectivity_test" == "200" ]]; then
         log "$exp_dir" "   Service connectivity verified (HTTP 200)"
     else
@@ -2155,7 +2155,7 @@ validate_system_readiness() {
     
     # 2. Validate Consul service registration
     log "$exp_dir" "2. Validating Consul service registration..."
-    local consul_services=$(kubectl exec -it deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
+    local consul_services=$(kubectl exec deployment/consul -- consul catalog services 2>/dev/null | grep -E "srv-" | tr -d '\r' | head -10)
     local expected_consul_services=("srv-search" "srv-geo" "srv-profile" "srv-rate" "srv-recommendation" "srv-reservation" "srv-user")
     local missing_consul_services=()
     
@@ -2181,7 +2181,7 @@ validate_system_readiness() {
     log "$exp_dir" "3. Testing critical service connectivity..."
     
     # Test recommendations endpoint (should work)
-    local rec_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    local rec_test=$(kubectl exec deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/recommendations?require=price&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$rec_test" == "200" ]]; then
         log "$exp_dir" "    Recommendations endpoint: HTTP 200"
     else
@@ -2190,7 +2190,7 @@ validate_system_readiness() {
     fi
     
     # Test hotels endpoint (requires search service via Consul)
-    local hotel_test=$(kubectl exec -it deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
+    local hotel_test=$(kubectl exec deployment/frontend -- curl -s -w "HTTP_CODE:%{http_code}" "http://frontend:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=37.7749&lon=-122.4194" 2>/dev/null | grep "HTTP_CODE" | cut -d: -f2)
     if [[ "$hotel_test" == "200" ]]; then
         log "$exp_dir" "    Hotels endpoint: HTTP 200"
     else
@@ -2274,8 +2274,22 @@ debug_service_registration() {
         
         # Check if service can connect to Consul
         log "$exp_dir" "  Testing Consul connectivity from $service_name:"
-        kubectl exec -it deployment/"$service_name" -- sh -c "nc -z consul 8500 && echo 'Consul reachable' || echo 'Consul unreachable'" 2>/dev/null || \
-            log "$exp_dir" "    Could not test Consul connectivity"
+        # Probe Consul with whatever the image actually ships (DSB images have
+        # no `nc`, which previously produced a misleading "Consul unreachable").
+        # Prefer Consul's HTTP API; fall back across nc/wget/curl; if none
+        # exist, say so -- the "Successfully registered in consul" log above is
+        # the authoritative signal, not this probe.
+        local consul_probe
+        consul_probe=$(kubectl exec deployment/"$service_name" -- sh -c '
+            if command -v wget >/dev/null 2>&1; then wget -q -T2 -O- http://consul:8500/v1/status/leader >/dev/null 2>&1 && echo reachable || echo unreachable;
+            elif command -v curl >/dev/null 2>&1; then curl -sf -m2 http://consul:8500/v1/status/leader >/dev/null 2>&1 && echo reachable || echo unreachable;
+            elif command -v nc >/dev/null 2>&1; then nc -z -w2 consul 8500 >/dev/null 2>&1 && echo reachable || echo unreachable;
+            else echo no-tool; fi' 2>/dev/null)
+        case "$consul_probe" in
+            reachable)   log "$exp_dir" "    Consul reachable from $service_name" ;;
+            unreachable) log "$exp_dir" "    Consul UNREACHABLE from $service_name" ;;
+            *)           log "$exp_dir" "    (no nc/wget/curl in image to probe Consul; registration log above is authoritative)" ;;
+        esac
     else
         log "$exp_dir" "  Deployment $service_name does not exist"
     fi
