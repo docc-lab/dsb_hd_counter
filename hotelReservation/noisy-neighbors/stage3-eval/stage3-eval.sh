@@ -461,10 +461,16 @@ s3_consul_manual_register() {
     local entry svc cname port ip count=0
     for entry in "${services[@]}"; do
         IFS=':' read -r svc cname port <<< "$entry"
+        # Filter to Running pods: right after a roll, the label selector also
+        # matches the terminating old replica (which has no podIP), and
+        # items[0] ordering is not guaranteed -- without this we'd grab the
+        # dead pod's empty IP and skip a service that actually needs
+        # re-registering.
         ip=$(kubectl get pod -l io.kompose.service="$svc" \
+            --field-selector=status.phase=Running \
             -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
         if [[ -z "$ip" ]]; then
-            s3_log "    skip $cname (no running pod IP for '$svc')"
+            s3_log "    skip $cname (no Running pod IP for '$svc')"
             continue
         fi
         if kubectl exec "$consul_pod" -- consul services register \

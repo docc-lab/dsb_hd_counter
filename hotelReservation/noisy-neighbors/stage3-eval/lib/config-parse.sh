@@ -128,6 +128,20 @@ parse_config() {
             echo "ERROR: testbeds.$tb.loadgen.rps must be a positive integer (got: '$rps')" >&2
             return 1
         fi
+        # Validate shape: a string must be a known wrk2 distribution; an
+        # object is the bursty form (its fields are checked by the driver).
+        # Catches typos like shape: exp2 here instead of silently running
+        # fixed at run time.
+        local shape_type shape_val
+        shape_type=$(echo "$lg" | jq -r '.shape | type')
+        if [[ "$shape_type" == "string" ]]; then
+            shape_val=$(echo "$lg" | jq -r '.shape')
+            case "$shape_val" in
+                fixed|exp|norm|zipf) ;;
+                *) echo "ERROR: testbeds.$tb.loadgen.shape='$shape_val' invalid (want fixed|exp|norm|zipf, or a bursty object {burst_s,idle_s,peak_rps,base_rps})" >&2
+                   return 1 ;;
+            esac
+        fi
         TESTBED_LOADGEN_JSON["$tb"]="$lg"
     done <<< "$tb_names"
 

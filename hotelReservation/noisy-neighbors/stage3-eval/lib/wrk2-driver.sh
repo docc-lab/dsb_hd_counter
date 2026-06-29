@@ -68,19 +68,21 @@ resolve_wrk2_script() {
 # via stop_wrk2_driver.
 #
 # shape_json is one of:
-#   "fixed"                                 -> constant rps (object form below
-#                                              with peak_rps == base_rps OR
-#                                              the string literal "fixed";
-#                                              caller is responsible for
-#                                              passing rps separately when
-#                                              shape == "fixed").
-#   {"burst_s":N,"idle_s":N,"peak_rps":N,"base_rps":N}
+#   "fixed" | "exp" | "norm" | "zipf"       -> a wrk2 inter-arrival
+#                                              distribution (-D) run at the
+#                                              single mean rate WRK2_FIXED_RPS:
+#                                              fixed=constant, exp=Poisson,
+#                                              norm=normal, zipf=zipfian.
+#   {"burst_s":N,"idle_s":N,"peak_rps":N,"base_rps":N}  -> alternating
+#                                              peak/idle bursty load.
+# Any other string is rejected (so a typo'd shape fails loudly instead of
+# silently degrading to fixed).
 #
-# When shape is "fixed", we look at the WRK2_FIXED_RPS env var (caller
-# sets it before invoking) for the target RPS. We do this rather than
-# adding another positional arg because aggressor.loadgen.rps already
-# lives in the YAML and the orchestrator's caller code is easier to
-# read with one env-var hand-off.
+# For the string shapes we look at the WRK2_FIXED_RPS env var (caller sets
+# it before invoking) for the target RPS. We do this rather than adding
+# another positional arg because aggressor.loadgen.rps already lives in the
+# YAML and the orchestrator's caller code is easier to read with one
+# env-var hand-off.
 # ---------------------------------------------------------------------------
 start_wrk2_driver() {
     local label="$1"
@@ -156,18 +158,29 @@ start_wrk2_driver() {
             " &
             ;;
 
-        fixed|*)
-            local rps="${WRK2_FIXED_RPS:?WRK2_FIXED_RPS must be set for fixed shape}"
+        fixed|exp|norm|zipf)
+            # String shapes map 1:1 to wrk2's inter-arrival distribution
+            # (-D): fixed=constant, exp=Poisson, norm=normal, zipf=zipfian.
+            # All run at the single mean rate WRK2_FIXED_RPS.
+            local dist="$shape_kind"
+            local rps="${WRK2_FIXED_RPS:?WRK2_FIXED_RPS must be set for $dist shape}"
             if ! [[ "$rps" =~ ^[0-9]+$ ]] || [[ "$rps" -le 0 ]]; then
                 echo "ERROR [wrk2-driver:$label]: WRK2_FIXED_RPS must be a positive integer (got '$rps')" >&2
                 return 1
             fi
             $launcher bash -c "
-                echo '--- FIXED rps=$rps for ${duration_s}s @ ' \$(date -Iseconds) >> '$out_file'
-                '$WRK2_BIN' -D fixed -t $WRK2_THREADS -c $WRK2_CONNECTIONS \
+                echo '--- shape=$dist rps=$rps for ${duration_s}s @ ' \$(date -Iseconds) >> '$out_file'
+                '$WRK2_BIN' -D $dist -t $WRK2_THREADS -c $WRK2_CONNECTIONS \
                     -d ${duration_s}s -L -R $rps -s '$script_path' '$target_url' \
                     >> '$out_file' 2>&1 || true
             " &
+            ;;
+
+        *)
+            # Previously this fell through to fixed, silently masking typos
+            # like shape: exp2. Fail loudly instead.
+            echo "ERROR [wrk2-driver:$label]: unknown shape '$shape_kind' (want: fixed|exp|norm|zipf, or a bursty object {burst_s,idle_s,peak_rps,base_rps})" >&2
+            return 1
             ;;
     esac
 
