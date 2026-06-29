@@ -401,29 +401,104 @@ place_all_aggressors() {
 # resolver's watch is stuck in "bad resolver state" and never re-pulls
 # fresh srv-* registrations. Symptom: 100 % non-2xx responses on wrk.
 #
-# Mitigation, ported in spirit from batch-perf's data-collector.sh
-# (already sourced at the top of this file). We deliberately do NOT call
-# monitor_consul_service_registration / validate_and_ensure_service_registration
-# from data-collector.sh: those use `kubectl exec -it`, which fails with
-# SIGTTOU when stage3-eval.sh is run with `&` (Phase 3 backgrounds it for
-# the manual grpcurl subscribe). The TTY-safe equivalents we run here:
+# Mitigation, ported from batch-perf's data-collector.sh. We can't call
+# data-collector.sh's manual_register_all_services /
+# validate_and_ensure_service_registration directly: those use
+# `kubectl exec -it`, which SIGTTOUs when stage3-eval.sh is run with `&`
+# (Phase 3 backgrounds it for the manual grpcurl subscribe). So we inline
+# the SAME logic here, TTY-safe (plain `kubectl exec`, no -t):
 #   1. clean_stale_consul_services       - sweep srv-* entries whose
-#                                          backing pod IP no longer
-#                                          exists in the cluster (uses
-#                                          plain `kubectl exec` -- safe).
-#   2. kubectl rollout restart frontend  - force the grpc client to
+#                                          backing pod IP no longer exists.
+#   2. s3_consul_manual_register         - directly (re)register every
+#                                          srv-* at its CURRENT pod IP with
+#                                          a stable id=manual-<svc> and no
+#                                          health check. This is the piece
+#                                          that actually heals 'missing
+#                                          srv-*': HR services self-register
+#                                          only at startup, so a service
+#                                          whose stale entry we just swept
+#                                          (and whose pod we did NOT roll)
+#                                          would otherwise never come back.
+#   3. kubectl rollout restart frontend  - force the grpc client to
 #                                          re-establish the resolver.
-#   3. inline poll without -t            - wait until all expected
-#                                          srv-* are back in the
-#                                          Consul catalog.
+#   4. inline poll without -t            - wait until all expected srv-*
+#                                          are in the catalog; if any are
+#                                          still missing, one more register
+#                                          pass before giving up.
 #
 # All three are best-effort: warnings, never die. If the cluster is
 # already healthy (no stale entries, frontend resolver fine), this is
 # essentially a no-op.
 # ---------------------------------------------------------------------------
-recover_consul_state() {
-    s3_log "Consul recovery: clean stale srv-* + bounce frontend (heals 'bad resolver state' from prior rolls)"
+# ---------------------------------------------------------------------------
+# s3_consul_manual_register
+#
+# TTY-safe port of batch-perf data-collector.sh::manual_register_all_services.
+# Registers each HR srv-* into Consul at its CURRENT pod IP with a stable
+# id=manual-<svc> and no health check (so Consul won't auto-deregister it).
+# Idempotent: re-registering the same id just updates the address. Echoes
+# nothing; logs progress. Best-effort -- never dies.
+# ---------------------------------------------------------------------------
+s3_consul_manual_register() {
+    local consul_pod
+    consul_pod=$(kubectl get pods -l io.kompose.service=consul \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$consul_pod" ]]; then
+        s3_log "  WARNING: no Consul pod found; skipping manual registration"
+        return 0
+    fi
 
+    # service_name : consul_name : port  (frontend does NOT register itself).
+    local services=(
+        "search:srv-search:8082"
+        "geo:srv-geo:8083"
+        "profile:srv-profile:8081"
+        "rate:srv-rate:8084"
+        "recommendation:srv-recommendation:8085"
+        "reservation:srv-reservation:8087"
+        "user:srv-user:8086"
+    )
+    local entry svc cname port ip count=0
+    for entry in "${services[@]}"; do
+        IFS=':' read -r svc cname port <<< "$entry"
+        ip=$(kubectl get pod -l io.kompose.service="$svc" \
+            -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+        if [[ -z "$ip" ]]; then
+            s3_log "    skip $cname (no running pod IP for '$svc')"
+            continue
+        fi
+        if kubectl exec "$consul_pod" -- consul services register \
+            -name="$cname" -port="$port" -address="$ip" -id="manual-$svc" \
+            >> "$EXP_DIR/logs/stage3-eval.log" 2>&1; then
+            ((count++))
+        else
+            s3_log "    WARNING: failed to register $cname at $ip:$port"
+        fi
+    done
+    s3_log "  Manual registration: $count/${#services[@]} srv-* registered with current pod IPs"
+}
+
+# ---------------------------------------------------------------------------
+# _s3_consul_count_registered  -> echoes "<registered> <missing...>"
+# TTY-safe catalog read. Sets nothing; caller parses stdout.
+# ---------------------------------------------------------------------------
+_s3_consul_missing() {
+    local expected_services=(srv-search srv-geo srv-profile srv-rate \
+                             srv-recommendation srv-reservation srv-user)
+    local svc_list expected missing=()
+    svc_list=$(kubectl exec deployment/consul -- \
+                consul catalog services 2>/dev/null \
+                | tr -d '\r' | grep -E '^srv-' || true)
+    for expected in "${expected_services[@]}"; do
+        echo "$svc_list" | grep -qx "$expected" || missing+=("$expected")
+    done
+    echo "${missing[*]:-}"
+}
+
+recover_consul_state() {
+    s3_log "Consul recovery: clean stale srv-* + re-register missing + bounce frontend"
+
+    # 1. Sweep dead srv-* entries (TTY-safe; plain kubectl exec).
     if declare -F clean_stale_consul_services >/dev/null 2>&1; then
         clean_stale_consul_services "$EXP_DIR" \
             >> "$EXP_DIR/logs/stage3-eval.log" 2>&1 || true
@@ -431,47 +506,42 @@ recover_consul_state() {
         s3_log "  WARNING: clean_stale_consul_services not available (data-collector.sh not sourced?)"
     fi
 
+    # 2. Directly (re)register every srv-* at its current pod IP. This is the
+    #    step the old recovery lacked -- swept-but-not-rolled services never
+    #    self-register, so without this they stay missing.
+    s3_consul_manual_register
+
+    # 3. Bounce frontend so its grpc-consul resolver re-pulls the fresh set.
     s3_log "  Restarting frontend to refresh grpc-consul resolver"
     kubectl rollout restart deployment/frontend >/dev/null 2>&1 || true
     kubectl rollout status  deployment/frontend --timeout=120s >/dev/null 2>&1 \
         || s3_log "  WARNING: frontend rollout did not complete in 120s; proceeding"
 
-    # TTY-safe Consul catalog poll. Runs `kubectl exec` (no -t), so it's
-    # immune to SIGTTOU when stage3-eval is run in the background.
-    local expected_services=(srv-search srv-geo srv-profile srv-rate \
-                             srv-recommendation srv-reservation srv-user)
-    local max_wait=60   # seconds
-    local interval=5
-    local elapsed=0
-    local registered=0
-    local missing=()
-
+    # 4. Poll the catalog; if anything is still missing after the window, do
+    #    one more register pass before proceeding.
+    local expected_total=7
+    local max_wait=60 interval=5 elapsed=0
+    local missing
     while (( elapsed < max_wait )); do
-        local svc_list
-        svc_list=$(kubectl exec deployment/consul -- \
-                    consul catalog services 2>/dev/null \
-                    | tr -d '\r' \
-                    | grep -E '^srv-' || true)
-        registered=0
-        missing=()
-        local expected
-        for expected in "${expected_services[@]}"; do
-            if echo "$svc_list" | grep -qx "$expected"; then
-                ((registered++))
-            else
-                missing+=("$expected")
-            fi
-        done
-        if (( registered == ${#expected_services[@]} )); then
-            s3_log "  All ${#expected_services[@]} srv-* registered in Consul (${elapsed}s)"
+        missing=$(_s3_consul_missing)
+        if [[ -z "$missing" ]]; then
+            s3_log "  All ${expected_total} srv-* registered in Consul (${elapsed}s)"
             break
         fi
         sleep "$interval"
         elapsed=$(( elapsed + interval ))
     done
 
-    if (( registered < ${#expected_services[@]} )); then
-        s3_log "  WARNING: only ${registered}/${#expected_services[@]} srv-* registered after ${max_wait}s (missing: ${missing[*]:-none}); proceeding"
+    missing=$(_s3_consul_missing)
+    if [[ -n "$missing" ]]; then
+        s3_log "  Still missing after ${max_wait}s: $missing -- one more manual register pass"
+        s3_consul_manual_register
+        sleep 5
+        missing=$(_s3_consul_missing)
+    fi
+
+    if [[ -n "$missing" ]]; then
+        s3_log "  WARNING: srv-* still missing after recovery: $missing; proceeding anyway"
     fi
 
     s3_log "Consul recovery complete"
@@ -554,9 +624,56 @@ run_one_iteration() {
     done
     RUN_WRK2_PIDFILES=()
 
+    # Persist the victim's score stream for this run window so it survives the
+    # next run's pod roll (kubectl logs is lost on restart).
+    capture_victim_score_log "$run_dir" "$started_ns"
+
     write_per_run_manifest "$run_id" "$run_dir" "$started_ns" "$ended_ns"
 
     s3_log "  Run $run_id complete ($(( (ended_ns - started_ns) / 1000000 )) ms)"
+}
+
+# ---------------------------------------------------------------------------
+# capture_victim_score_log <run_dir> <started_ns>
+#
+# Dumps the victim's `score_event` zerolog lines for this run window into
+# <run_dir>/score_events.log. Requires the run to have score_log=true (sets
+# GORDION_SCORE_LOG=true so the in-binary LogSink writes one line per
+# ScoreEvent). Best-effort: never dies, and writes a note instead of an
+# empty file when scores aren't available.
+# ---------------------------------------------------------------------------
+capture_victim_score_log() {
+    local run_dir="$1"
+    local started_ns="$2"
+    local out="$run_dir/score_events.log"
+
+    if [[ "${VICTIM_SCORE_LOG:-false}" != "true" ]]; then
+        s3_log "  Score capture skipped (victim.score_log=false). Live stream: grpcurl :7900 ContentionStream/Subscribe"
+        echo "# score_log disabled for this run (victim.score_log=false)" > "$out"
+        return 0
+    fi
+
+    # kubectl --since-time wants RFC3339 UTC; derive it from the run start.
+    local since
+    since=$(date -u -d "@$(( started_ns / 1000000000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+
+    if [[ -n "$since" ]]; then
+        kubectl logs "deployment/$VICTIM_DEPLOYMENT" --since-time="$since" 2>/dev/null \
+            | grep 'score_event' > "$out" 2>/dev/null || true
+    else
+        # Fallback if date math failed: capture the whole window by duration.
+        kubectl logs "deployment/$VICTIM_DEPLOYMENT" --since="$(( EXPERIMENT_DURATION_S + 10 ))s" 2>/dev/null \
+            | grep 'score_event' > "$out" 2>/dev/null || true
+    fi
+
+    local n
+    n=$(wc -l < "$out" 2>/dev/null | tr -d ' ')
+    n="${n:-0}"
+    if [[ "$n" -gt 0 ]]; then
+        s3_log "  Captured $n score_event line(s) -> runs/run_$(basename "$run_dir" | sed 's/run_//')/score_events.log"
+    else
+        s3_log "  WARNING: 0 score_event lines captured (victim emitted none in window; check GORDION_SCORE_SOURCE/model wiring)"
+    fi
 }
 
 # ---------------------------------------------------------------------------
