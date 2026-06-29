@@ -2047,6 +2047,89 @@ refresh_consul_service_discovery() {
     log "$exp_dir" "Consul service discovery refresh completed"
 }
 
+# ---------------------------------------------------------------------------
+# Reset HR service databases to a single canonical baseline.
+#
+# Every HR service re-seeds its test data at startup (cmd/<svc>/db.go
+# "Generating test data") and the data persists on a PVC, so every rollout
+# APPENDS another copy -- after dozens of restarts geo.geo / profile.hotels
+# balloon to 30-40x their intended size (e.g. geo 80 -> 3520) and the
+# reservation DB accumulates stale bookings. Not fatal (single-request
+# latency stays low) but it wastes storage and makes runs non-repeatable.
+#
+# Cheap by default: probes geo/profile counts first and returns immediately
+# unless they exceed HR_DB_BLOAT_THRESHOLD (default 500). Only on detected
+# bloat does it drop every non-system collection and roll the owning
+# services so each re-seeds exactly one baseline copy. Best-effort.
+#
+# NOTE: the reset rolls all 6 mongo-backed HR services; they mount /dev/cpu,
+# so `msr` must be loaded on every worker node or the new pods wedge in
+# ContainerCreating (same requirement as the instrumented victim).
+# ---------------------------------------------------------------------------
+clean_hr_databases() {
+    local exp_dir="$1"
+    local ns="${HR_NAMESPACE:-default}"
+    local threshold="${HR_DB_BLOAT_THRESHOLD:-500}"
+
+    local geo_pod profile_pod geo_n profile_n
+    geo_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-geo \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    profile_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-profile \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$geo_pod" && -z "$profile_pod" ]]; then
+        log "$exp_dir" "  HR DB reset skipped (no HR mongo pods found)"
+        return 0
+    fi
+    geo_n=$(kubectl -n "$ns" exec "$geo_pod" -- mongo geo-db --quiet \
+        --eval 'db.geo.count()' 2>/dev/null | tr -dc '0-9')
+    profile_n=$(kubectl -n "$ns" exec "$profile_pod" -- mongo profile-db --quiet \
+        --eval 'db.hotels.count()' 2>/dev/null | tr -dc '0-9')
+    geo_n="${geo_n:-0}"; profile_n="${profile_n:-0}"
+
+    if [[ "$geo_n" -le "$threshold" && "$profile_n" -le "$threshold" ]]; then
+        log "$exp_dir" "  HR DBs within baseline (geo.geo=$geo_n, profile.hotels=$profile_n <= $threshold); no reset"
+        return 0
+    fi
+
+    log "$exp_dir" "  HR DB bloat detected (geo.geo=$geo_n, profile.hotels=$profile_n > $threshold); resetting to baseline"
+
+    # deployment : mongo-label : db-name  (frontend/search keep no DB state)
+    local entries=(
+        "geo:mongodb-geo:geo-db"
+        "profile:mongodb-profile:profile-db"
+        "rate:mongodb-rate:rate-db"
+        "recommendation:mongodb-recommendation:recommendation-db"
+        "reservation:mongodb-reservation:reservation-db"
+        "user:mongodb-user:user-db"
+    )
+    local entry deploy label db pod dropped=()
+    for entry in "${entries[@]}"; do
+        IFS=':' read -r deploy label db <<< "$entry"
+        pod=$(kubectl -n "$ns" get pods -l io.kompose.service="$label" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        [[ -z "$pod" ]] && continue
+        kubectl -n "$ns" exec "$pod" -- mongo "$db" --quiet --eval \
+            'db.getCollectionNames().forEach(function(c){ if(!/^system\./.test(c)){ db[c].drop(); } });' \
+            >> "$exp_dir/logs/collector.log" 2>&1 && dropped+=("$deploy")
+    done
+
+    if [[ ${#dropped[@]} -eq 0 ]]; then
+        log "$exp_dir" "  No HR mongo pods reachable; nothing dropped"
+        return 0
+    fi
+
+    log "$exp_dir" "  Dropped collections in ${#dropped[@]} DB(s); restarting to re-seed: ${dropped[*]}"
+    kubectl -n "$ns" rollout restart deployment "${dropped[@]}" \
+        >> "$exp_dir/logs/collector.log" 2>&1 || true
+    local d
+    for d in "${dropped[@]}"; do
+        kubectl -n "$ns" rollout status deployment "$d" --timeout=120s \
+            >> "$exp_dir/logs/collector.log" 2>&1 \
+            || log "$exp_dir" "    WARNING: $d not Ready in 120s (is 'msr' loaded on all worker nodes?)"
+    done
+    sleep 10
+}
+
 # Deregister stale srv-* entries from Consul whose backing pod IP is no
 # longer alive in the cluster. Symptom we defend against: repeated failed
 # runs leave hundreds of stale srv-search registrations in Consul; the
@@ -2110,6 +2193,10 @@ validate_system_readiness() {
     # stale IP and we'll see HTTP 500 on the hotels probe even though the
     # live search pod is healthy.
     clean_stale_consul_services "$exp_dir"
+
+    # Reset seed-on-boot DB bloat to baseline. Cheap no-op unless geo/profile
+    # have grown past HR_DB_BLOAT_THRESHOLD; keeps batch experiments repeatable.
+    clean_hr_databases "$exp_dir"
 
     local validation_failed=false
     

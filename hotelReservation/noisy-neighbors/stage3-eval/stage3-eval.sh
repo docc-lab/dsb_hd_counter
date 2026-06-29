@@ -213,6 +213,11 @@ main() {
     determine_used_testbeds
     prep_victim_node
     deploy_testbeds
+    # Reset seed-on-boot DB bloat to a clean baseline (cheap no-op when the
+    # DBs are already small). clean_hr_databases is sourced from data-collector.sh.
+    if declare -F clean_hr_databases >/dev/null 2>&1; then
+        clean_hr_databases "$EXP_DIR" || true
+    fi
     deploy_victim
     place_all_aggressors
     recover_consul_state
