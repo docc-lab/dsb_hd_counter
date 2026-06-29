@@ -30,21 +30,25 @@ HR_NAMESPACE="${HR_NAMESPACE:-default}"
 HR_KUBERNETES_DIR="${HR_KUBERNETES_DIR:-../../kubernetes}"
 
 # Map between human-friendly service names (as written in YAML) and the
-# actual k8s deployment names. Most are 1:1; HR uses slightly off-spec
-# names for "recommendation" -> "reccomend" and "reservation" -> "reserve".
+# actual k8s deployment names. These are all 1:1 -- the deployments are
+# named `recommendation` / `reservation` (see metadata.name in
+# kubernetes/reccomend/recommendation-deployment.yaml etc.). Only the
+# kubernetes/ SUBDIRECTORIES are off-spec (reccomend/reserve); that quirk
+# lives in HR_SERVICE_TO_DIR below, not here.
 declare -gA HR_SERVICE_TO_DEPLOYMENT=(
     [frontend]=frontend
     [search]=search
     [profile]=profile
     [geo]=geo
     [rate]=rate
-    [recommendation]=reccomend
-    [reservation]=reserve
+    [recommendation]=recommendation
+    [reservation]=reservation
     [user]=user
 )
 
-# Service -> kubernetes/ subdir mapping (some HR services live in
-# directories whose names match the deployment, not the human name).
+# Service -> kubernetes/ subdir mapping. The recommendation/reservation
+# manifests live in directories named reccomend/reserve (off-spec), even
+# though the deployments inside are named recommendation/reservation.
 declare -gA HR_SERVICE_TO_DIR=(
     [frontend]=frontend
     [search]=search

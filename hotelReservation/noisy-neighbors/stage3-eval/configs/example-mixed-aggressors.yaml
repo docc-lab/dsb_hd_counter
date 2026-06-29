@@ -37,7 +37,7 @@ victim:
   testbed: hotelReservation
   service: search
   image: docclabgroup/search-online:v1.2.1
-  score_log: false
+  score_log: true   # GORDION_SCORE_LOG=true -> score_event lines in victim pod log
 aggressors:
   # HR co-tenants colocated with the victim on target_node.
   - testbed: hotelReservation
