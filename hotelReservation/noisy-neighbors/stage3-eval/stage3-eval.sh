@@ -355,6 +355,12 @@ place_all_aggressors() {
         s3_log "  aggressor[$i] role=$role -> $ns/$deploy"
         place_aggressor "$ns" "$deploy" "$TARGET_NODE" \
             || die "place_aggressor failed for $ns/$deploy"
+        # Aggressors run unlimited (no cpu/mem caps) at high priority. Recorded
+        # in RUN_PLACED_AGGRESSORS below so the cleanup trap's unplace_aggressor
+        # also unboosts. Victim placement (place_aggressor above) is deliberately
+        # NOT boosted.
+        boost_aggressor "$ns" "$deploy" \
+            || die "boost_aggressor failed for $ns/$deploy"
         RUN_PLACED_AGGRESSORS+=("${ns}|${deploy}")
     done
 
