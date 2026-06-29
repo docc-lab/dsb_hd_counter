@@ -1,0 +1,29 @@
+# HR-only baseline -- single hotelReservation deployment, NO aggressors,
+# no socialNetwork / sockshop. Zero injected contention.
+#
+# Purpose: isolate HR's own latency-vs-load. If HR alone can't hold its
+# target rps at low latency here, the problem is HR/victim itself (CPU_SET
+# pinning, instrumentation overhead, 3-core cap), NOT noisy neighbors.
+# Once this is clean, reintroduce aggressors one at a time.
+#
+#   ./stage3-eval.sh configs/hr-only-baseline.yaml
+#
+# Sweep rps (200 -> 150 -> 100 ...) to find the throughput knee: the point
+# where wrk's "Requests/sec" stops matching the target and latency climbs.
+
+experiment:
+  name: hr-only-baseline
+  duration_s: 120
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-3
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 200, shape: fixed}
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v1.2.1
+  score_log: true
+aggressors: []
