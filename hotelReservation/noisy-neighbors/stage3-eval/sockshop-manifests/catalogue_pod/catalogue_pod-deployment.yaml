@@ -21,6 +21,13 @@ spec:
         - name: catalogue-ctr
           image: docclabgroup/sockshop_catalogue_ctr
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "3"
+              memory: "2Gi"
           env:
             - name: CATALOGUE_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"

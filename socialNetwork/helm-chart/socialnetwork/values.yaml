@@ -5,13 +5,18 @@ global:
     maxReplicas: 10
     targetMemoryUtilizationPercentage: '60'
     targetCPUUtilizationPercentage: '60'
+  # Stage3: raised from cpu:100m (which throttled every SN service into
+  # collapse at 400 rps). global.resources applies to ALL ~30 SN subchart
+  # pods (compute + datastores) unless a subchart overrides .resources, so
+  # requests is kept at 1 core to bound total reservation (~30 cores); the
+  # 3-core limit gives the compute services room to burst.
   resources:
     limits:
-      cpu: 100m
-      memory: 128Mi
+      cpu: "3"
+      memory: 2Gi
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: "1"
+      memory: 512Mi
   replicas: 1
   imagePullPolicy: "IfNotPresent"
   restartPolicy: Always

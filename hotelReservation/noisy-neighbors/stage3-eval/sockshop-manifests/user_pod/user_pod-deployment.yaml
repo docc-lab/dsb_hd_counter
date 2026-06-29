@@ -21,6 +21,13 @@ spec:
         - name: user-ctr
           image: docclabgroup/sockshop_user_ctr
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "3"
+              memory: "2Gi"
           env:
             - name: USER_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"

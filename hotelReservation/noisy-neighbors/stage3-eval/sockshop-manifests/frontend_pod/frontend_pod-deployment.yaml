@@ -21,6 +21,13 @@ spec:
         - name: frontend-ctr
           image: docclabgroup/sockshop_frontend_ctr
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "3"
+              memory: "2Gi"
           env:
             - name: FRONTEND_HTTP_BIND_ADDR
               value: "0.0.0.0:2000"

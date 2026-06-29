@@ -21,6 +21,13 @@ spec:
         - name: shipping-ctr
           image: docclabgroup/sockshop_shipping_ctr
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "3"
+              memory: "2Gi"
           env:
             - name: SHIPPING_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"

@@ -21,6 +21,13 @@ spec:
         - name: payment-ctr
           image: docclabgroup/sockshop_payment_ctr
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "3"
+              memory: "2Gi"
           env:
             - name: PAYMENT_SERVICE_GRPC_BIND_ADDR
               value: "0.0.0.0:12345"
