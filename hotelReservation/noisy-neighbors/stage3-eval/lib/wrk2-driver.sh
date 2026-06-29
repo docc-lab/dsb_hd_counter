@@ -40,7 +40,21 @@ declare -gA WRK2_TESTBED_SCRIPT=(
 # specific aggressors need more concurrency; experimenter can also set
 # WRK2_THREADS / WRK2_CONNECTIONS globally before invoking stage3-eval.sh.
 WRK2_THREADS="${WRK2_THREADS:-4}"
-WRK2_CONNECTIONS="${WRK2_CONNECTIONS:-16}"
+WRK2_CONNECTIONS="${WRK2_CONNECTIONS:-32}"   # floor; auto-scaled up to >= rps
+
+# _wrk2_conns <rps> -> echoes the connection count to use.
+#
+# wrk2 is open-loop: connections must exceed rps*tail_latency or its
+# coordinated-omission correction inflates the tail and the offered rate is
+# never actually delivered (the -c 4 starvation we hit by hand). Use >=1
+# connection per offered rps (~1s of latency headroom), floored at
+# WRK2_CONNECTIONS and capped so we don't overwhelm the server's accept path.
+_wrk2_conns() {
+    local rps="$1" c="$WRK2_CONNECTIONS"
+    [[ "$rps" =~ ^[0-9]+$ ]] && (( rps > c )) && c="$rps"
+    (( c > 256 )) && c=256
+    echo "$c"
+}
 
 # ---------------------------------------------------------------------------
 # resolve_wrk2_script <testbed>
@@ -135,6 +149,8 @@ start_wrk2_driver() {
                 fi
             done
 
+            # Size connections to the peak rate (binding constraint).
+            local bconns; bconns=$(_wrk2_conns "$peak_rps")
             $launcher bash -c "
                 end=\$(( \$(date +%s) + $duration_s ))
                 while [[ \$(date +%s) -lt \$end ]]; do
@@ -143,7 +159,7 @@ start_wrk2_driver() {
                     if [[ \$remaining -le 0 ]]; then break; fi
                     burst=\$(( $burst_s < remaining ? $burst_s : remaining ))
                     echo '--- BURST peak_rps=$peak_rps for '\$burst's @ ' \$(date -Iseconds) >> '$out_file'
-                    '$WRK2_BIN' -D fixed -t $WRK2_THREADS -c $WRK2_CONNECTIONS \
+                    '$WRK2_BIN' -D fixed -t $WRK2_THREADS -c $bconns \
                         -d \${burst}s -L -R $peak_rps -s '$script_path' '$target_url' \
                         >> '$out_file' 2>&1 || true
                     # Idle window
@@ -151,7 +167,7 @@ start_wrk2_driver() {
                     if [[ \$remaining -le 0 ]]; then break; fi
                     idle=\$(( $idle_s < remaining ? $idle_s : remaining ))
                     echo '--- IDLE base_rps=$base_rps for '\$idle's @ ' \$(date -Iseconds) >> '$out_file'
-                    '$WRK2_BIN' -D fixed -t $WRK2_THREADS -c $WRK2_CONNECTIONS \
+                    '$WRK2_BIN' -D fixed -t $WRK2_THREADS -c $bconns \
                         -d \${idle}s -L -R $base_rps -s '$script_path' '$target_url' \
                         >> '$out_file' 2>&1 || true
                 done
@@ -168,9 +184,10 @@ start_wrk2_driver() {
                 echo "ERROR [wrk2-driver:$label]: WRK2_FIXED_RPS must be a positive integer (got '$rps')" >&2
                 return 1
             fi
+            local conns; conns=$(_wrk2_conns "$rps")
             $launcher bash -c "
-                echo '--- shape=$dist rps=$rps for ${duration_s}s @ ' \$(date -Iseconds) >> '$out_file'
-                '$WRK2_BIN' -D $dist -t $WRK2_THREADS -c $WRK2_CONNECTIONS \
+                echo '--- shape=$dist rps=$rps conns=$conns for ${duration_s}s @ ' \$(date -Iseconds) >> '$out_file'
+                '$WRK2_BIN' -D $dist -t $WRK2_THREADS -c $conns \
                     -d ${duration_s}s -L -R $rps -s '$script_path' '$target_url' \
                     >> '$out_file' 2>&1 || true
             " &

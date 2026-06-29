@@ -25,6 +25,16 @@ spec:
       labels:
         io.kompose.service: memcached-profile
     spec:
+      # Co-locate with the profile service to keep its cache lookups node-local.
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    io.kompose.service: profile
+                topologyKey: kubernetes.io/hostname
       containers:
         - env:
             - name: MEMCACHED_CACHE_SIZE

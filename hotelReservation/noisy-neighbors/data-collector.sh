@@ -2459,10 +2459,19 @@ start_workload_and_latency() {
     target_url="http://${service_ip}:${service_port}"
     log "$exp_dir" "Target URL: $target_url"
     log "$exp_dir" "Workload script: ${workload_script:-none}"
-    log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $connections, Duration: ${duration}s"
-    
+    # wrk2 is open-loop: connections must exceed rate*tail_latency or the
+    # backlog inflates the tail (coordinated omission), under-driving the
+    # offered rate. Scale to >=1 connection per offered rps (~1s of latency
+    # headroom), floored at the configured value and capped so we don't
+    # overwhelm the server's accept path.
+    local eff_conns="$connections"
+    (( rate > eff_conns )) && eff_conns="$rate"
+    (( eff_conns > 256 )) && eff_conns=256
+    (( threads > eff_conns )) && threads="$eff_conns"
+    log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $eff_conns (floor $connections), Duration: ${duration}s"
+
     # Construct wrk2 command
-    local wrk2_cmd="$WRK2_DIR/wrk -D ${WRK2_DIST:-fixed} -t $threads -c $connections -d ${duration}s -L -R $rate"
+    local wrk2_cmd="$WRK2_DIR/wrk -D ${WRK2_DIST:-fixed} -t $threads -c $eff_conns -d ${duration}s -L -R $rate"
     
     if [[ -n "$workload_script" && -f "$workload_script" ]]; then
         wrk2_cmd="$wrk2_cmd -s $workload_script"
@@ -2689,8 +2698,8 @@ run_iteration() {
             "$iteration" \
             "${WRK2_SCRIPT:-}" \
             "${WRK2_RATE:-200}" \
-            "${WRK2_THREADS:-2}" \
-            "${WRK2_CONNECTIONS:-2}")
+            "${WRK2_THREADS:-4}" \
+            "${WRK2_CONNECTIONS:-32}")
     fi
     
     # Start burst schedule execution in the background so the main loop's
@@ -3494,8 +3503,8 @@ WRK2_TARGET_IP='192.168.1.100'  # CHANGE TO YOUR IP
 WRK2_TARGET_PORT=5000
 WRK2_SCRIPT='../wrk2/scripts/hotel-reservation/mixed-workload_type_1.lua'
 WRK2_RATE=200
-WRK2_THREADS=3
-WRK2_CONNECTIONS=3
+WRK2_THREADS=4
+WRK2_CONNECTIONS=32   # floor; auto-scaled up to >= rate at run time (see run_load)
 
 # Timeline (per iteration):
 #   0-30s:   Burst 1 (4 CPUs) - active samples

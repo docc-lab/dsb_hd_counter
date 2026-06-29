@@ -70,6 +70,12 @@ spec:
           # to disable Stage 3 entirely while keeping the Stage 2
           # disk-dump path intact.
           env:
+            # Match GOMAXPROCS to the cpu limit (3). Without this the Go
+            # runtime defaults to the node core count (~32) and fans threads
+            # past the 3-core CFS quota -> heavy throttling + latency jitter on
+            # the victim (measured: nr_throttled climbing constantly). Standard
+            # Go-in-Kubernetes practice. Adjust if the cpu limit changes.
+            - {name: GOMAXPROCS,              value: "3"}
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,    value: "onnx"}
             # The remaining GORDION_* env vars (paths, ports, buffers)

@@ -25,6 +25,19 @@ spec:
       labels:
         io.kompose.service: memcached-reserve
     spec:
+      # Co-locate with the reservation service: CheckAvailability does a large
+      # (hotels x nights) memcached fan-out per request, so a cross-node hop
+      # turns that into tens of ms. Strong preference (not required) so it
+      # never blocks scheduling.
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    io.kompose.service: reservation
+                topologyKey: kubernetes.io/hostname
       containers:
         - env:
             - name: MEMCACHED_CACHE_SIZE
