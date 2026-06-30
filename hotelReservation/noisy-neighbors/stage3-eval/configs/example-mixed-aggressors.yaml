@@ -28,32 +28,33 @@ experiment:
   target_node: node-3
 testbeds:
   hotelReservation:
-    loadgen: {rps: 200, shape: fixed}
+    loadgen: {rps: 325, shape: exp}    # victim load -- keep fixed across runs
   socialNetwork:
-    loadgen: {rps: 150, shape: fixed}
+    loadgen: {rps: 1000, shape: exp}   # drive the SN aggressors hard; ramp w/ mpstat
+    replicas: 2                        # scale SN compute services (datastores untouched)
   sockshop:
-    loadgen: {rps: 100, shape: fixed}
+    loadgen: {rps: 1000, shape: exp}   # drive the SS aggressors hard; ramp w/ mpstat
+    replicas: 2                        # scale SS app services (db pods untouched)
 victim:
   testbed: hotelReservation
   service: search
   image: docclabgroup/search-online:v1.2.1
   score_log: true   # GORDION_SCORE_LOG=true -> score_event lines in victim pod log
 aggressors:
-  # HR co-tenants colocated with the victim on target_node.
-  - testbed: hotelReservation
-    service: profile
-    role: bad
-  - testbed: hotelReservation
-    service: geo
-    role: good
-  # SN co-tenant from a different testbed. The compose-post service
-  # lives on the victim's node; other SN services schedule wherever
-  # k8s puts them. Independent wrk2 drives SN via nginx-thrift.
-  - testbed: socialNetwork
-    service: compose-post
-    role: bad
-  # sockshop co-tenant (requires testbed-ss.sh to be implemented;
-  # comment out the entry below until sockshop ships).
-  - testbed: sockshop
-    service: cart
-    role: bad
+  # ~9 co-tenants, all pinned to target_node with the victim. The SN/SS
+  # services are the real contention generators (independent wrk2 load);
+  # the HR ones ride HR's own 325 rps. Roles are metadata only (placement
+  # and the unlimited+high-priority boost are identical regardless of role).
+  #
+  # HR co-tenants (driven by HR's own load).
+  - {testbed: hotelReservation, service: profile, role: bad}
+  - {testbed: hotelReservation, service: geo,     role: good}
+  # SN co-tenants (driven by the SN wrk2 at the rps above).
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  # SS co-tenants (driven by the SS wrk2 at the rps above).
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

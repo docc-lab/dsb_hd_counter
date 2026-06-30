@@ -213,6 +213,8 @@ main() {
     determine_used_testbeds
     prep_victim_node
     deploy_testbeds
+    # Scale non-HR aggressor testbeds' compute services per config (default 1).
+    scale_testbed_replicas
     # Reset seed-on-boot DB bloat to a clean baseline (cheap no-op when the
     # DBs are already small). clean_hr_databases is sourced from data-collector.sh.
     if declare -F clean_hr_databases >/dev/null 2>&1; then
@@ -302,6 +304,24 @@ deploy_testbeds() {
             socialNetwork)    sn_deploy "$EXP_DIR" || die "sn_deploy failed" ;;
             sockshop)         ss_deploy "$EXP_DIR" || die "ss_deploy failed (see TODO_SOCKSHOP.md)" ;;
             *) die "unknown testbed '$tb'" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Scale each in-scope testbed's compute services to its configured replica
+# count (testbeds.<tb>.replicas, default 1). Non-HR only: HR is the victim
+# testbed and is left at its manifest replicas. Datastores are skipped by the
+# per-testbed scale helpers.
+# ---------------------------------------------------------------------------
+scale_testbed_replicas() {
+    local tb n
+    for tb in "${DRIVEN_TESTBEDS[@]}"; do
+        n="${TESTBED_REPLICAS[$tb]:-1}"
+        case "$tb" in
+            socialNetwork) (( n > 1 )) && { s3_log "Scaling socialNetwork compute services to $n replicas"; sn_scale_replicas "$n" "$EXP_DIR"; } ;;
+            sockshop)      (( n > 1 )) && { s3_log "Scaling sockshop app services to $n replicas";        ss_scale_replicas "$n" "$EXP_DIR"; } ;;
+            hotelReservation) (( n > 1 )) && s3_log "NOTE: hotelReservation.replicas=$n ignored (victim testbed left at manifest replicas)" ;;
         esac
     done
 }

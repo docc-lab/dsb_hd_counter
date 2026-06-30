@@ -106,6 +106,7 @@ parse_config() {
 
     # testbeds block -> per-testbed loadgen JSON, one map slot per testbed.
     declare -gA TESTBED_LOADGEN_JSON=()
+    declare -gA TESTBED_REPLICAS=()      # per-testbed compute-service replica count (default 1)
     local tb_names tb
     tb_names=$(yq -r '.testbeds | keys | .[]' "$config_file" 2>/dev/null || echo "")
     if [[ -z "$tb_names" ]]; then
@@ -142,6 +143,17 @@ parse_config() {
                    return 1 ;;
             esac
         fi
+        # Optional per-testbed replica count for the compute services. Used to
+        # scale non-HR aggressor testbeds up so their node-pinned services
+        # generate more load/CPU. Default 1. HR (the victim testbed) is left at
+        # its manifest replicas regardless of this field.
+        local reps
+        reps=$(yq -r ".testbeds.\"$tb\".replicas // 1" "$config_file")
+        if ! [[ "$reps" =~ ^[0-9]+$ ]] || [[ "$reps" -lt 1 ]]; then
+            echo "ERROR: testbeds.$tb.replicas must be a positive integer (got: '$reps')" >&2
+            return 1
+        fi
+        TESTBED_REPLICAS["$tb"]="$reps"
         TESTBED_LOADGEN_JSON["$tb"]="$lg"
     done <<< "$tb_names"
 

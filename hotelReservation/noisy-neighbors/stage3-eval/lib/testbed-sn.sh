@@ -133,6 +133,32 @@ sn_deploy() {
 }
 
 # ---------------------------------------------------------------------------
+# sn_scale_replicas <n> [exp_dir]
+#
+# Scale every SN compute deployment to <n> replicas. SN datastores (mongodb /
+# redis / memcached) are NOT in SN_SERVICE_TO_DEPLOYMENT, so they're left
+# untouched (scaling stateful singletons would break them). No-op for n<=1.
+# Async (kubectl scale returns immediately); new pods come up during the
+# victim deploy + warmup. The aggressor SN service among these gets its
+# replicas pinned to target_node by place_aggressor; the rest add upstream
+# throughput so the pinned aggressor can be driven harder.
+# ---------------------------------------------------------------------------
+sn_scale_replicas() {
+    local n="$1" exp_dir="${2:-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || return 0
+    (( n <= 1 )) && return 0
+    local log=/dev/null
+    [[ -n "$exp_dir" ]] && log="$exp_dir/logs/testbed-sn.log"
+    local svc deploy
+    for svc in "${!SN_SERVICE_TO_DEPLOYMENT[@]}"; do
+        deploy="${SN_SERVICE_TO_DEPLOYMENT[$svc]}"
+        kubectl -n "$SN_NAMESPACE" scale deployment "$deploy" --replicas="$n" \
+            >> "$log" 2>&1 || true
+    done
+    echo "[testbed-sn] Scaled ${#SN_SERVICE_TO_DEPLOYMENT[@]} SN compute deployments to $n replicas"
+}
+
+# ---------------------------------------------------------------------------
 # sn_teardown <exp_dir>
 #
 # Soft reset: removes nodeSelector + tolerations from every SN deployment

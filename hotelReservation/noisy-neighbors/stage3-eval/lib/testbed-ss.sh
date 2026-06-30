@@ -130,6 +130,31 @@ ss_deploy() {
 }
 
 # ---------------------------------------------------------------------------
+# ss_scale_replicas <n> [exp_dir]
+#
+# Scale every sockshop APP deployment to <n> replicas, skipping the *-db
+# datastores (scaling stateful singletons would break them). No-op for n<=1.
+# Async; new pods come up during the victim deploy + warmup. The pinned
+# aggressor SS service gets its replicas placed on target_node; the rest add
+# upstream throughput.
+# ---------------------------------------------------------------------------
+ss_scale_replicas() {
+    local n="$1" exp_dir="${2:-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || return 0
+    (( n <= 1 )) && return 0
+    local log=/dev/null
+    [[ -n "$exp_dir" ]] && log="$exp_dir/logs/testbed-ss.log"
+    local svc deploy count=0
+    for svc in "${!SS_SERVICE_TO_DEPLOYMENT[@]}"; do
+        case "$svc" in *-db) continue ;; esac   # skip cart-db / order-db / ... datastores
+        deploy="${SS_SERVICE_TO_DEPLOYMENT[$svc]}"
+        kubectl -n "$SS_NAMESPACE" scale deployment "$deploy" --replicas="$n" \
+            >> "$log" 2>&1 && (( count++ )) || true
+    done
+    echo "[testbed-ss] Scaled $count sockshop app deployments to $n replicas"
+}
+
+# ---------------------------------------------------------------------------
 # ss_teardown <exp_dir>
 #
 # Soft reset: strip nodeSelector + tolerations from every sockshop
