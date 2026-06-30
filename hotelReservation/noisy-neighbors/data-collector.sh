@@ -2125,7 +2125,7 @@ clean_hr_databases() {
     for d in "${dropped[@]}"; do
         kubectl -n "$ns" rollout status deployment "$d" --timeout=120s \
             >> "$exp_dir/logs/collector.log" 2>&1 \
-            || log "$exp_dir" "    WARNING: $d not Ready in 120s (is 'msr' loaded on all worker nodes?)"
+            || log "$exp_dir" "    WARNING: $d not Ready in 120s after reseed (slow seed, node pressure, or stuck old pod). NOTE: of the HR services only 'search'/'profile' mount /dev/cpu, so msr matters only for those -- geo/rate/recommendation/reservation/user do NOT use msr."
     done
     sleep 10
 }

@@ -348,6 +348,16 @@ deploy_victim() {
         "GORDION_SCORE_LOG=$VICTIM_SCORE_LOG" >/dev/null 2>&1 \
         || s3_log "WARNING: failed to set GORDION_SCORE_LOG on $VICTIM_DEPLOYMENT"
 
+    # Instrumentation env -- applied here (not baked into base manifests) so any
+    # HR service stays a clean, scheduler-friendly stock service until it's the
+    # victim. Together with the image override above and apply_msr_pod_capabilities
+    # below (mount + privileged + AppArmor + CAP_SYS_RAWIO), this restores the
+    # full GORDION setup for whichever service is selected as the victim.
+    kubectl set env "deployment/$VICTIM_DEPLOYMENT" \
+        "ENABLE_WINDOWED_SAMPLING=true" "GORDION_SCORE_SOURCE=${VICTIM_SCORE_SOURCE:-onnx}" \
+        >/dev/null 2>&1 \
+        || s3_log "WARNING: failed to set instrumentation env on $VICTIM_DEPLOYMENT"
+
     if declare -F apply_msr_pod_capabilities >/dev/null 2>&1; then
         apply_msr_pod_capabilities "$VICTIM_DEPLOYMENT" "$EXP_DIR" \
             || s3_log "WARNING: apply_msr_pod_capabilities failed; freq.ok will be false in samples"

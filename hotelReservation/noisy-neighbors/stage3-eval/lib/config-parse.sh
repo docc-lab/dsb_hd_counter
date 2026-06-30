@@ -98,6 +98,10 @@ parse_config() {
     VICTIM_IMAGE=$(yq -e -r          '.victim.image'    "$config_file") || {
         echo "ERROR: victim.image missing" >&2; return 1; }
     VICTIM_SCORE_LOG=$(yq -r         '.victim.score_log // false' "$config_file")
+    # Instrumentation source applied to the victim at deploy time (onnx | none).
+    # Default onnx. Lives here (not in the base manifests) so any HR service is
+    # a clean stock service until it's selected as the victim.
+    VICTIM_SCORE_SOURCE=$(yq -r       '.victim.score_source // "onnx"' "$config_file")
 
     if [[ "$VICTIM_TESTBED" != "hotelReservation" ]]; then
         echo "ERROR: victim.testbed must be 'hotelReservation' (only testbed with stage3wire.Setup wired today, got '$VICTIM_TESTBED')" >&2
@@ -203,7 +207,7 @@ parse_config() {
     export EXPERIMENT_NAME EXPERIMENT_DURATION_S EXPERIMENT_WARMUP_S \
            EXPERIMENT_COOLDOWN_S EXPERIMENT_RUNS TARGET_NODE \
            VICTIM_TESTBED VICTIM_SERVICE VICTIM_IMAGE VICTIM_SCORE_LOG \
-           AGGRESSOR_COUNT
+           VICTIM_SCORE_SOURCE AGGRESSOR_COUNT
 
     return 0
 }
