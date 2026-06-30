@@ -2461,12 +2461,14 @@ start_workload_and_latency() {
     log "$exp_dir" "Workload script: ${workload_script:-none}"
     # wrk2 is open-loop: connections must exceed rate*tail_latency or the
     # backlog inflates the tail (coordinated omission), under-driving the
-    # offered rate. Scale to >=1 connection per offered rps (~1s of latency
-    # headroom), floored at the configured value and capped so we don't
-    # overwhelm the server's accept path.
-    local eff_conns="$connections"
-    (( rate > eff_conns )) && eff_conns="$rate"
-    (( eff_conns > 256 )) && eff_conns=256
+    # offered rate; too MANY connections idle between requests and trip wrk2's
+    # per-connection timeout / conntrack limits (socket timeouts). ~rate*0.25
+    # = ~250ms of latency headroom, floored at the configured value, capped 64.
+    local eff_conns="$connections" cap=64
+    (( connections > cap )) && cap="$connections"
+    local target=$(( (rate + 3) / 4 ))
+    (( target > eff_conns )) && eff_conns="$target"
+    (( eff_conns > cap )) && eff_conns="$cap"
     (( threads > eff_conns )) && threads="$eff_conns"
     log "$exp_dir" "Rate: ${rate} RPS, Threads: $threads, Connections: $eff_conns (floor $connections), Duration: ${duration}s"
 

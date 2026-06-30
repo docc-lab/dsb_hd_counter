@@ -44,15 +44,21 @@ WRK2_CONNECTIONS="${WRK2_CONNECTIONS:-32}"   # floor; auto-scaled up to >= rps
 
 # _wrk2_conns <rps> -> echoes the connection count to use.
 #
-# wrk2 is open-loop: connections must exceed rps*tail_latency or its
-# coordinated-omission correction inflates the tail and the offered rate is
-# never actually delivered (the -c 4 starvation we hit by hand). Use >=1
-# connection per offered rps (~1s of latency headroom), floored at
-# WRK2_CONNECTIONS and capped so we don't overwhelm the server's accept path.
+# Goldilocks: connections must hold the offered rate even when the victim
+# degrades under contention (too few -> client-side queueing and the rate is
+# never delivered: the -c 4 starvation), but NOT be so many that they idle
+# between requests and trip wrk2's per-connection timeout / NodePort conntrack
+# limits (too many -> socket timeouts: the -c 256 overshoot, ~3% timeouts at
+# 325 rps). ~rps*0.25 gives ~250ms of latency headroom; floored at
+# WRK2_CONNECTIONS (32) and capped at 64.
 _wrk2_conns() {
-    local rps="$1" c="$WRK2_CONNECTIONS"
-    [[ "$rps" =~ ^[0-9]+$ ]] && (( rps > c )) && c="$rps"
-    (( c > 256 )) && c=256
+    local rps="$1" c="$WRK2_CONNECTIONS" cap=64
+    (( WRK2_CONNECTIONS > cap )) && cap="$WRK2_CONNECTIONS"   # honor explicit high override
+    if [[ "$rps" =~ ^[0-9]+$ ]]; then
+        local target=$(( (rps + 3) / 4 ))   # ~rps * 0.25
+        (( target > c )) && c="$target"
+    fi
+    (( c > cap )) && c="$cap"
     echo "$c"
 }
 
