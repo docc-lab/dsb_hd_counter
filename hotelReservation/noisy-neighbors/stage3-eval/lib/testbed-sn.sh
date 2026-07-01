@@ -146,7 +146,7 @@ sn_deploy() {
 sn_scale_replicas() {
     local n="$1" exp_dir="${2:-}"
     [[ "$n" =~ ^[0-9]+$ ]] || return 0
-    (( n <= 1 )) && return 0
+    (( n < 1 )) && return 0   # n==1 is allowed: used by sn_teardown to reset
     local log=/dev/null
     [[ -n "$exp_dir" ]] && log="$exp_dir/logs/testbed-sn.log"
     local svc deploy
@@ -168,6 +168,12 @@ sn_scale_replicas() {
 sn_teardown() {
     local exp_dir="$1"
     echo "[testbed-sn] Resetting SN deployments to pre-experiment scheduling state"
+
+    # Undo any replica scale-up (scale_testbed_replicas) so a finished run -- or
+    # a force-quit mid-run -- doesn't leave the cluster oversubscribed.
+    if [[ "${TESTBED_REPLICAS[socialNetwork]:-1}" -gt 1 ]]; then
+        sn_scale_replicas 1 "$exp_dir"
+    fi
 
     local svc deploy
     for svc in "${!SN_SERVICE_TO_DEPLOYMENT[@]}"; do
