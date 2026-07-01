@@ -244,6 +244,34 @@ curve_run_level() {
 }
 
 # ---------------------------------------------------------------------------
+# Emit the ordered list of RPS levels for the sweep (one per line).
+#
+# When SATURATION_SEGMENTS is set it takes precedence: whitespace-separated
+# "lo-hi:step" tokens expanded left-to-right, giving a variable step across the
+# range (coarse far from the knee, progressively finer through it). Boundary
+# duplicates between adjacent segments are dropped while preserving order.
+# Otherwise fall back to the fixed START/STEP/MAX arithmetic (unchanged
+# default used by curve-profile.conf and any other caller).
+# ---------------------------------------------------------------------------
+curve_expand_levels() {
+    if [[ -n "${SATURATION_SEGMENTS:-}" ]]; then
+        local seg lo rest hi step r
+        for seg in $SATURATION_SEGMENTS; do
+            lo=${seg%%-*}; rest=${seg#*-}; hi=${rest%%:*}; step=${rest##*:}
+            # Skip malformed tokens rather than looping forever on step<=0.
+            [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ && "$step" =~ ^[0-9]+$ ]] || continue
+            (( step < 1 )) && continue
+            for ((r=lo; r<=hi; r+=step)); do echo "$r"; done
+        done | awk '!seen[$0]++'
+    else
+        local r
+        for ((r=SATURATION_START_RPS; r<=SATURATION_MAX_RPS; r+=SATURATION_STEP_RPS)); do
+            echo "$r"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Sweep all RPS levels under ONE sampler window, then retrieve the single
 # run_data and slice it per level into curve.csv.
 # ---------------------------------------------------------------------------
@@ -258,7 +286,11 @@ curve_sweep() {
 
     step1_log "$exp_dir" "=========================================="
     step1_log "$exp_dir" " INSTRUMENTED SWEEP (no contention, single window, no per-level restart)"
-    step1_log "$exp_dir" " RPS ${SATURATION_START_RPS}..${SATURATION_MAX_RPS} step ${SATURATION_STEP_RPS}"
+    if [[ -n "${SATURATION_SEGMENTS:-}" ]]; then
+        step1_log "$exp_dir" " RPS segments: ${SATURATION_SEGMENTS}"
+    else
+        step1_log "$exp_dir" " RPS ${SATURATION_START_RPS}..${SATURATION_MAX_RPS} step ${SATURATION_STEP_RPS}"
+    fi
     step1_log "$exp_dir" " per level: warmup ${SATURATION_WARMUP}s / measure ${SATURATION_DURATION}s / cooldown ${SATURATION_COOLDOWN}s"
     step1_log "$exp_dir" " sampler window: ${EXPERIMENT_DURATION}s   ring buffer: ${TIMING_BUFFER_SIZE}"
     step1_log "$exp_dir" "=========================================="
@@ -273,14 +305,14 @@ curve_sweep() {
     clean_stale_consul_services "$exp_dir"
     local window_start; window_start=$(date +%s)
 
-    local rps=$SATURATION_START_RPS level=0
-    while [[ $rps -le $SATURATION_MAX_RPS ]]; do
+    local rps level=0
+    while read -r rps; do
+        [[ -z "$rps" ]] && continue
         level=$((level + 1))
         if ! curve_run_level "$exp_dir" "$level" "$rps" "$manifest"; then
             step1_log "$exp_dir" "WARNING: level $level (rps=$rps) failed; continuing"
         fi
-        rps=$((rps + SATURATION_STEP_RPS))
-    done
+    done < <(curve_expand_levels)
 
     # Wait for the sampler window to close (the binary writes the run_data
     # file when its run_duration elapses; the ring buffer is sized so no
@@ -340,7 +372,9 @@ curve_sweep() {
 # ---------------------------------------------------------------------------
 curve_size_window() {
     local n_levels per_level pre_settle sweep_est needed min_buf buf
-    n_levels=$(( (SATURATION_MAX_RPS - SATURATION_START_RPS) / SATURATION_STEP_RPS + 1 ))
+    # Count the exact level list (honours SATURATION_SEGMENTS when set) so the
+    # single sampler window + ring buffer size correctly for a variable step.
+    n_levels=$(curve_expand_levels | grep -c .)
     [[ $n_levels -lt 1 ]] && n_levels=1
     # +10s/level slack for ghz spin-up + parsing between phases
     per_level=$(( SATURATION_WARMUP + SATURATION_DURATION + SATURATION_COOLDOWN + 10 ))
