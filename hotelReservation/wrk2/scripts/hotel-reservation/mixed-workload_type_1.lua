@@ -20,7 +20,7 @@ end
 
 local function search_hotel() 
   local in_date = math.random(9, 23)
-  local out_date = math.random(in_date + 1, 24)
+  local out_date = math.random(in_date + 1, 15)
 
   local in_date_str = tostring(in_date)
   if in_date <= 9 then
