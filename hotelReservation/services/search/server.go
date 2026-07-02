@@ -202,9 +202,17 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
+	// Per-request perf counters disabled: perf_stop's grouped read fails on
+	// every request (garbage "Machine Counter Readings" tag), and the 3
+	// perf_event_open syscalls/request contend with the windowed sampler on the
+	// pinned cores -> latency-tail stalls + gRPC connection resets that corrupt
+	// the stage-1 curve. The windowed sampler already provides per-window perf.
+	const enablePerfCounters = false
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if enablePerfCounters {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
@@ -244,9 +252,11 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
 		
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if enablePerfCounters {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
