@@ -157,7 +157,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 			}
 			curr.All(context.TODO(), &reserve)
 			if err != nil {
-				log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error", hotelId, indate, outdate, err.Error())
+				log.Error().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error: %s", hotelId, indate, outdate, err.Error())
 			}
 
 			for _, r := range reserve {
@@ -167,7 +167,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 			memc_date_num_map[memc_key] = count + int(req.RoomNumber)
 
 		} else {
-			log.Panic().Msgf("Tried to get memc_key [%v], but got memmcached error = %s", memc_key, err)
+			log.Error().Msgf("Tried to get memc_key [%v], but got memcached error = %s", memc_key, err)
 		}
 
 		// check capacity
@@ -184,14 +184,14 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 			var num number
 			err = numCollection.FindOne(context.TODO(), &bson.D{{"hotelId", hotelId}}).Decode(&num)
 			if err != nil {
-				log.Panic().Msgf("Tried to find hotelId [%v], but got error", hotelId, err.Error())
+				log.Error().Msgf("Tried to find hotelId [%v], but got error: %s", hotelId, err.Error())
 			}
 			hotel_cap = int(num.Number)
 
 			// write to memcache
 			s.MemcClient.Set(&memcache.Item{Key: memc_cap_key, Value: []byte(strconv.Itoa(hotel_cap))})
 		} else {
-			log.Panic().Msgf("Tried to get memc_cap_key [%v], but got memmcached error = %s", memc_cap_key, err)
+			log.Error().Msgf("Tried to get memc_cap_key [%v], but got memcached error = %s", memc_cap_key, err)
 		}
 
 		if count+int(req.RoomNumber) > hotel_cap {
@@ -225,7 +225,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 			},
 		)
 		if err != nil {
-			log.Panic().Msgf("Tried to insert hotel [hotelId %v], but got error", hotelId, err.Error())
+			log.Error().Msgf("Tried to insert hotel [hotelId %v], but got error: %s", hotelId, err.Error())
 		}
 		indate = outdate
 	}
@@ -276,7 +276,7 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 			}
 		}
 	} else if err != nil {
-		log.Panic().Msgf("Tried to get memc_cap_key [%v], but got memmcached error = %s", hotelMemKeys, err)
+		log.Error().Msgf("Tried to get memc_cap_key [%v], but got memcached error = %s", hotelMemKeys, err)
 	}
 	// store whole capacity result in cacheCap
 	cacheCap := make(map[string]int)
@@ -302,7 +302,7 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		}
 		capMongoSpan.Finish()
 		if err != nil {
-			log.Panic().Msgf("Tried to find hotelId [%v], but got error", misKeys, err.Error())
+			log.Error().Msgf("Tried to find hotelId [%v], but got error: %s", misKeys, err.Error())
 		}
 		for _, num := range nums {
 			cacheCap[num.HotelId] = num.Number
@@ -343,11 +343,14 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 	ch := make(chan taskRes)
 	reserveMemSpan.SetTag("span.kind", "client")
 	// check capacity in memcached and mongodb
-	if itemsMap, err := s.MemcClient.GetMulti(reqCommand); err != nil && err != memcache.ErrCacheMiss {
+	itemsMap, err := s.MemcClient.GetMulti(reqCommand)
 		reserveMemSpan.Finish()
-		log.Panic().Msgf("Tried to get memc_key [%v], but got memmcached error = %s", reqCommand, err)
-	} else {
-		reserveMemSpan.Finish()
+		if err != nil && err != memcache.ErrCacheMiss {
+			log.Error().Msgf("Tried to get memc_key [%v], but got memcached error = %s; treating as cache miss", reqCommand, err)
+			err = memcache.ErrCacheMiss
+			itemsMap = nil
+		}
+		{
 		// go through reservation count from memcached
 		go func() {
 			for k, v := range itemsMap {
@@ -417,8 +420,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 						reserveMongoSpan.Finish()
 
 						if err != nil {
-							log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error",
+							log.Error().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error: %s",
 								queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"], err.Error())
+							continue
 						}
 						var count int
 						for _, r := range reserve {

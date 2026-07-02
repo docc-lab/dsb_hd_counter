@@ -324,8 +324,10 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	var mutex sync.Mutex
 
 	if err != nil && err != memcache.ErrCacheMiss {
-		log.Panic().Msgf("Tried to get hotelIds [%v], but got memmcached error = %s", hotelIds, err)
-	} else {
+		log.Error().Msgf("Tried to get hotelIds [%v], but got memcached error = %s; falling back to mongo", hotelIds, err)
+		resMap = nil
+	}
+	{
 		for hotelId, item := range resMap {
 			profileStr := string(item.Value)
 			log.Trace().Msgf("memc hit with %v", profileStr)
