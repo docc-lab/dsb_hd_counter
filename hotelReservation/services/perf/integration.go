@@ -63,6 +63,18 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 	}
 	
 	tscFreqMHz := parseTscFreqMHz()
+	// Kill switch for the per-window MSR/frequency-utilization path. Each window
+	// (100ms) msr_reader_sample() pread()s MSRs across node-wide cores -- a heavy
+	// blocking CGO call that contends on the pod's pinned request cores and is the
+	// prime suspect for the sampler-induced request stalls ("context canceled").
+	// Set WINDOWED_FREQ_ENABLED=false to drop the whole MSR path (freq_util is not
+	// needed for the intrinsic latency-vs-arrival-rate curve); everything else
+	// (perf counters, timing, arrival rate) is unaffected. Forcing tscFreqMHz=0
+	// makes StartRun skip msr_reader_init (see windowed_sampler.go:237).
+	if !parseBoolEnv("WINDOWED_FREQ_ENABLED", true) {
+		tscFreqMHz = 0
+		log.Warn().Msg("WINDOWED_FREQ_ENABLED=false: per-window MSR/frequency sampling disabled (freq fields ok=false)")
+	}
 	c0Threshold := parseFloatEnv("C0_ACTIVE_THRESHOLD", 0.05)
 	msrRefresh := parseDurationSecondsEnv("MSR_TURBO_REFRESH_EVERY_S", 10*time.Second)
 
@@ -196,6 +208,23 @@ func parseFloatEnv(name string, def float64) float64 {
 		return def
 	}
 	return f
+}
+
+// parseBoolEnv reads a boolean-ish env var (1/0, true/false, yes/no, on/off,
+// case-insensitive). Empty or unrecognized -> def.
+func parseBoolEnv(name string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	switch v {
+	case "":
+		return def
+	case "1", "true", "yes", "on", "y", "t":
+		return true
+	case "0", "false", "no", "off", "n", "f":
+		return false
+	default:
+		log.Warn().Str(name, v).Bool("default", def).Msg("invalid bool env value, using default")
+		return def
+	}
 }
 
 // parseDurationSecondsEnv reads an integer-seconds env var into a Duration.
