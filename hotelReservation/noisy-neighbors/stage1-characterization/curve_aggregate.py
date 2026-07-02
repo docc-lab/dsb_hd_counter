@@ -21,15 +21,35 @@ A level's "active" windows are samples whose absolute `timestamp` falls in
 idle warmup/cooldown never dilutes the numbers). Slicing is done on the
 sample timestamp in Python -- no jq / GNU date dependency.
 
+Primary signal = the interceptor's in-pod processing_time (within-service
+execution time), NOT ghz's semi-e2e latency. ghz columns are retained for
+reference only; the `saturated` verdict is now derived from svc_p99.
+
+Stall rejection
+---------------
+The in-pod windowed sampler occasionally stalls the service for hundreds of ms
+(the `context canceled` errors), which inflates the interceptor service-time in
+the small fraction of 100ms windows where a stall lands. --build now REJECTS
+those windows per level: a window is contaminated if its p99 exceeds
+    median(window p99) + K * 1.4826 * MAD(window p99)   (robust outlier, K=5)
+and the svc_* columns are request-weighted means over the CLEAN windows only.
+svc_bad_windows / svc_bad_pct report how much was removed so the noise is
+visible. Set env CURVE_STALL_K=0 to disable rejection (use all windows).
+
 curve.csv columns:
   target_rps, arrival_rps_mean, arrival_rps_p50, arrival_rps_p99,
   svc_mean_us, svc_p50_us, svc_p90_us, svc_p99_us, ipc, llc_mpki,
   freq_mhz, freq_util_pct, active_windows, total_requests,
-  ghz_actual_rps, ghz_p50_ms, ghz_p90_ms, ghz_p99_ms, ghz_errors, saturated
+  ghz_actual_rps, ghz_p50_ms, ghz_p90_ms, ghz_p99_ms, ghz_errors, saturated,
+  svc_bad_windows, svc_bad_pct
 
 Service-time columns are request-weighted means of per-window processing_time
 stats (no pooled raw durations exist in one shared run_data), so svc_p90/p99
 are tail proxies, not globally-pooled percentiles.
+
+The `saturated` verdict (svc-based): a level is saturated once its svc_p99
+crosses SATURATION_P99_THRESHOLD x the intrinsic baseline (the lowest-arrival
+level's clean svc_p99). The last non-saturated level is the intrinsic knee.
 """
 import csv
 import glob
@@ -42,9 +62,17 @@ from datetime import datetime
 CSV_HEADER = ("target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,"
               "svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,"
               "freq_mhz,freq_util_pct,active_windows,total_requests,"
-              "ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated")
+              "ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated,"
+              "svc_bad_windows,svc_bad_pct")
 
 ZERO_FRAG = "0,0,0,0,0,0,0,0,0,0,0,0,0"
+
+# Robust-outlier multiplier for stall-window rejection (median + K*1.4826*MAD
+# of per-window p99). Env override; 0 disables rejection.
+STALL_K = float(os.environ.get("CURVE_STALL_K", "5") or "5")
+# svc_p99 must exceed this multiple of the intrinsic baseline to count as
+# saturated. Shares the driver's env var so both sides agree on the threshold.
+SAT_P99_THRESHOLD = float(os.environ.get("SATURATION_P99_THRESHOLD", "4") or "4")
 
 
 def pct(xs, q):
@@ -62,6 +90,23 @@ def pct(xs, q):
 
 def mean(xs):
     return (sum(xs) / len(xs)) if xs else 0.0
+
+
+def median(xs):
+    if not xs:
+        return 0.0
+    ys = sorted(xs)
+    n = len(ys)
+    mid = n // 2
+    return ys[mid] if n % 2 else (ys[mid - 1] + ys[mid]) / 2.0
+
+
+def mad(xs):
+    """Median absolute deviation (unscaled)."""
+    if not xs:
+        return 0.0
+    m = median(xs)
+    return median([abs(x - m) for x in xs])
 
 
 def us(ns):
@@ -139,6 +184,87 @@ def aggregate(samples, start_epoch, end_epoch):
         freq_mhz, freq_util, len(active), total_req)
 
 
+def level_stats(samples, start_epoch, end_epoch):
+    """Robust per-level stats for curve.csv (--build path).
+
+    Same active-window rule as aggregate(), but rejects stall-contaminated
+    windows before computing the service-time columns: a window whose p99
+    processing time is a robust MAD outlier vs the level's own windows is
+    dropped (those are the sampler-stall windows). Returns a dict; svc_* are
+    request-weighted means over the CLEAN windows only.
+    """
+    def in_window(s):
+        if start_epoch is None and end_epoch is None:
+            return True
+        te = to_epoch(s.get("timestamp"))
+        if te is None:
+            return False
+        if start_epoch is not None and te < start_epoch:
+            return False
+        if end_epoch is not None and te > end_epoch:
+            return False
+        return True
+
+    active = [s for s in samples
+              if in_window(s) and s.get("timing_window")
+              and (s["timing_window"].get("request_count") or 0) > 0]
+
+    n_active = len(active)
+    if n_active == 0:
+        return dict(arr_mean=0.0, arr_p50=0.0, arr_p99=0.0, svc_mean=0.0,
+                    svc_p50=0.0, svc_p90=0.0, svc_p99=0.0, ipc=0.0, llc_mpki=0.0,
+                    freq_mhz=0.0, freq_util=0.0, active_windows=0, total_req=0,
+                    bad_windows=0, bad_pct=0.0)
+
+    # Robust stall-window rejection on per-window p99 processing time.
+    def win_p99(s):
+        return (s["timing_window"].get("processing_time") or {}).get("p99_ns") or 0
+    if STALL_K > 0 and n_active >= 4:
+        p99s = [win_p99(s) for s in active]
+        thr = median(p99s) + STALL_K * 1.4826 * mad(p99s)
+        clean = [s for s in active if win_p99(s) <= thr]
+        if not clean:                 # all flagged (degenerate) -> keep all
+            clean = active
+    else:
+        clean = active
+    bad_windows = n_active - len(clean)
+
+    arr = [(s["timing_window"].get("arrival_rps_1s") or 0.0) for s in clean]
+
+    def wmean(field):
+        num = 0.0
+        den = 0
+        for s in clean:
+            ptw = (s["timing_window"].get("processing_time") or {})
+            c = ptw.get("count") or 0
+            num += (ptw.get(field) or 0) * c
+            den += c
+        return (num / den) if den else 0.0
+
+    # perf / freq use the clean windows too (a stall window's perf deltas are
+    # also unrepresentative of steady-state).
+    def perf_sum(key):
+        return sum((s.get("perf_deltas") or {}).get(key, 0) for s in clean)
+    instr = perf_sum("instructions")
+    cyc = perf_sum("cycles")
+    llcm = perf_sum("LLC-load-misses")
+    fr = [s["freq"]["actual_freq_mhz"] for s in clean if s.get("freq", {}).get("ok")]
+    fu = [s["freq"]["freq_util_pct"] for s in clean if s.get("freq", {}).get("ok")]
+
+    return dict(
+        arr_mean=mean(arr), arr_p50=pct(arr, 0.5), arr_p99=pct(arr, 0.99),
+        svc_mean=us(wmean("mean_ns")), svc_p50=us(wmean("p50_ns")),
+        svc_p90=us(wmean("p90_ns")), svc_p99=us(wmean("p99_ns")),
+        ipc=(instr / cyc) if cyc else 0.0,
+        llc_mpki=(llcm / instr * 1000.0) if instr else 0.0,
+        freq_mhz=mean(fr), freq_util=mean(fu),
+        active_windows=len(clean),
+        total_req=sum((s["timing_window"].get("request_count") or 0) for s in clean),
+        bad_windows=bad_windows,
+        bad_pct=(100.0 * bad_windows / n_active) if n_active else 0.0,
+    )
+
+
 def parse_ghz_pct(path, target_pct):
     """Read a percentile (ms) from a ghz --format json output file."""
     try:
@@ -170,9 +296,10 @@ def build(exp_dir):
         samples = (json.load(f).get("samples")) or []
 
     out = os.path.join(exp_dir, "curve.csv")
-    n = 0
-    with open(manifest, newline="") as mf, open(out, "w") as of:
-        of.write(CSV_HEADER + "\n")
+
+    # Pass 1: slice every level and compute robust interceptor stats.
+    levels = []
+    with open(manifest, newline="") as mf:
         reader = csv.reader(mf)
         header_seen = False
         for row in reader:
@@ -181,23 +308,55 @@ def build(exp_dir):
                 continue
             if len(row) < 9:
                 continue
-            level, rps, mstart, mend, actual, p50, p99, err, sat = row[:9]
+            level, rps, mstart, mend, actual, ghz_p50, ghz_p99, err, _sat = row[:9]
             try:
                 s_ep = float(mstart) if mstart else None
                 e_ep = float(mend) if mend else None
             except ValueError:
                 s_ep = e_ep = None
             try:
-                frag = aggregate(samples, s_ep, e_ep)
+                st = level_stats(samples, s_ep, e_ep)
             except Exception:
-                frag = ZERO_FRAG
+                st = level_stats([], None, None)
             ghz_json = os.path.join(exp_dir, "saturation", "L%s_rps%s.json" % (level, rps))
             ghz_p90 = parse_ghz_pct(ghz_json, 90)
-            of.write("%s,%s,%s,%s,%s,%s,%s,%s\n" % (
-                rps, frag, actual, p50, ghz_p90, p99, err, sat))
+            levels.append(dict(rps=rps, st=st, ghz_actual=actual,
+                               ghz_p50=ghz_p50, ghz_p90=ghz_p90, ghz_p99=ghz_p99,
+                               ghz_err=err))
+
+    # Baseline = intrinsic (unloaded) svc_p99: the clean svc_p99 of the level
+    # with the lowest arrival rate that actually served requests. The knee is
+    # the last level whose svc_p99 stays under SAT_P99_THRESHOLD x baseline.
+    served = [lv for lv in levels if lv["st"]["total_req"] > 0 and lv["st"]["svc_p99"] > 0]
+    baseline = 0.0
+    if served:
+        baseline = min(served, key=lambda lv: lv["st"]["arr_mean"])["st"]["svc_p99"]
+
+    # Pass 2: write, deriving `saturated` from svc_p99 vs the baseline.
+    n = 0
+    with open(out, "w") as of:
+        of.write(CSV_HEADER + "\n")
+        for lv in levels:
+            st = lv["st"]
+            sat = "false"
+            if baseline > 0 and st["svc_p99"] > 0 and \
+                    st["svc_p99"] >= SAT_P99_THRESHOLD * baseline:
+                sat = "true"
+            frag = "%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
+                st["arr_mean"], st["arr_p50"], st["arr_p99"],
+                st["svc_mean"], st["svc_p50"], st["svc_p90"], st["svc_p99"],
+                st["ipc"], st["llc_mpki"], st["freq_mhz"], st["freq_util"],
+                st["active_windows"], st["total_req"])
+            of.write("%s,%s,%s,%s,%s,%s,%s,%s,%d,%.1f\n" % (
+                lv["rps"], frag, lv["ghz_actual"], lv["ghz_p50"], lv["ghz_p90"],
+                lv["ghz_p99"], lv["ghz_err"], sat,
+                st["bad_windows"], st["bad_pct"]))
             n += 1
 
-    sys.stderr.write("Rewrote %s (%d levels) from %s\n" % (out, n, os.path.basename(raw)))
+    sys.stderr.write(
+        "Rewrote %s (%d levels) from %s  [baseline svc_p99=%.1f us, "
+        "sat threshold=%.1fx, stall K=%.1f]\n"
+        % (out, n, os.path.basename(raw), baseline, SAT_P99_THRESHOLD, STALL_K))
     return 0
 
 

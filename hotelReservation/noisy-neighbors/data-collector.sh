@@ -211,6 +211,7 @@ apply_cpu_pinning_to_deployment() {
 TSC_FREQ_MHZ="${TSC_FREQ_MHZ:-}"                         # If empty, in-pod sampler falls back to /proc/cpuinfo
 C0_ACTIVE_THRESHOLD="${C0_ACTIVE_THRESHOLD:-0.05}"       # 5% default; OS noise on idle cores is ~3-5%
 MSR_TURBO_REFRESH_EVERY_S="${MSR_TURBO_REFRESH_EVERY_S:-10}"  # re-read MSR 0x1AD every 10s
+WINDOWED_FREQ_ENABLED="${WINDOWED_FREQ_ENABLED:-true}"   # false => drop per-window MSR/freq CGO (sampler-stall A/B)
 
 # Track whether the 'msr' kernel module is loaded on TARGET_NODE.
 # Set to "true" by ensure_msr_module_on_node, "false" if the load attempt failed.
@@ -590,8 +591,8 @@ update_deployment_for_timing() {
 }
 
 # apply_freq_util_env: forward TSC_FREQ_MHZ, C0_ACTIVE_THRESHOLD,
-# MSR_TURBO_REFRESH_EVERY_S to the deployment via kubectl set env. These are
-# read by services/perf/integration.go on pod startup.
+# MSR_TURBO_REFRESH_EVERY_S, WINDOWED_FREQ_ENABLED to the deployment via
+# kubectl set env. These are read by services/perf/integration.go on pod startup.
 apply_freq_util_env() {
     local service="$1"
     local exp_dir="$2"
@@ -606,6 +607,10 @@ apply_freq_util_env() {
     kubectl set env "deployment/$service" "C0_ACTIVE_THRESHOLD=${C0_ACTIVE_THRESHOLD}" \
         >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
     kubectl set env "deployment/$service" "MSR_TURBO_REFRESH_EVERY_S=${MSR_TURBO_REFRESH_EVERY_S}" \
+        >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
+    # Kill switch for the per-window MSR/freq path (the sampler-stall suspect).
+    # Default true; set WINDOWED_FREQ_ENABLED=false to drop it for the A/B.
+    kubectl set env "deployment/$service" "WINDOWED_FREQ_ENABLED=${WINDOWED_FREQ_ENABLED:-true}" \
         >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
     return $rc
 }
