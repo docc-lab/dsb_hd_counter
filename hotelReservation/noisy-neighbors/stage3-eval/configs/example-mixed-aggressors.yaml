@@ -28,12 +28,12 @@ experiment:
   target_node: node-3
 testbeds:
   hotelReservation:
-    loadgen: {rps: 325, shape: exp}    # victim load -- keep fixed across runs
+    loadgen: {rps: 2400, shape: exp}    # victim load -- keep fixed across runs
   socialNetwork:
-    loadgen: {rps: 1000, shape: exp}   # drive the SN aggressors hard; ramp w/ mpstat
+    loadgen: {rps: 5400, shape: exp}   # drive the SN aggressors hard; ramp w/ mpstat
     replicas: 2                        # scale SN compute services (datastores untouched)
   sockshop:
-    loadgen: {rps: 1000, shape: exp}   # drive the SS aggressors hard; ramp w/ mpstat
+    loadgen: {rps: 6300, shape: exp}   # drive the SS aggressors hard; ramp w/ mpstat
     replicas: 2                        # scale SS app services (db pods untouched)
 victim:
   testbed: hotelReservation
