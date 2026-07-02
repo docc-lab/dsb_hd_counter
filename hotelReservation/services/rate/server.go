@@ -39,6 +39,14 @@ type PerfHandles struct {
 
 const name = "srv-rate"
 
+// rateMongoFallbackTimeout caps each memcached-miss mongo fallback query.
+// When memcached is unreachable (stale endpoint) or stressed (stage 2/3),
+// EVERY request falls through to mongo; with an unbounded context.TODO() a
+// slow mongo lets requests hang to the caller's (ghz 20s) deadline and pile up
+// full-collection scans. Cap it so the request fails fast instead. Derived
+// from the request ctx, so it's the min of this and the caller's deadline.
+const rateMongoFallbackTimeout = 2 * time.Second
+
 // Server implements the rate service
 type Server struct {
 	pb.UnimplementedRateServer
@@ -104,12 +112,18 @@ func (s *Server) Shutdown() {
 
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	// Per-request perf counters disabled (same as search): perf_stop's grouped
+	// read fails on every request (garbage "Machine Counter Readings" tag), and
+	// the 3 perf_event_open syscalls/request contend on the pinned cores. The
+	// windowed sampler already provides per-window perf.
+	const enablePerfCounters = false
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if enablePerfCounters {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
-	
 	res := new(pb.Result)
 
 	ratePlans := make(RatePlans, 0)
@@ -175,36 +189,43 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 				mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_rate")
 				mongoSpan.SetTag("span.kind", "client")
 
-				// memcached miss, set up mongo connection
+				// memcached miss, set up mongo connection. Bounded context so a
+				// slow mongo (e.g. every request falling back here) fails fast
+				// instead of hanging to the caller's deadline (see const above).
+				mongoCtx, cancelMongo := context.WithTimeout(ctx, rateMongoFallbackTimeout)
+
 				collection := s.MongoClient.Database("rate-db").Collection("inventory")
-				curr, err := collection.Find(context.TODO(), bson.D{})
+				curr, err := collection.Find(mongoCtx, bson.D{})
 				if err != nil {
-					log.Error().Msgf("Failed get rate data: ", err)
+					// Bounded-context deadline or mongo error: curr is nil here, so we
+					// MUST skip -- curr.All on a nil cursor would panic and crash the
+					// process. Degrade by dropping this hotel.
+					log.Error().Msgf("Failed to query rate data for hotelId [%v]: %s", id, err)
+					cancelMongo()
+					mongoSpan.Finish()
+					continue
 				}
 
 				tmpRatePlans := make(RatePlans, 0)
-				curr.All(context.TODO(), &tmpRatePlans)
-				if err != nil {
-					log.Error().Msgf("Failed get rate data: ", err)
+				if err := curr.All(mongoCtx, &tmpRatePlans); err != nil {
+					log.Error().Msgf("Failed to decode rate data for hotelId [%v]: %s", id, err)
+					cancelMongo()
+					mongoSpan.Finish()
+					continue
 				}
-
+				cancelMongo()
 				mongoSpan.Finish()
 
 				memcStr := ""
-				if err != nil {
-					log.Error().Msgf("Tried to find hotelId [%v], but got error: %s", id, err.Error())
-						continue
-					} else {
-					for _, r := range tmpRatePlans {
-						mutex.Lock()
-						ratePlans = append(ratePlans, r)
-						mutex.Unlock()
-						rateJson, err := json.Marshal(r)
-						if err != nil {
-							log.Error().Msgf("Failed to marshal plan [Code: %v] with error: %s", r.Code, err)
-						}
-						memcStr = memcStr + string(rateJson) + "\n"
+				for _, r := range tmpRatePlans {
+					mutex.Lock()
+					ratePlans = append(ratePlans, r)
+					mutex.Unlock()
+					rateJson, err := json.Marshal(r)
+					if err != nil {
+						log.Error().Msgf("Failed to marshal plan [Code: %v] with error: %s", r.Code, err)
 					}
+					memcStr = memcStr + string(rateJson) + "\n"
 				}
 				go s.MemcClient.Set(&memcache.Item{Key: id, Value: []byte(memcStr)})
 
@@ -217,11 +238,13 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	sort.Sort(ratePlans)
 	res.RatePlans = ratePlans
 	
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if enablePerfCounters {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
- 
+
 	return res, nil
 }
 
