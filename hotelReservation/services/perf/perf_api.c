@@ -102,6 +102,12 @@ const char* perf_stop(int leader_fd, int instructions_fd, int l1_misses_fd) {
 
     if (bytes_read == -1) {
         snprintf(error_buffer, sizeof(error_buffer), "read failed: %s", strerror(errno));
+        // Close the counter fds before returning, otherwise every request that
+        // hits this error path leaks 3 perf-event fds (open-loop load exhausts
+        // the fd table -> epoll/%sys thrash -> gRPC connection resets).
+        close(leader_fd);
+        close(instructions_fd);
+        close(l1_misses_fd);
         return error_buffer;
     }
     
