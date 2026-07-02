@@ -130,8 +130,10 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
 	if err != nil && err != memcache.ErrCacheMiss {
-		log.Panic().Msgf("Memmcached error while trying to get hotel [id: %v]= %s", hotelIds, err)
-	} else {
+		log.Error().Msgf("Memcached error while trying to get hotel [id: %v]= %s; falling back to mongo", hotelIds, err)
+		resMap = nil
+	}
+	{
 		for hotelId, item := range resMap {
 			rateStrs := strings.Split(string(item.Value), "\n")
 			log.Trace().Msgf("memc hit, hotelId = %s,rate strings: %v", hotelId, rateStrs)
@@ -190,8 +192,9 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 
 				memcStr := ""
 				if err != nil {
-					log.Panic().Msgf("Tried to find hotelId [%v], but got error", id, err.Error())
-				} else {
+					log.Error().Msgf("Tried to find hotelId [%v], but got error: %s", id, err.Error())
+						continue
+					} else {
 					for _, r := range tmpRatePlans {
 						mutex.Lock()
 						ratePlans = append(ratePlans, r)

@@ -1430,34 +1430,33 @@ reset_non_victim_services() {
             continue
         fi
         
-        # Check if currently using a windowed/timing image
-        if [[ "$current_image" == *"-windowed:"* ]] || [[ "$current_image" == *"/windowed"* ]]; then
-            # Default hotel-reservation image (standard for all services)
-            local default_image="deathstarbench/hotel-reservation:latest"
-            
+        # Enforce the standard (panic-hardened) image on EVERY non-victim
+        # service, not just ones currently running a windowed image. The stock
+        # deathstarbench image log.Panic()s on transient memcached/mongo errors
+        # and crash-loops under contention (see hr-services-panic fix), so the
+        # rebuilt image must be applied whenever the running one differs.
+        # Override the target with HR_DEFAULT_IMAGE without editing this script.
+        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.0}"
+
+        if [[ "$current_image" == "$default_image" ]]; then
+            log "$exp_dir" "  $service already using default image ($default_image)"
+        else
             log "$exp_dir" "  Resetting $service: $current_image -> $default_image"
             local container_name=$(get_container_name "$service")
-            
+
             if kubectl set image "deployment/$service" "$container_name=$default_image" 2>/dev/null; then
                 log "$exp_dir" "    Successfully reset $service to default image"
                 reset_count=$((reset_count + 1))
-                
-                # Remove windowed sampling env vars if present
+
+                # Remove windowed sampling env vars if present (harmless otherwise)
                 kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- ITERATION_ID- 2>/dev/null || true
-                
-                # Restore command override (needed for default image which has no ENTRYPOINT)
+
+                # Restore command override (default/patched images have no ENTRYPOINT)
                 log "$exp_dir" "    Restoring command override for default image"
                 kubectl patch deployment "$service" --type=json -p="[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"$service\"]}]" 2>/dev/null || \
                     log "$exp_dir" "    WARNING: Failed to restore command override"
             else
                 log "$exp_dir" "    WARNING: Failed to reset image for $service"
-            fi
-        else
-            # Check if already using the correct default image
-            if [[ "$current_image" == "deathstarbench/hotel-reservation:latest" ]]; then
-                log "$exp_dir" "  $service already using default image"
-            else
-                log "$exp_dir" "  $service using non-standard image: $current_image (leaving as-is)"
             fi
         fi
     done

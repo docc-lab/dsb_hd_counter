@@ -138,8 +138,10 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 	item, err := s.MemcClient.Get(hotelId)
 	memSpan.Finish()
 	if err != nil && err != memcache.ErrCacheMiss {
-		log.Panic().Msgf("Tried to get hotelId [%v], but got memmcached error = %s", hotelId, err)
-	} else {
+		log.Error().Msgf("Tried to get hotelId [%v], but got memcached error = %s; falling back to mongo", hotelId, err)
+		err = memcache.ErrCacheMiss
+	}
+	{
 		if err == memcache.ErrCacheMiss {
 			mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_review")
 			mongoSpan.SetTag("span.kind", "client")
@@ -182,7 +184,7 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 			reviewsStr := string(item.Value)
 			log.Trace().Msgf("memc hit with %v", reviewsStr)
 			if err := json.Unmarshal([]byte(reviewsStr), &reviews); err != nil {
-				log.Panic().Msgf("Failed to unmarshal reviews: %s", err)
+				log.Error().Msgf("Failed to unmarshal reviews: %s", err)
 			}
 		}
 	}
