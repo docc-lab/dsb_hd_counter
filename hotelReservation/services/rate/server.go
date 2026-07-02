@@ -194,8 +194,14 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 				// instead of hanging to the caller's deadline (see const above).
 				mongoCtx, cancelMongo := context.WithTimeout(ctx, rateMongoFallbackTimeout)
 
+				// Filter by hotelId (docs are keyed `bson:"hotelId"`, same
+				// convention as reservation). The unfiltered bson.D{} here
+				// fetched the ENTIRE inventory per miss and cached it under
+				// EVERY hotel key -> 117KB memcached values -> ~587KB per
+				// GetMulti -> rate<->memcached saturated the inter-node link
+				// at ~200 RPS (read i/o timeouts, mongo-fallback spiral).
 				collection := s.MongoClient.Database("rate-db").Collection("inventory")
-				curr, err := collection.Find(mongoCtx, bson.D{})
+				curr, err := collection.Find(mongoCtx, bson.D{{"hotelId", id}})
 				if err != nil {
 					// Bounded-context deadline or mongo error: curr is nil here, so we
 					// MUST skip -- curr.All on a nil cursor would panic and crash the

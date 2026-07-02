@@ -19,8 +19,16 @@ COPY tune/ tune/
 
 COPY config.json config.json
 
+# Build ALL three perf static libs: windowed_sampler.go links
+# -lperf_api_windowed and -lmsr_reader unconditionally (no build tag), so every
+# service binary needs them, not just libperf_api.a. Missing these caused
+# "/usr/bin/ld: cannot find -lperf_api_windowed / -lmsr_reader" at go install.
 WORKDIR /workspace/services/perf
-RUN gcc -std=c11 -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o
+RUN gcc -std=c11 -c perf_api.c -o perf_api.o && ar rcs libperf_api.a perf_api.o \
+    && gcc -O2 -Wall -fPIC -c perf_api_windowed.c -o perf_api_windowed.o \
+    && ar rcs libperf_api_windowed.a perf_api_windowed.o \
+    && gcc -O2 -Wall -fPIC -c msr_reader.c -o msr_reader.o \
+    && ar rcs libmsr_reader.a msr_reader.o
 
 WORKDIR /workspace
 
