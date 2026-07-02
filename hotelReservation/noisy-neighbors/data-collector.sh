@@ -1436,7 +1436,11 @@ reset_non_victim_services() {
         # and crash-loops under contention (see hr-services-panic fix), so the
         # rebuilt image must be applied whenever the running one differs.
         # Override the target with HR_DEFAULT_IMAGE without editing this script.
-        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.0}"
+        # NOTE: bump this tag whenever you rebuild the panic-hardened image, or
+        # pass HR_DEFAULT_IMAGE=... at runtime. It MUST point at an image that
+        # contains the panic->error fix (verify: grep -a 'falling back to mongo'
+        # /go/bin/rate). panic-fixed-1.0 was built pre-fix and will crash-loop.
+        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.1}"
 
         if [[ "$current_image" == "$default_image" ]]; then
             log "$exp_dir" "  $service already using default image ($default_image)"
