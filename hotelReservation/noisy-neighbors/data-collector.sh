@@ -2084,10 +2084,17 @@ refresh_consul_service_discovery() {
 # reservation DB accumulates stale bookings. Not fatal (single-request
 # latency stays low) but it wastes storage and makes runs non-repeatable.
 #
-# Cheap by default: probes geo/profile counts first and returns immediately
-# unless they exceed HR_DB_BLOAT_THRESHOLD (default 500). Only on detected
-# bloat does it drop every non-system collection and roll the owning
-# services so each re-seeds exactly one baseline copy. Best-effort.
+# Cheap by default: probes one representative collection per seeded DB and
+# returns immediately unless a count exceeds its seed baseline x
+# HR_DB_BLOAT_FACTOR (default 5). Per-collection baselines matter: user-db
+# seeds 501 docs while rate-db seeds 27, so no single absolute threshold
+# works (the old geo/profile-only probe with an absolute 500 let rate/user
+# bloat go undetected -- rate duplicates additionally re-inflate the
+# memcached values cached per hotelId). Set HR_DB_FORCE_RESET=1 to skip
+# probing and reset unconditionally. Only on detected bloat does it drop
+# every non-system collection, roll the owning services so each re-seeds
+# exactly one baseline copy, and restart the memcached tiers so stale
+# dup-inflated cache values are flushed. Best-effort.
 #
 # NOTE: the reset rolls all 6 mongo-backed HR services; they mount /dev/cpu,
 # so `msr` must be loaded on every worker node or the new pods wedge in
@@ -2096,29 +2103,51 @@ refresh_consul_service_discovery() {
 clean_hr_databases() {
     local exp_dir="$1"
     local ns="${HR_NAMESPACE:-default}"
-    local threshold="${HR_DB_BLOAT_THRESHOLD:-500}"
+    local factor="${HR_DB_BLOAT_FACTOR:-5}"
 
-    local geo_pod profile_pod geo_n profile_n
-    geo_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-geo \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    profile_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-profile \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [[ -z "$geo_pod" && -z "$profile_pod" ]]; then
-        log "$exp_dir" "  HR DB reset skipped (no HR mongo pods found)"
-        return 0
+    # mongo-label : db : representative collection : seed baseline (docs
+    # inserted by ONE initializeDatabase run -- see cmd/<svc>/db.go).
+    local probes=(
+        "mongodb-geo:geo-db:geo:80"
+        "mongodb-profile:profile-db:hotels:80"
+        "mongodb-rate:rate-db:inventory:27"
+        "mongodb-user:user-db:user:501"
+        "mongodb-reservation:reservation-db:number:80"
+        "mongodb-recommendation:recommendation-db:recommendation:80"
+    )
+
+    local bloated="" seen_pod=""
+    if [[ "${HR_DB_FORCE_RESET:-0}" == "1" ]]; then
+        log "$exp_dir" "  HR_DB_FORCE_RESET=1: skipping probes, resetting unconditionally"
+        bloated="(forced)"
+        seen_pod="forced"
+    else
+        local probe label db coll base pod n limit
+        for probe in "${probes[@]}"; do
+            IFS=':' read -r label db coll base <<< "$probe"
+            pod=$(kubectl -n "$ns" get pods -l io.kompose.service="$label" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            [[ -z "$pod" ]] && continue
+            seen_pod="$pod"
+            n=$(kubectl -n "$ns" exec "$pod" -- mongo "$db" --quiet \
+                --eval "db.${coll}.count()" 2>/dev/null | tr -dc '0-9')
+            n="${n:-0}"
+            limit=$(( base * factor ))
+            if [[ "$n" -gt "$limit" ]]; then
+                bloated+="${db}.${coll}=${n}(>~${limit}) "
+            fi
+        done
+        if [[ -z "$seen_pod" ]]; then
+            log "$exp_dir" "  HR DB reset skipped (no HR mongo pods found)"
+            return 0
+        fi
+        if [[ -z "$bloated" ]]; then
+            log "$exp_dir" "  HR DBs within ${factor}x seed baselines; no reset"
+            return 0
+        fi
     fi
-    geo_n=$(kubectl -n "$ns" exec "$geo_pod" -- mongo geo-db --quiet \
-        --eval 'db.geo.count()' 2>/dev/null | tr -dc '0-9')
-    profile_n=$(kubectl -n "$ns" exec "$profile_pod" -- mongo profile-db --quiet \
-        --eval 'db.hotels.count()' 2>/dev/null | tr -dc '0-9')
-    geo_n="${geo_n:-0}"; profile_n="${profile_n:-0}"
 
-    if [[ "$geo_n" -le "$threshold" && "$profile_n" -le "$threshold" ]]; then
-        log "$exp_dir" "  HR DBs within baseline (geo.geo=$geo_n, profile.hotels=$profile_n <= $threshold); no reset"
-        return 0
-    fi
-
-    log "$exp_dir" "  HR DB bloat detected (geo.geo=$geo_n, profile.hotels=$profile_n > $threshold); resetting to baseline"
+    log "$exp_dir" "  HR DB bloat detected: ${bloated}; resetting to baseline"
 
     # deployment : mongo-label : db-name  (frontend/search keep no DB state)
     local entries=(
@@ -2154,6 +2183,23 @@ clean_hr_databases() {
             >> "$exp_dir/logs/collector.log" 2>&1 \
             || log "$exp_dir" "    WARNING: $d not Ready in 120s (is 'msr' loaded on all worker nodes?)"
     done
+
+    # Flush the memcached tiers too: cached values built from the bloated
+    # DBs contain the duplicated records (e.g. rate caches ALL plans found
+    # per hotelId), so they'd keep serving stale oversized entries after the
+    # DB reset. A restart is a full flush (memcached is volatile).
+    local mc mc_restarted=()
+    for mc in memcached-profile memcached-rate memcached-reserve; do
+        kubectl -n "$ns" rollout restart deployment "$mc" \
+            >> "$exp_dir/logs/collector.log" 2>&1 && mc_restarted+=("$mc")
+    done
+    if [[ ${#mc_restarted[@]} -gt 0 ]]; then
+        log "$exp_dir" "  Flushed memcached tiers (restart): ${mc_restarted[*]}"
+        for mc in "${mc_restarted[@]}"; do
+            kubectl -n "$ns" rollout status deployment "$mc" --timeout=120s \
+                >> "$exp_dir/logs/collector.log" 2>&1 || true
+        done
+    fi
     sleep 10
 }
 
@@ -2786,10 +2832,17 @@ run_iteration() {
     local actual_duration=$((iteration_end - iteration_start))
     log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
 
-    # Wait a bit more for data to be written to disk
-    log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
-    sleep 5
-    
+    # The in-pod sampler runs in CONTINUOUS mode (SetupContinuousSampling:
+    # 24h window, streamMode) and its periodicFlushLoop rewrites
+    # /data/run_data_*.json every 30s with all samples so far. The file is
+    # only as fresh as the LAST flush -- retrieving right after the window
+    # ends can silently drop up to 30s of the iteration's tail (the jq slice
+    # downstream expects samples through iteration_end). Wait one full flush
+    # period so the covering flush is on disk. (Mirrors the stage-1
+    # latency-rate-curve.sh fix.)
+    log "$exp_dir" "Waiting 35s for the sampler's next periodic flush (30s cadence) before retrieval..."
+    sleep 35
+
     # Retrieve windowed run data from all victim services (only if enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then
         log "$exp_dir" "Retrieving windowed run data from victim services"

@@ -25,6 +25,19 @@ spec:
       labels:
         io.kompose.service: memcached-profile
     spec:
+      # Co-locate with the profile service to keep its cache lookups node-local:
+      # some request types issue ~1000 memcached ops/request, so a cross-node
+      # cache turns tens of us into tens of ms. Strong preference (not
+      # required) so it never blocks scheduling. (Ported from stage3 04299e9.)
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    io.kompose.service: profile
+                topologyKey: kubernetes.io/hostname
       containers:
         - env:
             - name: MEMCACHED_CACHE_SIZE

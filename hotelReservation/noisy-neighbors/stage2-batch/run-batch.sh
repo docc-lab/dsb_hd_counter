@@ -137,6 +137,14 @@ if ! "$SCRIPT_DIR/cluster-healthcheck.sh"; then
     exit 1
 fi
 
+# Opt-in DB hygiene before the batch: the HR data services re-seed duplicate
+# records on every restart (see clean-dbs.sh header), which drifts DB query
+# times and inflates rate's memcached values across a long batch. Default off.
+if [[ "${PRE_BATCH_DB_CLEAN:-0}" == "1" ]]; then
+    echo "=== Pre-batch DB hygiene (PRE_BATCH_DB_CLEAN=1) ==="
+    "$SCRIPT_DIR/../clean-dbs.sh" || echo "WARNING: clean-dbs.sh failed; continuing" >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Enumerate configs.
 # ---------------------------------------------------------------------------
