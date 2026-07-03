@@ -28,7 +28,7 @@ spec:
       containers:
         - command:
             - user
-          image: deathstarbench/hotel-reservation:latest
+          image: docclabgroup/hotelreservation:panic-fixed-1.3
           name: hotel-reserv-user
           ports:
             - containerPort: 8086

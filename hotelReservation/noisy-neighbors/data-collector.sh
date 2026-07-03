@@ -211,6 +211,7 @@ apply_cpu_pinning_to_deployment() {
 TSC_FREQ_MHZ="${TSC_FREQ_MHZ:-}"                         # If empty, in-pod sampler falls back to /proc/cpuinfo
 C0_ACTIVE_THRESHOLD="${C0_ACTIVE_THRESHOLD:-0.05}"       # 5% default; OS noise on idle cores is ~3-5%
 MSR_TURBO_REFRESH_EVERY_S="${MSR_TURBO_REFRESH_EVERY_S:-10}"  # re-read MSR 0x1AD every 10s
+WINDOWED_FREQ_ENABLED="${WINDOWED_FREQ_ENABLED:-true}"   # false => drop per-window MSR/freq CGO (sampler-stall A/B; needs image with the gate)
 
 # Track whether the 'msr' kernel module is loaded on TARGET_NODE.
 # Set to "true" by ensure_msr_module_on_node, "false" if the load attempt failed.
@@ -590,8 +591,8 @@ update_deployment_for_timing() {
 }
 
 # apply_freq_util_env: forward TSC_FREQ_MHZ, C0_ACTIVE_THRESHOLD,
-# MSR_TURBO_REFRESH_EVERY_S to the deployment via kubectl set env. These are
-# read by services/perf/integration.go on pod startup.
+# MSR_TURBO_REFRESH_EVERY_S, WINDOWED_FREQ_ENABLED to the deployment via
+# kubectl set env. These are read by services/perf/integration.go on pod startup.
 apply_freq_util_env() {
     local service="$1"
     local exp_dir="$2"
@@ -606,6 +607,11 @@ apply_freq_util_env() {
     kubectl set env "deployment/$service" "C0_ACTIVE_THRESHOLD=${C0_ACTIVE_THRESHOLD}" \
         >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
     kubectl set env "deployment/$service" "MSR_TURBO_REFRESH_EVERY_S=${MSR_TURBO_REFRESH_EVERY_S}" \
+        >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
+    # Kill switch for the per-window MSR/freq path (the sampler-stall suspect).
+    # Default true; set WINDOWED_FREQ_ENABLED=false to drop it for the A/B.
+    # No-op on images without the gate (env is simply ignored).
+    kubectl set env "deployment/$service" "WINDOWED_FREQ_ENABLED=${WINDOWED_FREQ_ENABLED:-true}" \
         >> "$exp_dir/logs/collector.log" 2>&1 || rc=1
     return $rc
 }
@@ -1414,34 +1420,41 @@ reset_non_victim_services() {
             continue
         fi
         
-        # Check if currently using a windowed/timing image
-        if [[ "$current_image" == *"-windowed:"* ]] || [[ "$current_image" == *"/windowed"* ]]; then
-            # Default hotel-reservation image (standard for all services)
-            local default_image="deathstarbench/hotel-reservation:latest"
-            
+        # Enforce the standard (panic-hardened) image on EVERY non-victim
+        # service, not just ones currently running a windowed image. The stock
+        # deathstarbench image log.Panic()s on transient memcached/mongo errors
+        # and crash-loops under contention (see hr-services-panic fix), so the
+        # rebuilt image must be applied whenever the running one differs.
+        # Override the target with HR_DEFAULT_IMAGE without editing this script.
+        # NOTE: bump this tag whenever you rebuild the panic-hardened image, or
+        # pass HR_DEFAULT_IMAGE=... at runtime. It MUST point at an image that
+        # contains the panic->error fix (verify: grep -a 'falling back to mongo'
+        # /go/bin/rate). panic-fixed-1.0 was built pre-fix and will crash-loop.
+        # panic-fixed-1.3 = panic->error + perf_api FD-leak fix + rate perf
+        # disable + bounded mongo fallback + rate hotelId query filter (the
+        # 117KB-cache-values bandwidth bug). 1.1/1.2 predate the rate fixes.
+        # (Ported from batch-perf's data-collector.sh.)
+        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.3}"
+
+        if [[ "$current_image" == "$default_image" ]]; then
+            log "$exp_dir" "  $service already using default image ($default_image)"
+        else
             log "$exp_dir" "  Resetting $service: $current_image -> $default_image"
             local container_name=$(get_container_name "$service")
-            
+
             if kubectl set image "deployment/$service" "$container_name=$default_image" 2>/dev/null; then
                 log "$exp_dir" "    Successfully reset $service to default image"
                 reset_count=$((reset_count + 1))
-                
-                # Remove windowed sampling env vars if present
+
+                # Remove windowed sampling env vars if present (harmless otherwise)
                 kubectl set env "deployment/$service" ENABLE_WINDOWED_SAMPLING- ITERATION_ID- 2>/dev/null || true
-                
-                # Restore command override (needed for default image which has no ENTRYPOINT)
+
+                # Restore command override (default/patched images have no ENTRYPOINT)
                 log "$exp_dir" "    Restoring command override for default image"
                 kubectl patch deployment "$service" --type=json -p="[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/command\", \"value\": [\"$service\"]}]" 2>/dev/null || \
                     log "$exp_dir" "    WARNING: Failed to restore command override"
             else
                 log "$exp_dir" "    WARNING: Failed to reset image for $service"
-            fi
-        else
-            # Check if already using the correct default image
-            if [[ "$current_image" == "deathstarbench/hotel-reservation:latest" ]]; then
-                log "$exp_dir" "  $service already using default image"
-            else
-                log "$exp_dir" "  $service using non-standard image: $current_image (leaving as-is)"
             fi
         fi
     done
@@ -2057,10 +2070,18 @@ refresh_consul_service_discovery() {
 # reservation DB accumulates stale bookings. Not fatal (single-request
 # latency stays low) but it wastes storage and makes runs non-repeatable.
 #
-# Cheap by default: probes geo/profile counts first and returns immediately
-# unless they exceed HR_DB_BLOAT_THRESHOLD (default 500). Only on detected
-# bloat does it drop every non-system collection and roll the owning
-# services so each re-seeds exactly one baseline copy. Best-effort.
+# Cheap by default: probes one representative collection per seeded DB and
+# returns immediately unless a count exceeds its seed baseline x
+# HR_DB_BLOAT_FACTOR (default 5). Per-collection baselines matter: user-db
+# seeds 501 docs while rate-db seeds 27, so no single absolute threshold
+# works (the old geo/profile-only probe with an absolute 500 let rate/user
+# bloat go undetected -- rate duplicates additionally re-inflate the
+# memcached values cached per hotelId). Set HR_DB_FORCE_RESET=1 to skip
+# probing and reset unconditionally. Only on detected bloat does it drop
+# every non-system collection, roll the owning services so each re-seeds
+# exactly one baseline copy, and restart the memcached tiers so stale
+# dup-inflated cache values are flushed. Best-effort.
+# (Ported from batch-perf's data-collector.sh.)
 #
 # NOTE: the reset rolls all 6 mongo-backed HR services; they mount /dev/cpu,
 # so `msr` must be loaded on every worker node or the new pods wedge in
@@ -2069,29 +2090,51 @@ refresh_consul_service_discovery() {
 clean_hr_databases() {
     local exp_dir="$1"
     local ns="${HR_NAMESPACE:-default}"
-    local threshold="${HR_DB_BLOAT_THRESHOLD:-500}"
+    local factor="${HR_DB_BLOAT_FACTOR:-5}"
 
-    local geo_pod profile_pod geo_n profile_n
-    geo_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-geo \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    profile_pod=$(kubectl -n "$ns" get pods -l io.kompose.service=mongodb-profile \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    if [[ -z "$geo_pod" && -z "$profile_pod" ]]; then
-        log "$exp_dir" "  HR DB reset skipped (no HR mongo pods found)"
-        return 0
+    # mongo-label : db : representative collection : seed baseline (docs
+    # inserted by ONE initializeDatabase run -- see cmd/<svc>/db.go).
+    local probes=(
+        "mongodb-geo:geo-db:geo:80"
+        "mongodb-profile:profile-db:hotels:80"
+        "mongodb-rate:rate-db:inventory:27"
+        "mongodb-user:user-db:user:501"
+        "mongodb-reservation:reservation-db:number:80"
+        "mongodb-recommendation:recommendation-db:recommendation:80"
+    )
+
+    local bloated="" seen_pod=""
+    if [[ "${HR_DB_FORCE_RESET:-0}" == "1" ]]; then
+        log "$exp_dir" "  HR_DB_FORCE_RESET=1: skipping probes, resetting unconditionally"
+        bloated="(forced)"
+        seen_pod="forced"
+    else
+        local probe label db coll base pod n limit
+        for probe in "${probes[@]}"; do
+            IFS=':' read -r label db coll base <<< "$probe"
+            pod=$(kubectl -n "$ns" get pods -l io.kompose.service="$label" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            [[ -z "$pod" ]] && continue
+            seen_pod="$pod"
+            n=$(kubectl -n "$ns" exec "$pod" -- mongo "$db" --quiet \
+                --eval "db.${coll}.count()" 2>/dev/null | tr -dc '0-9')
+            n="${n:-0}"
+            limit=$(( base * factor ))
+            if [[ "$n" -gt "$limit" ]]; then
+                bloated+="${db}.${coll}=${n}(>~${limit}) "
+            fi
+        done
+        if [[ -z "$seen_pod" ]]; then
+            log "$exp_dir" "  HR DB reset skipped (no HR mongo pods found)"
+            return 0
+        fi
+        if [[ -z "$bloated" ]]; then
+            log "$exp_dir" "  HR DBs within ${factor}x seed baselines; no reset"
+            return 0
+        fi
     fi
-    geo_n=$(kubectl -n "$ns" exec "$geo_pod" -- mongo geo-db --quiet \
-        --eval 'db.geo.count()' 2>/dev/null | tr -dc '0-9')
-    profile_n=$(kubectl -n "$ns" exec "$profile_pod" -- mongo profile-db --quiet \
-        --eval 'db.hotels.count()' 2>/dev/null | tr -dc '0-9')
-    geo_n="${geo_n:-0}"; profile_n="${profile_n:-0}"
 
-    if [[ "$geo_n" -le "$threshold" && "$profile_n" -le "$threshold" ]]; then
-        log "$exp_dir" "  HR DBs within baseline (geo.geo=$geo_n, profile.hotels=$profile_n <= $threshold); no reset"
-        return 0
-    fi
-
-    log "$exp_dir" "  HR DB bloat detected (geo.geo=$geo_n, profile.hotels=$profile_n > $threshold); resetting to baseline"
+    log "$exp_dir" "  HR DB bloat detected: ${bloated}; resetting to baseline"
 
     # deployment : mongo-label : db-name  (frontend/search keep no DB state)
     local entries=(
@@ -2127,6 +2170,23 @@ clean_hr_databases() {
             >> "$exp_dir/logs/collector.log" 2>&1 \
             || log "$exp_dir" "    WARNING: $d not Ready in 120s after reseed (slow seed, node pressure, or stuck old pod). NOTE: of the HR services only 'search'/'profile' mount /dev/cpu, so msr matters only for those -- geo/rate/recommendation/reservation/user do NOT use msr."
     done
+
+    # Flush the memcached tiers too: cached values built from the bloated
+    # DBs contain the duplicated records (e.g. rate caches ALL plans found
+    # per hotelId), so they'd keep serving stale oversized entries after the
+    # DB reset. A restart is a full flush (memcached is volatile).
+    local mc mc_restarted=()
+    for mc in memcached-profile memcached-rate memcached-reserve; do
+        kubectl -n "$ns" rollout restart deployment "$mc" \
+            >> "$exp_dir/logs/collector.log" 2>&1 && mc_restarted+=("$mc")
+    done
+    if [[ ${#mc_restarted[@]} -gt 0 ]]; then
+        log "$exp_dir" "  Flushed memcached tiers (restart): ${mc_restarted[*]}"
+        for mc in "${mc_restarted[@]}"; do
+            kubectl -n "$ns" rollout status deployment "$mc" --timeout=120s \
+                >> "$exp_dir/logs/collector.log" 2>&1 || true
+        done
+    fi
     sleep 10
 }
 
@@ -2748,8 +2808,14 @@ run_iteration() {
     log "$exp_dir" "Iteration actual duration: ${actual_duration}s (planned: ${total_duration}s)"
 
     # Wait a bit more for data to be written to disk
-    log "$exp_dir" "Waiting 5s for data to be flushed to disk..."
-    sleep 5
+    # The in-pod sampler runs in CONTINUOUS mode (SetupContinuousSampling:
+    # 24h window, streamMode) and its periodicFlushLoop rewrites
+    # /data/run_data_*.json every 30s with all samples so far. The file is
+    # only as fresh as the LAST flush -- retrieving right after the window
+    # ends can silently drop up to 30s of the iteration's tail. Wait one full
+    # flush period so the covering flush is on disk. (Ported from batch-perf.)
+    log "$exp_dir" "Waiting 35s for the sampler's next periodic flush (30s cadence) before retrieval..."
+    sleep 35
     
     # Retrieve windowed run data from all victim services (only if enabled)
     if [[ "${ENABLE_WINDOWED_SAMPLING:-true}" == "true" ]]; then

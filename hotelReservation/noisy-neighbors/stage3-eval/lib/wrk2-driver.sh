@@ -48,11 +48,20 @@ WRK2_CONNECTIONS="${WRK2_CONNECTIONS:-32}"   # floor; auto-scaled up to >= rps
 # degrades under contention (too few -> client-side queueing and the rate is
 # never delivered: the -c 4 starvation), but NOT be so many that they idle
 # between requests and trip wrk2's per-connection timeout / NodePort conntrack
-# limits (too many -> socket timeouts: the -c 256 overshoot, ~3% timeouts at
-# 325 rps). ~rps*0.25 gives ~250ms of latency headroom; floored at
-# WRK2_CONNECTIONS (32) and capped at 64.
+# limits (too many -> socket timeouts: the flat -c 256 overshoot, ~3% timeouts
+# at 325 rps). ~rps*0.25 gives ~250ms of latency headroom; floored at
+# WRK2_CONNECTIONS (32) and capped at WRK2_CONNS_CAP (default 256).
+#
+# The cap was 64, which STARVES the 2400-rps HR victim: 64 conns means each
+# connection must turn a request around every ~27ms sequentially, far below
+# the contended p90/p99 (76ms-3s) -> threads block, offered rate is never
+# delivered, latency readings become client-side queueing artifacts. Because
+# the ~rps*0.25 formula only allocates connections the rate actually needs,
+# the higher CEILING does not reintroduce the idle-conn overshoot at low rps
+# (325 rps still gets ~82 conns, not 256). Sizing rule: conns >= rate x the
+# worst-case per-request latency you intend to tolerate.
 _wrk2_conns() {
-    local rps="$1" c="$WRK2_CONNECTIONS" cap=64
+    local rps="$1" c="$WRK2_CONNECTIONS" cap="${WRK2_CONNS_CAP:-256}"
     (( WRK2_CONNECTIONS > cap )) && cap="$WRK2_CONNECTIONS"   # honor explicit high override
     if [[ "$rps" =~ ^[0-9]+$ ]]; then
         local target=$(( (rps + 3) / 4 ))   # ~rps * 0.25

@@ -38,7 +38,7 @@ spec:
       containers:
         - command:
             - profile
-          image: deathstarbench/hotel-reservation:latest
+          image: docclabgroup/hotelreservation:panic-fixed-1.3
           name: hotel-reserv-profile
           ports:
             - {name: rpc,     containerPort: 8081}
