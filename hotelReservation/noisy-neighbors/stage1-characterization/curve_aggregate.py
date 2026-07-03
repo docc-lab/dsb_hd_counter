@@ -41,15 +41,29 @@ curve.csv columns:
   svc_mean_us, svc_p50_us, svc_p90_us, svc_p99_us, ipc, llc_mpki,
   freq_mhz, freq_util_pct, active_windows, total_requests,
   ghz_actual_rps, ghz_p50_ms, ghz_p90_ms, ghz_p99_ms, ghz_errors, saturated,
-  svc_bad_windows, svc_bad_pct
+  svc_bad_windows, svc_bad_pct,
+  svc_p50_fnorm_us, svc_p90_fnorm_us, svc_p99_fnorm_us
 
 Service-time columns are request-weighted means of per-window processing_time
 stats (no pooled raw durations exist in one shared run_data), so svc_p90/p99
 are tail proxies, not globally-pooled percentiles.
 
+Frequency-normalized columns (svc_*_fnorm_us): per-window service time scaled
+by that window's (actual_freq_mhz / tsc_freq_mhz) -- i.e. latency re-expressed
+at base clock, removing the DVFS effect (governor downclocks idle cores, so
+raw low-load service time measures the power policy, not the service). Each
+window is normalized by ITS OWN measured frequency before aggregation, so the
+correction is exact even mid-governor-ramp. Windows without freq data
+(freq.ok=false) are excluded from fnorm; the column is 0 when none have it.
+Note the correction is for clock speed only: IPC shifts (cache warmth) and
+memory-bound time are real workload behavior and are deliberately retained.
+
 The `saturated` verdict (svc-based): a level is saturated once its svc_p99
 crosses SATURATION_P99_THRESHOLD x the intrinsic baseline (the lowest-arrival
-level's clean svc_p99). The last non-saturated level is the intrinsic knee.
+level's clean svc_p99). Uses the frequency-NORMALIZED p99 whenever every
+served level has freq data (a DVFS-inflated baseline would otherwise loosen
+the threshold ~3-4x); falls back to raw svc_p99 otherwise. The last
+non-saturated level is the intrinsic knee.
 """
 import csv
 import glob
@@ -63,7 +77,8 @@ CSV_HEADER = ("target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,"
               "svc_mean_us,svc_p50_us,svc_p90_us,svc_p99_us,ipc,llc_mpki,"
               "freq_mhz,freq_util_pct,active_windows,total_requests,"
               "ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated,"
-              "svc_bad_windows,svc_bad_pct")
+              "svc_bad_windows,svc_bad_pct,"
+              "svc_p50_fnorm_us,svc_p90_fnorm_us,svc_p99_fnorm_us")
 
 ZERO_FRAG = "0,0,0,0,0,0,0,0,0,0,0,0,0"
 
@@ -214,7 +229,8 @@ def level_stats(samples, start_epoch, end_epoch):
         return dict(arr_mean=0.0, arr_p50=0.0, arr_p99=0.0, svc_mean=0.0,
                     svc_p50=0.0, svc_p90=0.0, svc_p99=0.0, ipc=0.0, llc_mpki=0.0,
                     freq_mhz=0.0, freq_util=0.0, active_windows=0, total_req=0,
-                    bad_windows=0, bad_pct=0.0)
+                    bad_windows=0, bad_pct=0.0,
+                    svc_p50_fn=0.0, svc_p90_fn=0.0, svc_p99_fn=0.0)
 
     # Robust stall-window rejection on per-window p99 processing time.
     def win_p99(s):
@@ -241,6 +257,26 @@ def level_stats(samples, start_epoch, end_epoch):
             den += c
         return (num / den) if den else 0.0
 
+    def wmean_fnorm(field):
+        """Request-weighted mean of per-window service time scaled to base
+        clock: t * (actual_freq / tsc_freq), using each window's OWN measured
+        frequency. Only windows with valid freq data participate."""
+        num = 0.0
+        den = 0
+        for s in clean:
+            fr = s.get("freq") or {}
+            if not fr.get("ok"):
+                continue
+            f = fr.get("actual_freq_mhz") or 0.0
+            tsc = fr.get("tsc_freq_mhz") or 0.0
+            if f <= 0 or tsc <= 0:
+                continue
+            ptw = (s["timing_window"].get("processing_time") or {})
+            c = ptw.get("count") or 0
+            num += (ptw.get(field) or 0) * (f / tsc) * c
+            den += c
+        return (num / den) if den else 0.0
+
     # perf / freq use the clean windows too (a stall window's perf deltas are
     # also unrepresentative of steady-state).
     def perf_sum(key):
@@ -262,6 +298,9 @@ def level_stats(samples, start_epoch, end_epoch):
         total_req=sum((s["timing_window"].get("request_count") or 0) for s in clean),
         bad_windows=bad_windows,
         bad_pct=(100.0 * bad_windows / n_active) if n_active else 0.0,
+        svc_p50_fn=us(wmean_fnorm("p50_ns")),
+        svc_p90_fn=us(wmean_fnorm("p90_ns")),
+        svc_p99_fn=us(wmean_fnorm("p99_ns")),
     )
 
 
@@ -327,36 +366,47 @@ def build(exp_dir):
     # Baseline = intrinsic (unloaded) svc_p99: the clean svc_p99 of the level
     # with the lowest arrival rate that actually served requests. The knee is
     # the last level whose svc_p99 stays under SAT_P99_THRESHOLD x baseline.
+    #
+    # Prefer the frequency-NORMALIZED p99 whenever every served level carries
+    # freq data: under a stock governor the raw low-load baseline is inflated
+    # by DVFS downclocking (measures the power policy, not the service), which
+    # would loosen the saturation threshold ~3-4x and push the detected knee
+    # right. Falls back to raw svc_p99 when freq data is missing.
     served = [lv for lv in levels if lv["st"]["total_req"] > 0 and lv["st"]["svc_p99"] > 0]
+    use_fnorm = bool(served) and all(lv["st"]["svc_p99_fn"] > 0 for lv in served)
+    key = "svc_p99_fn" if use_fnorm else "svc_p99"
     baseline = 0.0
     if served:
-        baseline = min(served, key=lambda lv: lv["st"]["arr_mean"])["st"]["svc_p99"]
+        baseline = min(served, key=lambda lv: lv["st"]["arr_mean"])["st"][key]
 
-    # Pass 2: write, deriving `saturated` from svc_p99 vs the baseline.
+    # Pass 2: write, deriving `saturated` from (normalized) svc_p99 vs baseline.
     n = 0
     with open(out, "w") as of:
         of.write(CSV_HEADER + "\n")
         for lv in levels:
             st = lv["st"]
             sat = "false"
-            if baseline > 0 and st["svc_p99"] > 0 and \
-                    st["svc_p99"] >= SAT_P99_THRESHOLD * baseline:
+            if baseline > 0 and st[key] > 0 and \
+                    st[key] >= SAT_P99_THRESHOLD * baseline:
                 sat = "true"
             frag = "%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%.2f,%.0f,%.1f,%d,%d" % (
                 st["arr_mean"], st["arr_p50"], st["arr_p99"],
                 st["svc_mean"], st["svc_p50"], st["svc_p90"], st["svc_p99"],
                 st["ipc"], st["llc_mpki"], st["freq_mhz"], st["freq_util"],
                 st["active_windows"], st["total_req"])
-            of.write("%s,%s,%s,%s,%s,%s,%s,%s,%d,%.1f\n" % (
+            of.write("%s,%s,%s,%s,%s,%s,%s,%s,%d,%.1f,%.1f,%.1f,%.1f\n" % (
                 lv["rps"], frag, lv["ghz_actual"], lv["ghz_p50"], lv["ghz_p90"],
                 lv["ghz_p99"], lv["ghz_err"], sat,
-                st["bad_windows"], st["bad_pct"]))
+                st["bad_windows"], st["bad_pct"],
+                st["svc_p50_fn"], st["svc_p90_fn"], st["svc_p99_fn"]))
             n += 1
 
     sys.stderr.write(
-        "Rewrote %s (%d levels) from %s  [baseline svc_p99=%.1f us, "
+        "Rewrote %s (%d levels) from %s  [baseline %s=%.1f us (%s), "
         "sat threshold=%.1fx, stall K=%.1f]\n"
-        % (out, n, os.path.basename(raw), baseline, SAT_P99_THRESHOLD, STALL_K))
+        % (out, n, os.path.basename(raw), key, baseline,
+           "freq-normalized" if use_fnorm else "RAW: no freq data",
+           SAT_P99_THRESHOLD, STALL_K))
     return 0
 
 
