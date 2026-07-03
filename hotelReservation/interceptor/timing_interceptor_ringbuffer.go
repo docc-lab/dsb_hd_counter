@@ -33,6 +33,13 @@ type RingBufferTimingAggregator struct {
 	// needed. See arrivalRateSmoother below.
 	arrivalSmoother1s *arrivalRateSmoother
 	arrivalSmoother3s *arrivalRateSmoother
+
+	// Sticky local-error state: true iff the most recent completion seen by
+	// flushWindow returned an error. Persists across idle windows and clears
+	// on the first error-free completion, so score layers can hold their
+	// "error" signal until the service demonstrably serves a clean request.
+	// Updated and read only from the windowedFlushLoop goroutine.
+	lastCompletionErrored bool
 }
 
 // arrivalRateSmoother computes a trailing sliding-window arrival rate (req/s)
@@ -313,6 +320,9 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 			case rba.windowStatsChannel <- &WindowTimingStats{
 				ArrivalCount: 0,
 				RequestCount: 0,
+				// Idle window: sticky error state carries over unchanged
+				// (nothing completed, so nothing could clear it).
+				InErrorState: rba.lastCompletionErrored,
 				ArrivalRps1s: rps1,
 				ArrivalRps3s: rps3,
 			}:
@@ -322,16 +332,27 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 		return
 	}
 
-	// Separate arrivals from completions
+	// Separate arrivals from completions, counting local errors.
 	arrivalCount := 0
+	errorCount := 0
 	completions := make([]TimingData, 0, len(windowData))
 
 	for _, event := range windowData {
 		if event.IsArrival {
 			arrivalCount++
 		} else {
+			if event.IsError {
+				errorCount++
+			}
 			completions = append(completions, event)
 		}
+	}
+
+	// Update the sticky error state from the LAST completion in this window
+	// (ring-buffer order approximates completion order): an error sets it, an
+	// error-free completion clears it.
+	if len(completions) > 0 {
+		rba.lastCompletionErrored = completions[len(completions)-1].IsError
 	}
 
 	// Advance both smoothers with this window's arrival count BEFORE the
@@ -341,6 +362,8 @@ func (rba *RingBufferTimingAggregator) flushWindow() {
 
 	// Calculate aggregated window statistics from completion data
 	stats := rba.calculateWindowStats(completions, arrivalCount, rps1, rps3)
+	stats.ErrorCount = errorCount
+	stats.InErrorState = rba.lastCompletionErrored
 
 	// Send aggregated stats to windowed sampler (non-blocking)
 	if rba.windowStatsChannel != nil {

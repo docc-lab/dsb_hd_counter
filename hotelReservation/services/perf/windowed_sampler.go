@@ -291,18 +291,29 @@ func (ws *windowedSampler) StartRun(ctx context.Context, config RunConfig) error
 	return nil
 }
 
-// periodicFlushLoop writes samples to disk periodically in stream mode
+// periodicFlushLoop writes samples to disk periodically in stream mode.
+//
+// The mutex is held ONLY long enough to snapshot the samples slice: JSON
+// marshaling of the (ever-growing) sample array takes seconds once the run
+// is tens of MB, and holding ws.mu through it blocked takeSample for the
+// duration -- the sampler dropped 10-30% of its 100ms windows late in long
+// runs. The full-slice expression (cap==len) forces takeSample's next append
+// to reallocate, so the snapshot's backing array is never written again;
+// Sample elements are immutable after append, making the read-only marshal
+// safe outside the lock.
 func (ws *windowedSampler) periodicFlushLoop() {
 	defer ws.wg.Done()
-	
+
 	flushTicker := time.NewTicker(30 * time.Second) // Flush every 30s
 	defer flushTicker.Stop()
-	
+
 	for {
 		select {
 		case <-flushTicker.C:
 			ws.mu.Lock()
-			if len(ws.samples) > 0 {
+			snapshot := ws.samples[:len(ws.samples):len(ws.samples)]
+			ws.mu.Unlock()
+			if len(snapshot) > 0 {
 				runData := &RunData{
 					ServiceName:    ws.config.ServiceName,
 					IterationID:    ws.config.IterationID,
@@ -310,21 +321,20 @@ func (ws *windowedSampler) periodicFlushLoop() {
 					RunEnd:         time.Now(),
 					RunDurationMs:  time.Since(ws.runStartTime).Milliseconds(),
 					WindowInterval: ws.config.WindowInterval.Milliseconds(),
-					SampleCount:    len(ws.samples),
+					SampleCount:    len(snapshot),
 					PerfEvents:     ws.config.PerfEvents,
-					Samples:        ws.samples,
-					Aggregates:     ws.calculateAggregates(),
+					Samples:        snapshot,
+					Aggregates:     ws.calculateAggregates(snapshot),
 				}
 				if err := ws.writeRunData(runData); err != nil {
 					log.Error().Err(err).Msg("Periodic flush failed")
 				} else {
 					log.Info().
-						Int("samples_written", len(ws.samples)).
+						Int("samples_written", len(snapshot)).
 						Msg("Periodic flush: wrote samples to file")
 				}
 			}
-			ws.mu.Unlock()
-			
+
 		case <-ws.ctx.Done():
 			return
 		}
@@ -554,7 +564,7 @@ func (ws *windowedSampler) StopRun() (*RunData, error) {
 		SampleCount:    len(ws.samples),
 		PerfEvents:     ws.config.PerfEvents,
 		Samples:        ws.samples,
-		Aggregates:     ws.calculateAggregates(),
+		Aggregates:     ws.calculateAggregates(ws.samples),
 	}
 	
 	// Write to file
@@ -574,53 +584,72 @@ func (ws *windowedSampler) StopRun() (*RunData, error) {
 	return runData, nil
 }
 
-// writeRunData writes run data to JSON file
+// writeRunData writes run data to a JSON file ATOMICALLY: encode into a .tmp
+// sibling, then os.Rename over the final name (atomic on the same fs). The
+// previous in-place os.Create truncated the file at the START of every 30s
+// flush, so any reader (harness `kubectl exec cat`) racing a rewrite got a
+// truncated or empty payload ("Unterminated string" mid-file / zero bytes).
+// With rename, readers always see either the previous complete flush or the
+// new complete flush, never a partial one.
 func (ws *windowedSampler) writeRunData(data *RunData) error {
 	filename := fmt.Sprintf("%s/run_data_%s_iter%d.json",
 		ws.config.OutputDir,
 		ws.config.ServiceName,
 		ws.config.IterationID)
-	
+	tmpname := filename + ".tmp"
+
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(ws.config.OutputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
-	
+
 	// Write JSON with indentation for readability
-	file, err := os.Create(filename)
+	file, err := os.Create(tmpname)
 	if err != nil {
-		return fmt.Errorf("failed to create file %s: %w", filename, err)
+		return fmt.Errorf("failed to create file %s: %w", tmpname, err)
 	}
-	defer file.Close()
-	
+
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(data); err != nil {
-		return fmt.Errorf("failed to write JSON to %s: %w", filename, err)
+		file.Close()
+		os.Remove(tmpname)
+		return fmt.Errorf("failed to write JSON to %s: %w", tmpname, err)
 	}
-	
+	if err := file.Close(); err != nil {
+		os.Remove(tmpname)
+		return fmt.Errorf("failed to close %s: %w", tmpname, err)
+	}
+
+	if err := os.Rename(tmpname, filename); err != nil {
+		os.Remove(tmpname)
+		return fmt.Errorf("failed to rename %s -> %s: %w", tmpname, filename, err)
+	}
+
 	log.Info().
 		Str("filename", filename).
 		Int("sample_count", data.SampleCount).
 		Msg("Wrote run data to file")
-	
+
 	return nil
 }
 
-// calculateAggregates computes statistics from all samples
-func (ws *windowedSampler) calculateAggregates() *RunAggregates {
+// calculateAggregates computes statistics from the given samples slice
+// (a lock-free snapshot from periodicFlushLoop, or ws.samples under lock
+// from StopRun).
+func (ws *windowedSampler) calculateAggregates(samples []Sample) *RunAggregates {
 	agg := &RunAggregates{
 		PerfTotals: make(map[string]uint64),
 		PerfMean:   make(map[string]float64),
 		PerfRate:   make(map[string]float64),
 	}
 	
-	if len(ws.samples) == 0 {
+	if len(samples) == 0 {
 		return agg
 	}
 	
 	// Calculate perf aggregates
-	for _, sample := range ws.samples {
+	for _, sample := range samples {
 		agg.TotalRequests += sample.TimingWindow.RequestCount
 		
 		for event, delta := range sample.PerfDeltas {
@@ -630,7 +659,7 @@ func (ws *windowedSampler) calculateAggregates() *RunAggregates {
 	
 	// Calculate means and rates
 	durationSec := ws.config.RunDuration.Seconds()
-	sampleCount := float64(len(ws.samples))
+	sampleCount := float64(len(samples))
 	
 	for event, total := range agg.PerfTotals {
 		agg.PerfMean[event] = float64(total) / sampleCount
@@ -638,13 +667,13 @@ func (ws *windowedSampler) calculateAggregates() *RunAggregates {
 	}
 	
 	// Calculate overall timing stats (aggregate across all samples)
-	agg.TimingOverall = ws.aggregateTimingStats()
+	agg.TimingOverall = ws.aggregateTimingStats(samples)
 
 	// Calculate frequency utilization rollup
-	agg.FreqUtil = ws.aggregateFreqStats()
+	agg.FreqUtil = ws.aggregateFreqStats(samples)
 
 	// Calculate arrival-rate rollup
-	agg.ArrivalRate = ws.aggregateArrivalRateStats()
+	agg.ArrivalRate = ws.aggregateArrivalRateStats(samples)
 
 	return agg
 }
@@ -653,16 +682,16 @@ func (ws *windowedSampler) calculateAggregates() *RunAggregates {
 // actual_freq, fraction of samples in turbo, and active_n stats. Samples
 // where Freq.OK is false are excluded from numerical means but counted in
 // SamplesWithoutFreq.
-func (ws *windowedSampler) aggregateFreqStats() *FreqUtilStats {
+func (ws *windowedSampler) aggregateFreqStats(samples []Sample) *FreqUtilStats {
 	stats := &FreqUtilStats{
 		TscFreqMHz:        ws.config.TscFreqMHz,
 		C0ActiveThreshold: ws.config.C0ActiveThreshold,
 	}
-	if len(ws.samples) == 0 {
+	if len(samples) == 0 {
 		return stats
 	}
 
-	utils := make([]float64, 0, len(ws.samples))
+	utils := make([]float64, 0, len(samples))
 	var (
 		sumActual    float64
 		sumUtil      float64
@@ -671,7 +700,7 @@ func (ws *windowedSampler) aggregateFreqStats() *FreqUtilStats {
 		activeNMax   int
 	)
 
-	for _, s := range ws.samples {
+	for _, s := range samples {
 		if !s.Freq.OK {
 			stats.SamplesWithoutFreq++
 			continue
@@ -715,20 +744,20 @@ func (ws *windowedSampler) aggregateFreqStats() *FreqUtilStats {
 // The horizons are echoed from the run's RunConfig. They're populated from
 // integration.ParseWindowedSamplingConfig (env-var-driven), and propagated
 // into the timing aggregator's smoothers, so this is the canonical source.
-func (ws *windowedSampler) aggregateArrivalRateStats() *ArrivalRateStats {
+func (ws *windowedSampler) aggregateArrivalRateStats(samples []Sample) *ArrivalRateStats {
 	stats := &ArrivalRateStats{
 		HorizonT1Sec: ws.config.ArrivalRpsT1.Seconds(),
 		HorizonT2Sec: ws.config.ArrivalRpsT2.Seconds(),
 	}
-	if len(ws.samples) == 0 {
+	if len(samples) == 0 {
 		return stats
 	}
 
-	rps1 := make([]float64, 0, len(ws.samples))
-	rps3 := make([]float64, 0, len(ws.samples))
+	rps1 := make([]float64, 0, len(samples))
+	rps3 := make([]float64, 0, len(samples))
 	var sum1, sum3 float64
 
-	for _, s := range ws.samples {
+	for _, s := range samples {
 		if s.TimingWindow == nil {
 			continue
 		}
@@ -776,10 +805,10 @@ func percentileFloat64(sorted []float64, p float64) float64 {
 }
 
 // aggregateTimingStats computes overall timing statistics
-func (ws *windowedSampler) aggregateTimingStats() *DurationStats {
+func (ws *windowedSampler) aggregateTimingStats(samples []Sample) *DurationStats {
 	var allProcessing, allTotal, allBlocking []int64
 	
-	for _, sample := range ws.samples {
+	for _, sample := range samples {
 		if sample.TimingWindow.RequestCount > 0 {
 			allProcessing = append(allProcessing, sample.TimingWindow.ProcessingTime.MeanNs)
 			allTotal = append(allTotal, sample.TimingWindow.TotalTime.MeanNs)
