@@ -28,8 +28,16 @@ spec:
       containers:
         - command:
             - search
-          image: docclabgroup/hotelreservation:v7.0.2
+          image: docclabgroup/hotelreservation:v7.0.5
           name: hotel-reserv-search
+          env:
+            # Match GOMAXPROCS to the cpu limit (3). Without this the Go
+            # runtime defaults to the node core count (~32) and fans threads
+            # past the 3-core CFS quota -> heavy throttling + latency jitter
+            # (stage-3 measured: nr_throttled climbing constantly). Adjust if
+            # the cpu limit changes. (Ported from stage3-predictor.)
+            - name: GOMAXPROCS
+              value: "3"
           ports:
             - containerPort: 8082
           resources:
