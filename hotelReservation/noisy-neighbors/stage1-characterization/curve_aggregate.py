@@ -42,21 +42,23 @@ curve.csv columns:
   freq_mhz, freq_util_pct, active_windows, total_requests,
   ghz_actual_rps, ghz_p50_ms, ghz_p90_ms, ghz_p99_ms, ghz_errors, saturated,
   svc_bad_windows, svc_bad_pct,
-  svc_p50_fnorm_us, svc_p90_fnorm_us, svc_p99_fnorm_us
+  svc_p50_norm_kcyc, svc_p90_norm_kcyc, svc_p99_norm_kcyc
 
 Service-time columns are request-weighted means of per-window processing_time
 stats (no pooled raw durations exist in one shared run_data), so svc_p90/p99
 are tail proxies, not globally-pooled percentiles.
 
-Frequency-normalized columns (svc_*_fnorm_us): per-window service time scaled
-by that window's (actual_freq_mhz / tsc_freq_mhz) -- i.e. latency re-expressed
-at base clock, removing the DVFS effect (governor downclocks idle cores, so
-raw low-load service time measures the power policy, not the service). Each
-window is normalized by ITS OWN measured frequency before aggregation, so the
-correction is exact even mid-governor-ramp. Windows without freq data
-(freq.ok=false) are excluded from fnorm; the column is 0 when none have it.
-Note the correction is for clock speed only: IPC shifts (cache warmth) and
-memory-bound time are real workload behavior and are deliberately retained.
+Frequency-normalized columns (svc_*_norm_kcyc): normalized latency =
+freq x latency, per window -- i.e. service time expressed in KILOCYCLES of
+work (us x MHz / 1000), the frequency-invariant measure. This removes the
+DVFS effect (governor downclocks idle cores, so raw low-load service time
+measures the power policy, not the service). Each window is normalized by ITS
+OWN measured actual_freq_mhz before aggregation, so the correction is exact
+even mid-governor-ramp. Windows without freq data (freq.ok=false) are
+excluded; the column is 0 when none have it. The correction is for clock
+speed only: IPC shifts (cache warmth) and memory-bound time are real workload
+behavior and are deliberately retained. (Divide by base freq in GHz to read
+it back as us-at-base-clock.)
 
 The `saturated` verdict (svc-based): a level is saturated once its svc_p99
 crosses SATURATION_P99_THRESHOLD x the intrinsic baseline (the lowest-arrival
@@ -78,7 +80,7 @@ CSV_HEADER = ("target_rps,arrival_rps_mean,arrival_rps_p50,arrival_rps_p99,"
               "freq_mhz,freq_util_pct,active_windows,total_requests,"
               "ghz_actual_rps,ghz_p50_ms,ghz_p90_ms,ghz_p99_ms,ghz_errors,saturated,"
               "svc_bad_windows,svc_bad_pct,"
-              "svc_p50_fnorm_us,svc_p90_fnorm_us,svc_p99_fnorm_us")
+              "svc_p50_norm_kcyc,svc_p90_norm_kcyc,svc_p99_norm_kcyc")
 
 ZERO_FRAG = "0,0,0,0,0,0,0,0,0,0,0,0,0"
 
@@ -258,9 +260,10 @@ def level_stats(samples, start_epoch, end_epoch):
         return (num / den) if den else 0.0
 
     def wmean_fnorm(field):
-        """Request-weighted mean of per-window service time scaled to base
-        clock: t * (actual_freq / tsc_freq), using each window's OWN measured
-        frequency. Only windows with valid freq data participate."""
+        """Request-weighted mean of normalized latency = freq x latency,
+        i.e. per-window service time in KILOCYCLES (ns * MHz * 1e-6), using
+        each window's OWN measured frequency. Frequency-invariant; only
+        windows with valid freq data participate."""
         num = 0.0
         den = 0
         for s in clean:
@@ -268,12 +271,11 @@ def level_stats(samples, start_epoch, end_epoch):
             if not fr.get("ok"):
                 continue
             f = fr.get("actual_freq_mhz") or 0.0
-            tsc = fr.get("tsc_freq_mhz") or 0.0
-            if f <= 0 or tsc <= 0:
+            if f <= 0:
                 continue
             ptw = (s["timing_window"].get("processing_time") or {})
             c = ptw.get("count") or 0
-            num += (ptw.get(field) or 0) * (f / tsc) * c
+            num += (ptw.get(field) or 0) * f * 1e-6 * c
             den += c
         return (num / den) if den else 0.0
 
@@ -298,9 +300,9 @@ def level_stats(samples, start_epoch, end_epoch):
         total_req=sum((s["timing_window"].get("request_count") or 0) for s in clean),
         bad_windows=bad_windows,
         bad_pct=(100.0 * bad_windows / n_active) if n_active else 0.0,
-        svc_p50_fn=us(wmean_fnorm("p50_ns")),
-        svc_p90_fn=us(wmean_fnorm("p90_ns")),
-        svc_p99_fn=us(wmean_fnorm("p99_ns")),
+        svc_p50_fn=wmean_fnorm("p50_ns"),   # already kilocycles (ns*MHz*1e-6)
+        svc_p90_fn=wmean_fnorm("p90_ns"),
+        svc_p99_fn=wmean_fnorm("p99_ns"),
     )
 
 
@@ -402,9 +404,10 @@ def build(exp_dir):
             n += 1
 
     sys.stderr.write(
-        "Rewrote %s (%d levels) from %s  [baseline %s=%.1f us (%s), "
+        "Rewrote %s (%d levels) from %s  [baseline %s=%.1f %s (%s), "
         "sat threshold=%.1fx, stall K=%.1f]\n"
         % (out, n, os.path.basename(raw), key, baseline,
+           "kcyc" if use_fnorm else "us",
            "freq-normalized" if use_fnorm else "RAW: no freq data",
            SAT_P99_THRESHOLD, STALL_K))
     return 0
