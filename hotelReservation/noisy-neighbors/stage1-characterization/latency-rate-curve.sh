@@ -339,7 +339,23 @@ curve_sweep() {
         fi
         sleep 5
     done
-    kubectl exec "$pod" -- cat "$run_file" > "$raw" 2>/dev/null || true
+    # Retrieve with validation + retry: the sampler's periodicFlushLoop
+    # rewrites run_data IN PLACE every 30s (os.Create truncates the file
+    # before the rewrite), so a cat racing a rewrite reads a truncated or
+    # empty file (observed: zero-byte reads, "Unterminated string" ~29MB in).
+    # Retry until the payload parses as JSON; 6 x 7s covers >1 flush cycle.
+    local attempt retrieved=false
+    for attempt in 1 2 3 4 5 6; do
+        kubectl exec "$pod" -- cat "$run_file" > "$raw" 2>/dev/null || true
+        if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$raw" 2>/dev/null; then
+            retrieved=true
+            break
+        fi
+        step1_log "$exp_dir" "  run_data truncated/incomplete (attempt $attempt); retrying in 7s"
+        sleep 7
+    done
+    [[ "$retrieved" == "true" ]] || \
+        step1_log "$exp_dir" "WARNING: run_data still invalid after $attempt attempts; curve build will likely fail (reslice-curve.sh can rebuild after a manual re-cat)"
     step1_log "$exp_dir" "Building curve.csv from run_data in one pass (curve_aggregate.py --build)"
 
     # Single-pass build: loads run_data once, slices every level by its

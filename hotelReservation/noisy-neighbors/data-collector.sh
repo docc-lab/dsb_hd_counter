@@ -810,8 +810,24 @@ retrieve_windowed_run_data() {
     local run_file="/data/run_data_${service}_iter${iteration}.json"
     if kubectl exec "$pod_name" -- test -f "$run_file" 2>/dev/null; then
         log "$exp_dir" "  Retrieving run data: $run_file"
-        kubectl exec "$pod_name" -- cat "$run_file" > "$output_dir/run_data_iter${iteration}_raw.json" 2>/dev/null
-        
+        # Validate + retry: the sampler's periodicFlushLoop rewrites run_data
+        # IN PLACE every 30s (os.Create truncates before the rewrite), so a
+        # single-shot cat can race a rewrite and read a truncated or empty
+        # file. Retry until the payload parses as JSON (6 x 7s > 1 flush cycle).
+        local _raw_out="$output_dir/run_data_iter${iteration}_raw.json"
+        local _attempt _retrieved=false
+        for _attempt in 1 2 3 4 5 6; do
+            kubectl exec "$pod_name" -- cat "$run_file" > "$_raw_out" 2>/dev/null
+            if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$_raw_out" 2>/dev/null; then
+                _retrieved=true
+                break
+            fi
+            log "$exp_dir" "  run_data truncated/incomplete (attempt $_attempt); retrying in 7s"
+            sleep 7
+        done
+        [[ "$_retrieved" == "true" ]] || \
+            log "$exp_dir" "  WARNING: run_data still invalid after $_attempt attempts; downstream slicing may fail"
+
         if [[ -s "$output_dir/run_data_iter${iteration}_raw.json" ]]; then
             # Load iteration timing metadata
             local workload_start_file="$exp_dir/metadata/iteration_${iteration}_workload_start.txt"
