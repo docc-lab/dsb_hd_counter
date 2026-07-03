@@ -67,8 +67,7 @@ type TimingData struct {
 type WindowTimingStats struct {
 	ArrivalCount   int                 `json:"arrival_count"`   // Requests that arrived in this window (sampled at window boundary)
 	RequestCount   int                 `json:"request_count"`   // Requests that completed in this window
-	ErrorCount     int                 `json:"error_count"`     // Completions in this window whose handler returned an error
-	InErrorState   bool                `json:"in_error_state"`  // Sticky: most recent completion (as of window close) errored; persists across idle windows, clears on the first error-free completion. Score layers can map this directly to "bump to max until a clean request".
+	ErrorCount     int                 `json:"error_count"`     // Completions in this window whose handler returned an error. Raw fact only -- any hold/decay policy (e.g. "score=1 until a clean request") belongs to the score/predictor layer, not here.
 	ArrivalRps1s   float64             `json:"arrival_rps_1s"`  // Trailing 1 s sliding-window arrival rate (req/s)
 	ArrivalRps3s   float64             `json:"arrival_rps_3s"`  // Trailing 3 s sliding-window arrival rate (req/s)
 	ProcessingTime WindowDurationStats `json:"processing_time"`
