@@ -314,15 +314,19 @@ curve_sweep() {
         fi
     done < <(curve_expand_levels)
 
-    # Wait for the sampler window to close (the binary writes the run_data
-    # file when its run_duration elapses; the ring buffer is sized so no
-    # mid-run flush happens), then retrieve the single file.
+    # The in-pod sampler runs in CONTINUOUS mode (SetupContinuousSampling
+    # hard-overrides RunDuration to 24h; EXPERIMENT_DURATION does NOT bound
+    # the window) and its streamMode periodicFlushLoop rewrites /data/run_data
+    # every 30s with all samples so far. The file therefore exists ~30s after
+    # pod start and is only as fresh as the LAST flush -- retrieving right at
+    # sweep end can silently drop up to 30s (the final level's tail). Sleep
+    # one full flush period so the flush covering the last level is on disk,
+    # then retrieve the newest flush.
     local run_file="/data/run_data_${svc}_iter1.json"
     local raw="$exp_dir/raw/windowed/${svc}/run_data_full_raw.json"
-    local elapsed=$(( $(date +%s) - window_start ))
-    local remain=$(( EXPERIMENT_DURATION - elapsed )); [[ $remain -lt 0 ]] && remain=0
-    local deadline=$(( SECONDS + remain + CURVE_FILE_POLL_TIMEOUT ))
-    step1_log "$exp_dir" "Sweep traffic done (${level} levels). Waiting for sampler window to close (~${remain}s) + retrieve ..."
+    step1_log "$exp_dir" "Sweep traffic done (${level} levels). Waiting 35s for the sampler's next periodic flush, then retrieving ..."
+    sleep 35
+    local deadline=$(( SECONDS + CURVE_FILE_POLL_TIMEOUT ))
     local pod
     while :; do
         pod=$(kubectl get pods -l io.kompose.service="$svc" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
