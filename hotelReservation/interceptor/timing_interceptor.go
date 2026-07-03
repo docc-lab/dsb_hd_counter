@@ -45,6 +45,7 @@ type TimingData struct {
 	ServiceName    string        `json:"service_name"`
 	Method         string        `json:"method"`
 	IsArrival      bool          `json:"is_arrival"`         // true = arrival event, false = completion event
+	IsError        bool          `json:"is_error"`           // completion returned a non-nil error (local service error)
 	ArrivalTime    time.Time     `json:"arrival_time"`
 	ProcessingTime time.Duration `json:"processing_time_ns"` // Time spent in actual processing (excluding blocking calls)
 	TotalTime      time.Duration `json:"total_time_ns"`      // Total time including blocking calls
@@ -66,6 +67,8 @@ type TimingData struct {
 type WindowTimingStats struct {
 	ArrivalCount   int                 `json:"arrival_count"`   // Requests that arrived in this window (sampled at window boundary)
 	RequestCount   int                 `json:"request_count"`   // Requests that completed in this window
+	ErrorCount     int                 `json:"error_count"`     // Completions in this window whose handler returned an error
+	InErrorState   bool                `json:"in_error_state"`  // Sticky: most recent completion (as of window close) errored; persists across idle windows, clears on the first error-free completion. Score layers can map this directly to "bump to max until a clean request".
 	ArrivalRps1s   float64             `json:"arrival_rps_1s"`  // Trailing 1 s sliding-window arrival rate (req/s)
 	ArrivalRps3s   float64             `json:"arrival_rps_3s"`  // Trailing 3 s sliding-window arrival rate (req/s)
 	ProcessingTime WindowDurationStats `json:"processing_time"`
@@ -262,6 +265,9 @@ func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceN
 	timingData.TotalTime = totalTime
 	timingData.ProcessingTime = processingTime
 	timingData.BlockingTime = pausedTime
+	// Record whether this request errored locally (handler returned non-nil).
+	// Assigned unconditionally so a pooled object can't leak a stale value.
+	timingData.IsError = err != nil
 
 	// Make a copy of timing data before returning to pool
 	// The aggregator's channel consumer will handle this asynchronously
