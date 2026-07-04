@@ -238,8 +238,14 @@ build_and_push_docker() {
             ;;
     esac
 
-    # Check if image already exists locally
-    if ! sudo docker image inspect "${image_full_name}" >/dev/null 2>&1; then
+    # ALWAYS build. The old behavior skipped the build when the tag already
+    # existed locally and just re-pushed the stale image -- which silently
+    # deployed OLD binaries twice now (search-windowed v7.0.2 FD-leak saga,
+    # then v7.0.7 shipping without the v7.0.6 sampler fixes). Docker layer
+    # caching makes a no-change rebuild nearly free, so there is no reason
+    # to skip. Set SKIP_BUILD_IF_EXISTS=1 to restore the old (dangerous)
+    # behavior for offline situations.
+    if [[ "${SKIP_BUILD_IF_EXISTS:-0}" != "1" ]] || ! sudo docker image inspect "${image_full_name}" >/dev/null 2>&1; then
         log_info "Building Docker image: ${image_full_name}"
         log_info "Platform: ${PLATFORM}"
         
