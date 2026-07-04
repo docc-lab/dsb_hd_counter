@@ -1461,10 +1461,11 @@ reset_non_victim_services() {
         # pass HR_DEFAULT_IMAGE=... at runtime. It MUST point at an image that
         # contains the panic->error fix (verify: grep -a 'falling back to mongo'
         # /go/bin/rate). panic-fixed-1.0 was built pre-fix and will crash-loop.
-        # panic-fixed-1.3 = panic->error + perf_api FD-leak fix + rate perf
-        # disable + bounded mongo fallback + rate hotelId query filter (the
-        # 117KB-cache-values bandwidth bug). 1.1/1.2 predate the rate fixes.
-        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.3}"
+        # panic-fixed-1.4 = 1.3 + nil-aggregator interceptor fix (1.3 SIGSEGVs
+        # on the FIRST request to any timing-disabled service -- user crash-
+        # looped under the mixed workload) + sampler v7.0.6 fixes + per-window
+        # error_count. 1.3 and earlier will crash under frontend load.
+        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.4}"
 
         if [[ "$current_image" == "$default_image" ]]; then
             log "$exp_dir" "  $service already using default image ($default_image)"

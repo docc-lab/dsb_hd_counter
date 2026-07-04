@@ -28,7 +28,7 @@ spec:
       containers:
         - command:
             - search
-          image: docclabgroup/search-windowed:v7.0.5
+          image: docclabgroup/search-windowed:v7.0.8
           name: hotel-reserv-search
           env:
             # Match GOMAXPROCS to the cpu limit (3). Without this the Go

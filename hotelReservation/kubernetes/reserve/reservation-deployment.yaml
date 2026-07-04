@@ -28,7 +28,7 @@ spec:
       containers:
         - command:
             - reservation
-          image: docclabgroup/hotelreservation:panic-fixed-1.3
+          image: docclabgroup/hotelreservation:panic-fixed-1.4
           name: hotel-reserv-reservation
           env:
             # Match GOMAXPROCS to the cpu limit (3). Without this the Go
