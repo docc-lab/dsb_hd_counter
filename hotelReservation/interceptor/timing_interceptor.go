@@ -219,7 +219,17 @@ type timingContext struct {
 // TimingServerInterceptorWithAggregator creates interceptor using a provided aggregator
 // This allows sharing the aggregator across all requests for proper windowed batching
 // Uses object pooling and deferred submission to eliminate request path overhead
+//
+// A nil aggregator yields a PASS-THROUGH interceptor: the first statement below
+// is aggregator.RecordArrival(), and calling that on a nil interface panics
+// (SIGSEGV) on the very first request -- which crash-looped every
+// timing-disabled service that received traffic.
 func TimingServerInterceptorWithAggregator(aggregator TimingAggregator, serviceName string) grpc.UnaryServerInterceptor {
+	if aggregator == nil {
+		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			return handler(ctx, req)
+		}
+	}
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		// RECORD ARRIVAL: Increment arrival counter for this window
 		// This happens at request arrival, synchronized with window boundary sampling
