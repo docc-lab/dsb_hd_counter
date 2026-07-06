@@ -17,12 +17,19 @@ Usage: python3 warmup_check.py <run_dir> [service] [cores]
 """
 import csv
 import json
+import re
 import sys
 from datetime import datetime
 
 
 def to_epoch(ts):
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    """Parse a Go RFC3339 / RFC3339Nano timestamp to epoch seconds."""
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # datetime.fromisoformat (<3.11) accepts at most 6 fractional digits.
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    return datetime.fromisoformat(s).timestamp()
 
 
 def main():
