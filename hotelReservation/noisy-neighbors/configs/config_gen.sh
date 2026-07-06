@@ -15,6 +15,10 @@
 # Also fixed from the old generator: the 10s_repeated4_burst{30,40}_start20
 # entries passed num_bursts=2 (mislabeled as repeated4) — now actually 4.
 #
+# 2026-07-05: added the no-stressor baseline tier (0s_baseline_rps*) that the
+# original grid forgot — one per rate, same template/threads/connections as
+# the contention configs, CONTENTION_BURSTS=none.
+#
 # WRK2_THREADS scales with rate; WRK2_CONNECTIONS is only a FLOOR — the
 # harness auto-scales connections to max(floor, rate) capped at 256
 # (data-collector.sh run_load), so 32 everywhere is correct.
@@ -109,9 +113,39 @@ SHAPES=(
 )
 
 # --------------------------------------------------------------------------
+# No-stressor baselines: one per rate tier.
+# CONTENTION_BURSTS=none is data-collector.sh's explicit no-contention mode
+# (generate_burst_schedule); in that mode the run length comes from
+# EXPERIMENT_DURATION instead of the burst schedule, so pin it explicitly.
+# 100s sits at the median of the contention iterations (shape max_end ranges
+# 40-150s) and matches the modal 30s_repeated2 / linear2 shapes exactly.
+# Everything else (test.conf template, rate tiers, threads_for_rate, conns
+# floor) is identical to the contention grid, so baselines are directly
+# comparable to the already-run stage-2 experiments. The "0s_" prefix keeps
+# the names inside run-batch.sh's default 'configs/[0-9]*.conf' glob and
+# sorts them ahead of the 10s_/20s_/30s_ shapes.
+# --------------------------------------------------------------------------
+BASELINE_DURATION=100
+total=0
+for rate in "${RATES[@]}"; do
+    threads=$(threads_for_rate "$rate")
+    name="0s_baseline_rps${rate}"
+    ./a.sh "EXPERIMENT_NAME='${name}'" \
+           "CONTENTION_BURSTS=none" \
+           "WRK2_RATE=${rate}" \
+           "WRK2_THREADS=${threads}" \
+           "WRK2_CONNECTIONS=${CONNS_FLOOR}"
+    if grep -q '^EXPERIMENT_DURATION=' "${name}.conf"; then
+        sed -i "s|^EXPERIMENT_DURATION=.*|EXPERIMENT_DURATION=${BASELINE_DURATION}|" "${name}.conf"
+    else
+        echo "EXPERIMENT_DURATION=${BASELINE_DURATION}" >> "${name}.conf"
+    fi
+    total=$((total + 1))
+done
+
+# --------------------------------------------------------------------------
 # Generate: RATES x SHAPES
 # --------------------------------------------------------------------------
-total=0
 for rate in "${RATES[@]}"; do
     threads=$(threads_for_rate "$rate")
     for entry in "${SHAPES[@]}"; do
@@ -127,4 +161,4 @@ for rate in "${RATES[@]}"; do
 done
 
 echo ""
-echo "Generated $total configs (${#RATES[@]} rate tiers x ${#SHAPES[@]} shapes)."
+echo "Generated $total configs (${#RATES[@]} rate tiers x (${#SHAPES[@]} shapes + 1 baseline))."
