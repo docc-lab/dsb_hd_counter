@@ -137,8 +137,10 @@ def to_epoch(ts):
     s = ts.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    # datetime.fromisoformat (<3.11) accepts at most 6 fractional digits.
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    # Go's RFC3339Nano trims trailing zeros, so the fraction is 1-9 digits;
+    # datetime.fromisoformat (<3.11) needs exactly 3 or 6. Normalize to 6.
+    s = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), s,
+               count=1)
     try:
         return datetime.fromisoformat(s).timestamp()
     except Exception:
