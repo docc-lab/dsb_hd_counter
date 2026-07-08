@@ -63,6 +63,112 @@ curve_aggregate_level() {
 }
 
 # ---------------------------------------------------------------------------
+# Optional CPU-frequency policy on the target node (intrinsic-curve mode).
+#
+# Knobs (env or config; all optional — when none are set this is a no-op and
+# the sweep runs under whatever governor the node already has):
+#   FREQ_GOVERNOR   cpufreq governor for the sweep (e.g. performance)
+#   FREQ_MIN_MHZ    scaling_min_freq bound in MHz
+#   FREQ_MAX_MHZ    scaling_max_freq bound in MHz
+#   FREQ_SSH_HOST   ssh host for cpupower (default: $TARGET_NODE)
+#
+# Set FREQ_MIN_MHZ == FREQ_MAX_MHZ to PIN the clock: this removes both the
+# schedutil idle down-clock (left-side latency fall) AND turbo excursions,
+# which governor=performance alone does not (observed 2.4-3.0 GHz wander
+# under performance on 2026-07-05). Applies to ALL cpus on the node (the
+# node is dedicated to the victim during a sweep). The original governor and
+# bounds are read from cpu0, recorded in metadata/freq_policy.json, and
+# restored by the EXIT trap no matter how the run ends.
+# ---------------------------------------------------------------------------
+CURVE_FREQ_SAVED=false
+CURVE_FREQ_ORIG_GOV=""
+CURVE_FREQ_ORIG_MIN_KHZ=""
+CURVE_FREQ_ORIG_MAX_KHZ=""
+
+curve_freq_ssh() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "${FREQ_SSH_HOST:-$TARGET_NODE}" "$@"
+}
+
+curve_apply_freq_policy() {
+    local exp_dir="$1"
+    [[ -z "${FREQ_GOVERNOR:-}${FREQ_MIN_MHZ:-}${FREQ_MAX_MHZ:-}" ]] && return 0
+
+    local host="${FREQ_SSH_HOST:-$TARGET_NODE}"
+    step1_log "$exp_dir" "Applying CPU freq policy on $host: governor=${FREQ_GOVERNOR:-<keep>} min=${FREQ_MIN_MHZ:-<keep>}MHz max=${FREQ_MAX_MHZ:-<keep>}MHz"
+
+    # Save the original policy BEFORE touching anything; abort if unreadable
+    # (no passwordless ssh/sudo) rather than leave the node half-configured.
+    if ! CURVE_FREQ_ORIG_GOV=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null); then
+        step1_log "$exp_dir" "ERROR: cannot read cpufreq state on $host (ssh/BatchMode?); aborting before modifying it"
+        exit 1
+    fi
+    CURVE_FREQ_ORIG_MIN_KHZ=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq)
+    CURVE_FREQ_ORIG_MAX_KHZ=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
+    CURVE_FREQ_SAVED=true
+
+    # Single cpupower call (all CPUs); -d/-u/-g are each optional.
+    if ! curve_freq_ssh sudo cpupower frequency-set \
+            ${FREQ_GOVERNOR:+-g "$FREQ_GOVERNOR"} \
+            ${FREQ_MIN_MHZ:+-d "${FREQ_MIN_MHZ}MHz"} \
+            ${FREQ_MAX_MHZ:+-u "${FREQ_MAX_MHZ}MHz"} >/dev/null; then
+        step1_log "$exp_dir" "ERROR: cpupower frequency-set failed on $host; restoring and aborting"
+        curve_restore_freq_policy "$exp_dir"
+        exit 1
+    fi
+
+    # Verify on a victim core (search is pinned to 18-20), not cpu0.
+    local gov min max
+    gov=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu18/cpufreq/scaling_governor)
+    min=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu18/cpufreq/scaling_min_freq)
+    max=$(curve_freq_ssh cat /sys/devices/system/cpu/cpu18/cpufreq/scaling_max_freq)
+    step1_log "$exp_dir" "  cpu18 policy now: governor=$gov range=$((min/1000))-$((max/1000))MHz (was: $CURVE_FREQ_ORIG_GOV $((CURVE_FREQ_ORIG_MIN_KHZ/1000))-$((CURVE_FREQ_ORIG_MAX_KHZ/1000))MHz)"
+
+    cat > "$exp_dir/metadata/freq_policy.json" <<-EOJSON
+	{
+	    "host": "$host",
+	    "applied": {
+	        "governor": "${FREQ_GOVERNOR:-}",
+	        "min_mhz": "${FREQ_MIN_MHZ:-}",
+	        "max_mhz": "${FREQ_MAX_MHZ:-}"
+	    },
+	    "verified_cpu18": {
+	        "governor": "$gov",
+	        "min_khz": $min,
+	        "max_khz": $max
+	    },
+	    "original_cpu0": {
+	        "governor": "$CURVE_FREQ_ORIG_GOV",
+	        "min_khz": $CURVE_FREQ_ORIG_MIN_KHZ,
+	        "max_khz": $CURVE_FREQ_ORIG_MAX_KHZ
+	    },
+	    "restored_on_exit": true
+	}
+	EOJSON
+}
+
+curve_restore_freq_policy() {
+    local exp_dir="${1:-}"
+    [[ "$CURVE_FREQ_SAVED" == "true" ]] || return 0
+    local host="${FREQ_SSH_HOST:-$TARGET_NODE}"
+    local msg="Restoring CPU freq policy on $host: governor=$CURVE_FREQ_ORIG_GOV range=$((CURVE_FREQ_ORIG_MIN_KHZ/1000))-$((CURVE_FREQ_ORIG_MAX_KHZ/1000))MHz"
+    if [[ -n "$exp_dir" ]]; then step1_log "$exp_dir" "$msg"; else echo "[curve] $msg" >&2; fi
+    if curve_freq_ssh sudo cpupower frequency-set \
+            -g "$CURVE_FREQ_ORIG_GOV" \
+            -d "${CURVE_FREQ_ORIG_MIN_KHZ}kHz" \
+            -u "${CURVE_FREQ_ORIG_MAX_KHZ}kHz" >/dev/null; then
+        CURVE_FREQ_SAVED=false
+    else
+        echo "[curve] WARNING: failed to restore cpufreq policy on $host — fix manually:" >&2
+        echo "  ssh $host 'sudo cpupower frequency-set -g $CURVE_FREQ_ORIG_GOV -d ${CURVE_FREQ_ORIG_MIN_KHZ}kHz -u ${CURVE_FREQ_ORIG_MAX_KHZ}kHz'" >&2
+    fi
+}
+
+curve_cleanup() {
+    curve_restore_freq_policy
+    step1_cleanup
+}
+
+# ---------------------------------------------------------------------------
 # Create the curve experiment directory + metadata.
 # ---------------------------------------------------------------------------
 curve_create_exp_dir() {
@@ -442,6 +548,11 @@ Usage (run from noisy-neighbors/): ./stage1-characterization/latency-rate-curve.
     CURVE_FILE_POLL_TIMEOUT  extra seconds to wait for the run_data file at
                              window close (default 120)
     CURVE_DATA_DIR           output root (default ./experiment_data)
+    FREQ_GOVERNOR            cpufreq governor on the target node for the sweep
+                             (e.g. performance); original restored on exit
+    FREQ_MIN_MHZ/FREQ_MAX_MHZ  bound the clock; set equal to PIN it (intrinsic
+                             curve with no DVFS / turbo variation)
+    FREQ_SSH_HOST            ssh host for cpupower (default: TARGET_NODE)
 
   X-axis of curve.csv is arrival_rps_mean (interceptor-measured), NOT ghz.
 USAGE
@@ -491,12 +602,14 @@ USAGE
            C0_ACTIVE_THRESHOLD MSR_TURBO_REFRESH_EVERY_S TSC_FREQ_MHZ \
            SATURATION_WARMUP SATURATION_COOLDOWN
 
-    trap step1_cleanup EXIT INT TERM
+    trap curve_cleanup EXIT INT TERM
 
     local exp_dir
     exp_dir=$(curve_create_exp_dir)
 
     cleanup_existing_stress_pods "$exp_dir"
+
+    curve_apply_freq_policy "$exp_dir"
 
     curve_deploy "$exp_dir"
     curve_sweep "$exp_dir"
