@@ -5,28 +5,37 @@
 
 | File | What | Status |
 |---|---|---|
-| `<svc>.onnx` | trained GRU model | `search.onnx` = the July 2026 retrain (blob `9357ea3`, input `[batch, 20, 75]`, output `p50_score`) |
-| `<svc>-config.json` | run config with `n_features`, `service_vocab`, `scaler.mean/scale` | `search-config.json` = **APPROXIMATED** (see below). The trainer-emitted original was lost (the `gru_config_run1.json` on master is the pre-training input template; the post-training file no longer exists on the training host and retraining was abandoned). |
+| `<svc>.onnx` | trained GRU model | `search.onnx` = the a07a375 "model fixed size" retrain (blob `e062053`, input `[batch, 20, 73]`, output `p50_score`, service encoded as a **scalar index**) |
+| `<svc>-config.json` | run config with `n_features`, `service_vocab`, `service_encoding`, `scaler.mean/scale` | `search-config.json` = **APPROXIMATED** (see below). The trainer-emitted config was again not committed with a07a375. |
 
 ### About the approximated `search-config.json`
 
 - `service_vocab` = `["profile", "search", "__unknown__"]`, deduced from the
-  training file paths hardcoded in `gru_train.py` (a search + a profile run).
+  training file paths hardcoded in `gru_train.py` (unchanged at a07a375);
+  `service_encoding` = `scalar_index` (search → index 1.0).
 - The scaler was **re-fit on the committed labeled test file**
-  (`run_data_iter1_ready.json`) using ONLINE-style extraction
-  (`error_count=0`, `offset_from_workload_ms=0`), matching the Go `gru_v2`
-  extractor exactly.
+  (`run_data_iter1_ready.json`) using ONLINE-style gru_v3 extraction
+  (`error_count=0`, `offset_from_workload_ms=0`), matching the Go extractor
+  exactly, with the wall-clock offset features neutralized.
 - **Measured quality** against that file's 810 labeled sequences through the
-  actual committed model: **pearson r = 0.917, RMSE = 0.153, bias +0.12**
-  (an identity scaler scores r = −0.2 — the standardization is what carries
-  the signal). Use ŷ50 as a **trend** signal; calibrate absolute thresholds
-  on the observed stream, or lean on the formula's `y50_current` for
-  absolute levels.
+  actual a07a375 model: **pearson r = 0.901, RMSE = 0.184, bias +0.15**
+  (an identity scaler scores negative correlation — the standardization is
+  what carries the signal). Use ŷ50 as a **trend** signal; calibrate
+  absolute thresholds on the observed stream, or lean on the formula's
+  `y50_current` for absolute levels.
+- The Go extractor **neutralizes the two wall-clock offset features**
+  (`offset_ms`, `offset_from_workload_ms`) to z = 0 after standardization —
+  measured quality-neutral, while preventing the drift a long-lived pod
+  would otherwise feed (offset_ms = pod uptime; simulated 1-day uptime
+  without neutralization degraded the previous model from r 0.917 to 0.888).
 - Caveat: the scaler's coverage is one contended search run; feature regimes
   far outside it (different aggressor mixes, other services) degrade the
   standardization unpredictably. `ScoreEvent.ModelVersion` reports
-  `gru-run1@2026-07-09 approx-scaler` so downstream analysis can tag results.
-- Supersede this file the moment any trainer-emitted config ships.
+  `gru-run1@2026-07-09 approx-scaler-v3` so downstream analysis can tag
+  results.
+- Supersede this file the moment any trainer-emitted config ships (it will
+  carry the same `service_encoding: "scalar_index"` field, which the Go
+  loader now requires).
 
 Prediction-OFF deployments need nothing from this directory: the Gordion
 formula source runs from the `gordion-<svc>` ConfigMap alone (see

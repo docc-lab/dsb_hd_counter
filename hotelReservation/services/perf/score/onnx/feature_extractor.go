@@ -7,14 +7,14 @@ import (
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 )
 
-// gru_v2 feature recipe, ported from the trainer's extract_features
-// (gru_train.py @ d38b8dd) via the colleague's reference client
-// (scenario_onnx_go.go::extractFeaturesRaw). The Go extractor and the
-// trainer's Python MUST produce byte-identical features for the same
-// sample; the golden parity test in feature_extractor_test.go guards
-// the transcription.
+// gru_v3 feature recipe, ported from the trainer's extract_features
+// (gru_train.py @ a07a375 "model fixed size") via the colleague's
+// reference client (scenario_onnx_go.go::extractFeaturesRaw). The Go
+// extractor and the trainer's Python MUST produce byte-identical
+// features for the same sample; the golden parity test in
+// feature_extractor_test.go guards the transcription.
 //
-// Layout (n_features = 72 + len(service_vocab)):
+// Layout (n_features = 73, FIXED regardless of vocab size):
 //
 //	group 1   10  perf_counters absolute       ┐
 //	group 2   10  perf_deltas                  │
@@ -22,7 +22,8 @@ import (
 //	group 4   33  timing stats (3 sections)    │
 //	group 5    6  freq fields + turbo_on       │
 //	group 6    3  offset_ms / offset_from_workload_ms / window_interval_ms ┘
-//	group 7    |vocab|  service one-hot        (NOT log1p'd)
+//	group 7    1  service index scalar         (index into service_vocab;
+//	              NOT one-hot, NOT log1p'd — a07a375's fixed-size change)
 //	group 8    5  derived ratios               (NOT log1p'd, clipped)
 //
 // then StandardScaler (x - mean) / scale over the FULL vector.
@@ -31,42 +32,53 @@ import (
 //   - error_count: not collected by interceptor.WindowTimingStats;
 //     constant 0 in ALL training samples (injected offline), so a
 //     constant 0 here matches the training distribution exactly.
-//   - offset_from_workload_ms: training-only field (ms since loadgen
-//     start, injected offline); no online equivalent exists, so we feed
-//     0. This is a known train/serve skew -- the trainer has been asked
-//     to drop it at the next retrain.
-//   - offset_ms: ms since sampler run start. Online this grows without
-//     bound (pod lifetime) vs 70-155 s in training; same skew note.
+//   - offset_ms / offset_from_workload_ms: training-run wall-clock
+//     artifacts with no faithful online equivalent (offset_ms online =
+//     pod uptime, unbounded, vs 70-155 s in training). Both features
+//     are NEUTRALIZED after standardization (forced to z = 0, i.e. the
+//     scaler mean). Empirically validated against the committed model +
+//     labeled test data: neutralizing costs nothing (pearson r 0.916 vs
+//     0.917), while feeding real pod uptime degrades measurably as the
+//     pod ages (r 0.888 with prediction shift at simulated 1-day
+//     uptime). The trainer has been asked to drop both features at the
+//     next retrain.
 //   - window_interval_ms: file-level in training data; online it is the
 //     actual configured sampler interval (WINDOW_INTERVAL_MS env),
 //     plumbed in at construction. Do NOT hardcode 100.
 
-// gruV2PerfCounterKeys are the 10 perf-counter names in trainer order.
+// gruV3PerfCounterKeys are the 10 perf-counter names in trainer order.
 // Both perf_counters (cumulative) and perf_deltas (per-window) use this
 // same key set.
-var gruV2PerfCounterKeys = []string{
+var gruV3PerfCounterKeys = []string{
 	"LLC-load-misses", "LLC-loads", "branch-instructions", "branch-misses",
 	"cycles", "dTLB-load-misses", "dTLB-loads", "instructions",
 	"page-faults", "ref-cycles",
 }
 
-// extractorV2 holds the per-deployment constants resolved once at
+// Positions of the neutralized group-6 offset features in the vector
+// (g1 0-9, g2 10-19, g3 20-24, g4 25-57, g5 58-63, g6 64-66; the
+// service index scalar is 67, ratios 68-72).
+const (
+	idxOffsetMs           = 64
+	idxOffsetFromWorkload = 65
+)
+
+// extractorV3 holds the per-deployment constants resolved once at
 // construction so the per-window hot path is allocation-light and
 // branch-light.
-type extractorV2 struct {
+type extractorV3 struct {
 	mean, scale      []float64 // StandardScaler params, len == nFeatures
-	oneHotIdx        int       // this service's slot in the vocab
-	vocabLen         int
+	svcIndex         float64   // this service's index in the vocab (group-7 scalar)
 	windowIntervalMs float64
 	nFeatures        int
 }
 
-// newExtractorV2 resolves the service's one-hot slot and captures the
+// newExtractorV3 resolves the service's vocab index and captures the
 // scaler. Returns (extractor, vocabMiss): vocabMiss is true when
 // serviceName is not in the vocab and the extractor fell back to the
 // __unknown__ bucket -- the caller MUST log this loudly, because a
 // silently-unknown service degrades every prediction.
-func newExtractorV2(rc *RunConfig, serviceName string, windowIntervalMs float64) (*extractorV2, bool) {
+func newExtractorV3(rc *RunConfig, serviceName string, windowIntervalMs float64) (*extractorV3, bool) {
 	idx := len(rc.ServiceVocab) - 1 // unknown bucket is always last
 	vocabMiss := true
 	for i, v := range rc.ServiceVocab {
@@ -79,11 +91,10 @@ func newExtractorV2(rc *RunConfig, serviceName string, windowIntervalMs float64)
 	if serviceName == unknownService {
 		vocabMiss = false // explicitly unknown is not a misconfiguration
 	}
-	return &extractorV2{
+	return &extractorV3{
 		mean:             rc.Scaler.Mean,
 		scale:            rc.Scaler.Scale,
-		oneHotIdx:        idx,
-		vocabLen:         len(rc.ServiceVocab),
+		svcIndex:         float64(idx),
 		windowIntervalMs: windowIntervalMs,
 		nFeatures:        rc.NFeatures,
 	}, vocabMiss
@@ -93,17 +104,17 @@ func newExtractorV2(rc *RunConfig, serviceName string, windowIntervalMs float64)
 // of length nFeatures. Called once per Sample per window; with
 // seq_len = N the Model's ring holds the last N vectors, concatenated
 // into a [1, N, nFeatures] tensor.
-func (e *extractorV2) Extract(s perf.Sample) []float32 {
+func (e *extractorV3) Extract(s perf.Sample) []float32 {
 	// raw accumulates the 67 values that get log1p'd.
 	raw := make([]float64, 0, 67)
 
 	// Group 1: perf_counters absolute.
-	for _, k := range gruV2PerfCounterKeys {
+	for _, k := range gruV3PerfCounterKeys {
 		raw = append(raw, float64(s.PerfCounters[k]))
 	}
 
 	// Group 2: perf_deltas (per-window deltas).
-	for _, k := range gruV2PerfCounterKeys {
+	for _, k := range gruV3PerfCounterKeys {
 		raw = append(raw, float64(s.PerfDeltas[k]))
 	}
 
@@ -163,14 +174,9 @@ func (e *extractorV2) Extract(s perf.Sample) []float32 {
 		out = append(out, math.Log1p(v))
 	}
 
-	// Group 7: service one-hot (NOT log1p'd).
-	for i := 0; i < e.vocabLen; i++ {
-		if i == e.oneHotIdx {
-			out = append(out, 1.0)
-		} else {
-			out = append(out, 0.0)
-		}
-	}
+	// Group 7: service index scalar (NOT one-hot, NOT log1p'd) --
+	// matches gru_train.py::_service_index / scenario_onnx_go.go::serviceIndex.
+	out = append(out, e.svcIndex)
 
 	// Group 8: derived ratios (NOT log1p'd). Epsilon avoids 0/0; clip
 	// ranges match the trainer.
@@ -198,6 +204,12 @@ func (e *extractorV2) Extract(s perf.Sample) []float32 {
 	for i, v := range out {
 		scaled[i] = float32((v - e.mean[i]) / e.scale[i])
 	}
+
+	// Neutralize the wall-clock offset features (see file header): z = 0
+	// feeds the scaler mean, keeping a long-lived pod inside the model's
+	// trained input distribution regardless of uptime.
+	scaled[idxOffsetMs] = 0
+	scaled[idxOffsetFromWorkload] = 0
 	return scaled
 }
 

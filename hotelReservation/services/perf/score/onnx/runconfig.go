@@ -6,17 +6,18 @@
 // This package owns:
 //
 //	runconfig.go          // trainer-emitted run config parsed at startup
-//	feature_extractor.go  // gru_v2 recipe, ported from scenario_onnx_go.go
+//	feature_extractor.go  // gru_v3 recipe, ported from scenario_onnx_go.go
 //	ring.go               // bounded sequence buffer
 //	session.go            // ORT init + NewAdvancedSession + Run
 //	model.go              // glue: ring + extractor + session -> Push()
 //
 // The deployment contract is the trainer's own: gru_train.py finishes a
 // run by writing gru_config_run{N}.json with the fitted StandardScaler,
-// the service one-hot vocabulary, and n_features. The same file drives
-// the colleague's reference client (scenario_onnx_go.go::loadRunConfig);
-// this package reads the identical format so the trainer ships exactly
-// two artifacts per run: the .onnx and its run config.
+// the service vocabulary (+ its encoding discriminator), and n_features.
+// The same file drives the colleague's reference client
+// (scenario_onnx_go.go::loadRunConfig); this package reads the identical
+// format so the trainer ships exactly two artifacts per run: the .onnx
+// and its run config.
 package onnx
 
 import (
@@ -25,16 +26,23 @@ import (
 	"os"
 )
 
-// unknownService is the catch-all one-hot bucket. build_service_vocab in
+// unknownService is the catch-all vocab bucket. build_service_vocab in
 // gru_train.py always appends it last, so a service name unseen at
-// training time maps to the final vocab slot instead of failing.
+// training time maps to the final vocab index instead of failing.
 const unknownService = "__unknown__"
 
-// gruV2FixedFeatures is the number of features the gru_v2 recipe
-// produces before the service one-hot: 67 log1p'd raw values + 5
-// derived ratios. Total model input width = gruV2FixedFeatures +
-// len(ServiceVocab). See feature_extractor.go for the full layout.
-const gruV2FixedFeatures = 72
+// serviceEncodingScalarIndex is the only service encoding this binary
+// implements (commit a07a375's "model fixed size"): the service name is
+// a SINGLE scalar feature — its integer index in service_vocab — so the
+// input width is fixed at gruV3NFeatures regardless of vocab size.
+// Legacy one-hot configs (no service_encoding field) had a variable
+// width (72 + len(vocab)) and are rejected with a pointed error.
+const serviceEncodingScalarIndex = "scalar_index"
+
+// gruV3NFeatures mirrors N_FEATURES_FIXED in gru_train.py: 67 log1p'd
+// raw values + 1 service-index scalar + 5 derived ratios = 73. See
+// feature_extractor.go for the full layout.
+const gruV3NFeatures = 73
 
 // RunConfig is the parsed trainer-emitted run config
 // (gru_config_run{N}.json AFTER training; the pre-training template with
@@ -47,9 +55,10 @@ type RunConfig struct {
 			SequenceLength int `json:"sequence_length"`
 		} `json:"model"`
 	} `json:"config"`
-	NFeatures    int      `json:"n_features"`
-	ServiceVocab []string `json:"service_vocab"`
-	Scaler       struct {
+	NFeatures       int      `json:"n_features"`
+	ServiceVocab    []string `json:"service_vocab"`
+	ServiceEncoding string   `json:"service_encoding"` // must be "scalar_index"
+	Scaler          struct {
 		Mean  []float64 `json:"mean"`
 		Scale []float64 `json:"scale"`
 	} `json:"scaler"`
@@ -87,11 +96,21 @@ func (rc *RunConfig) Validate() error {
 	if rc.ServiceVocab[len(rc.ServiceVocab)-1] != unknownService {
 		return fmt.Errorf("service_vocab must end with %q (got %v)", unknownService, rc.ServiceVocab)
 	}
-	if want := gruV2FixedFeatures + len(rc.ServiceVocab); rc.NFeatures != want {
-		return fmt.Errorf("n_features=%d does not match gru_v2 recipe (%d fixed + %d vocab = %d); "+
-			"if the trainer changed the feature set, the Go extractor must change in lockstep "+
-			"and the trainer should add a feature-set discriminator field to the run config",
-			rc.NFeatures, gruV2FixedFeatures, len(rc.ServiceVocab), want)
+	switch rc.ServiceEncoding {
+	case serviceEncodingScalarIndex:
+		// expected
+	case "":
+		return fmt.Errorf("config has no service_encoding field -- this looks like a " +
+			"legacy one-hot config (pre-a07a375), which this binary does not support; " +
+			"retrain with the updated gru_train.py")
+	default:
+		return fmt.Errorf("unsupported service_encoding %q (this binary only supports %q)",
+			rc.ServiceEncoding, serviceEncodingScalarIndex)
+	}
+	if rc.NFeatures != gruV3NFeatures {
+		return fmt.Errorf("n_features=%d does not match the fixed scalar_index recipe width %d; "+
+			"if the trainer changed the feature set, the Go extractor must change in lockstep",
+			rc.NFeatures, gruV3NFeatures)
 	}
 	if len(rc.Scaler.Mean) != rc.NFeatures || len(rc.Scaler.Scale) != rc.NFeatures {
 		return fmt.Errorf("scaler mean/scale lengths (%d/%d) do not match n_features (%d)",

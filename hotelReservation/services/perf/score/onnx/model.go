@@ -34,7 +34,7 @@ type Model struct {
 	rc        *RunConfig
 	session   *Session
 	ring      *Ring
-	extractor *extractorV2
+	extractor *extractorV3
 	logger    zerolog.Logger
 
 	inferErrors uint64
@@ -53,7 +53,7 @@ func NewModel(cfg ModelConfig, logger zerolog.Logger) (*Model, error) {
 		return nil, fmt.Errorf("window interval must be > 0 (got %v)", cfg.WindowIntervalMs)
 	}
 
-	extractor, vocabMiss := newExtractorV2(rc, cfg.ServiceName, cfg.WindowIntervalMs)
+	extractor, vocabMiss := newExtractorV3(rc, cfg.ServiceName, cfg.WindowIntervalMs)
 	if vocabMiss {
 		// Loud by design: an unnoticed fallback to __unknown__ would
 		// silently degrade every prediction for the pod's lifetime.
@@ -61,7 +61,7 @@ func NewModel(cfg ModelConfig, logger zerolog.Logger) (*Model, error) {
 			Str("event", "score_onnx_vocab_miss").
 			Str("service", cfg.ServiceName).
 			Strs("service_vocab", rc.ServiceVocab).
-			Msg("service name not in model vocab; one-hot falls back to __unknown__ -- " +
+			Msg("service name not in model vocab; service index falls back to __unknown__ -- " +
 				"predictions will be degraded; check ServiceName vs the trainer's vocab")
 	}
 
