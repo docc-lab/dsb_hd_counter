@@ -7,14 +7,21 @@
 // services/perf/score (the publisher packages need perf.Sample, so
 // services/perf can't depend on them in turn).
 //
-// Env knobs controlled here (defaults match the design plan, section 8.1):
+// Env knobs controlled here:
 //
 //	GORDION_SCORE_PORT             - ContentionStream listen port; default 7900.
 //	GORDION_INSTRUMENTATION_PORT   - InstrumentationStream listen port; default 7901; 0 disables.
 //	GORDION_SUBSCRIBER_BUFFER      - per-subscriber bounded chan depth; default 64.
 //	GORDION_SCORE_LOG              - "true"/"false"; emit one info log per ScoreEvent. Default true.
 //	GORDION_INSTRUMENTATION_LOG    - "true"/"false"; emit one debug log per Sample. Default false.
-//	GORDION_SCORE_SOURCE           - "onnx" (default when GORDION_MODEL is set), "none", or future kinds.
+//	GORDION_SCORE_SOURCE           - "gordion" (default when the gordion config file exists),
+//	                                 "none", or a registered comparator kind. "onnx" is a
+//	                                 deprecated alias for gordion-with-prediction.
+//	GORDION_CONFIG                 - gordion scorer config JSON; default /etc/gordion/gordion.json.
+//	GORDION_MODEL                  - .onnx path; presence enables prediction-ON.
+//	GORDION_MODEL_CONFIG           - trainer-emitted run config JSON; default /etc/gordion/model-config.json.
+//	GORDION_LIBONNXRUNTIME         - libonnxruntime.so path (prediction-ON only).
+//	GORDION_INFLIGHT_DEPTH         - sampler->scorer channel depth; default 16.
 package stage3wire
 
 import (
@@ -24,9 +31,63 @@ import (
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/instrumentation"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/score"
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/score/gordion"
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/score/onnx"
 	"github.com/rs/zerolog"
 )
+
+// sourceBuilder constructs one score.Source kind. Comparator algorithms
+// (FIRM p50/p90 ratio, CPI signal, slowdown ratio, MAD z-score, SLO
+// burn rate) slot in by adding one entry to sourceBuilders -- they
+// receive the same deps and read their own env/config.
+type sourceBuilder func(serviceName string, pub *score.Publisher, logger zerolog.Logger) (score.Source, error)
+
+// sourceBuilders is the score-source registry keyed by
+// GORDION_SCORE_SOURCE. "none" and the deprecated "onnx" alias are
+// handled in Setup before the registry lookup.
+var sourceBuilders = map[string]sourceBuilder{
+	"gordion": buildGordion,
+}
+
+// buildGordion wires the Gordion formula source, attaching the ONNX
+// prediction model when GORDION_MODEL is set. Model construction
+// failure degrades to prediction-off (logged) -- scoring must not be
+// lost because a model artifact is broken.
+func buildGordion(serviceName string, pub *score.Publisher, logger zerolog.Logger) (score.Source, error) {
+	inflight, err := strconv.Atoi(envOrDefault("GORDION_INFLIGHT_DEPTH", "16"))
+	if err != nil || inflight <= 0 {
+		inflight = 16
+	}
+
+	var model *onnx.Model
+	if modelPath := os.Getenv("GORDION_MODEL"); modelPath != "" {
+		windowMs, err := strconv.ParseFloat(envOrDefault("WINDOW_INTERVAL_MS", "100"), 64)
+		if err != nil || windowMs <= 0 {
+			windowMs = 100
+		}
+		model, err = onnx.NewModel(onnx.ModelConfig{
+			ServiceName:      serviceName,
+			ModelPath:        modelPath,
+			RunConfigPath:    envOrDefault("GORDION_MODEL_CONFIG", "/etc/gordion/model-config.json"),
+			LibOnnxRuntime:   envOrDefault("GORDION_LIBONNXRUNTIME", "/usr/lib/libonnxruntime.so"),
+			WindowIntervalMs: windowMs,
+		}, logger)
+		if err != nil {
+			logger.Warn().Err(err).
+				Str("event", "stage3_prediction_disabled").
+				Str("model_path", modelPath).
+				Msg("ONNX model construction failed; continuing in prediction-OFF mode")
+			model = nil
+		}
+	}
+
+	return gordion.New(gordion.SourceConfig{
+		ServiceName:   serviceName,
+		ConfigPath:    envOrDefault("GORDION_CONFIG", "/etc/gordion/gordion.json"),
+		Model:         model,
+		InflightDepth: inflight,
+	}, pub, logger)
+}
 
 // Wireup carries handles to every Stage 3 component constructed by Setup.
 // Callers Close on shutdown; the gRPC servers are stopped gracefully and
@@ -38,7 +99,7 @@ type Wireup struct {
 	instGRPC  *instrumentation.GRPCSink // nil if GORDION_INSTRUMENTATION_PORT=0
 	scoreGRPC *score.GRPCSink
 
-	// Source is the configured score.Source (e.g. onnx.Predictor). nil
+	// Source is the configured score.Source (e.g. gordion.Source). nil
 	// when GORDION_SCORE_SOURCE is "none" / unset / unknown.
 	Source score.Source
 }
@@ -95,51 +156,50 @@ func Setup(serviceName string, sampler perf.WindowedSampler, logger zerolog.Logg
 			Msg("GORDION_INSTRUMENTATION_PORT=0; skipping InstrumentationStream listener")
 	}
 
-	// Score source selection. Empty / "none" -> no score source
-	// constructed; the score side runs gRPC + log sinks but emits no
-	// events. Anything else picks a concrete impl; we currently ship
-	// "onnx" (default when GORDION_MODEL is set).
+	// Score source selection. Empty defaults to "gordion" when the
+	// gordion config file exists (mounted ConfigMap or baked into the
+	// image); "none" (or a missing config) runs the gRPC + log sinks
+	// with no events. The deprecated "onnx" value predates the two-mode
+	// design and now means gordion-with-prediction.
 	srcKind := os.Getenv("GORDION_SCORE_SOURCE")
-	if srcKind == "" && os.Getenv("GORDION_MODEL") != "" {
-		srcKind = "onnx"
+	gordionCfgPath := envOrDefault("GORDION_CONFIG", "/etc/gordion/gordion.json")
+	if srcKind == "" {
+		if _, err := os.Stat(gordionCfgPath); err == nil {
+			srcKind = "gordion"
+		}
 	}
+	if srcKind == "onnx" {
+		logger.Warn().
+			Str("event", "stage3_score_source_deprecated").
+			Msg("GORDION_SCORE_SOURCE=onnx is deprecated; treating as \"gordion\" " +
+				"(prediction enabled by GORDION_MODEL). Update the deployment env.")
+		srcKind = "gordion"
+	}
+
 	switch srcKind {
 	case "", "none":
 		logger.Info().
 			Str("event", "stage3_score_source_disabled").
 			Msg("no score source configured; ScorePub will fan no events to subscribers")
-	case "onnx":
-		inflight, err := strconv.Atoi(envOrDefault("GORDION_INFLIGHT_DEPTH", "16"))
-		if err != nil || inflight <= 0 {
-			inflight = 16
-		}
-		cfg := onnx.Config{
-			ServiceName:    serviceName,
-			ModelPath:      envOrDefault("GORDION_MODEL", ""),
-			ShortlistPath:  envOrDefault("GORDION_SHORTLIST", "/etc/gordion/shortlist.json"),
-			LibOnnxRuntime: envOrDefault("GORDION_LIBONNXRUNTIME", "/usr/lib/libonnxruntime.so"),
-			InflightDepth:  inflight,
-		}
-		if cfg.ModelPath == "" {
-			logger.Warn().
-				Str("event", "stage3_score_source_disabled").
-				Msg("GORDION_SCORE_SOURCE=onnx but GORDION_MODEL is unset; skipping ONNX source")
-		} else {
-			pred, err := onnx.New(cfg, w.ScorePub, logger)
-			if err != nil {
-				logger.Warn().Err(err).
-					Str("event", "stage3_score_source_failed").
-					Msg("ONNX predictor construction failed; continuing without score source")
-			} else {
-				w.Source = pred
-				w.InstPub.Register(pred)
-			}
-		}
 	default:
-		logger.Warn().
-			Str("event", "stage3_score_source_unknown").
-			Str("kind", srcKind).
-			Msg("unknown GORDION_SCORE_SOURCE value; skipping score source")
+		build, ok := sourceBuilders[srcKind]
+		if !ok {
+			logger.Warn().
+				Str("event", "stage3_score_source_unknown").
+				Str("kind", srcKind).
+				Msg("unknown GORDION_SCORE_SOURCE value; skipping score source")
+			break
+		}
+		src, err := build(serviceName, w.ScorePub, logger)
+		if err != nil {
+			logger.Warn().Err(err).
+				Str("event", "stage3_score_source_failed").
+				Str("kind", srcKind).
+				Msg("score source construction failed; continuing without score source")
+		} else {
+			w.Source = src
+			w.InstPub.Register(src)
+		}
 	}
 
 	// Hand the publisher to the sampler. After this point, every

@@ -1,13 +1,27 @@
-# Online predictor image template (Stage 3).
+# Online predictor image template (Stage 3, prediction-ON mode).
 #
 # Builds a per-service image with the gRPC service binary plus an in-pod
-# windowed sampler + ONNX score source baked in. This Dockerfile is the
-# Stage 3 superset of what --mode-windowed previously produced: it builds
-# all the perf C libraries (perf_api, perf_api_windowed, msr_reader),
-# links them into the Go binary, AND adds libonnxruntime + the
-# per-service .onnx/shortlist artifacts. ENABLE_WINDOWED_SAMPLING is set
-# by default so the sampler boots, which is what the stage3wire wire-up
-# in cmd/<svc>/main.go gates on.
+# windowed sampler + Gordion score source + ONNX prediction model baked
+# in. This Dockerfile is the Stage 3 superset of what --mode-windowed
+# previously produced: it builds all the perf C libraries (perf_api,
+# perf_api_windowed, msr_reader), links them into the Go binary, AND
+# adds libonnxruntime + the per-service .onnx/run-config artifacts.
+# ENABLE_WINDOWED_SAMPLING is set by default so the sampler boots, which
+# is what the stage3wire wire-up in cmd/<svc>/main.go gates on.
+#
+# PREDICTION-OFF deployments do NOT need this image: the Gordion formula
+# source has no ONNX dependency at runtime, so any windowed-sampling
+# image works -- just mount the gordion config (see below) and leave
+# GORDION_MODEL unset.
+#
+# The Gordion scorer's calibration (gordion.json + the stage-1
+# curve.csv) is NOT baked here: mount it as a ConfigMap at
+# /etc/gordion-conf/ (a separate path so the volume does not shadow the
+# baked /etc/gordion/ model files) so baselines can be recalibrated
+# without an image rebuild:
+#
+#   kubectl create configmap gordion-${SVC} \
+#       --from-file=gordion.json --from-file=curve.csv
 #
 # Use this image for any service that has been wired through
 # stage3wire.Setup. Service mains that haven't been wired yet still
@@ -19,8 +33,10 @@
 #   ONNX_RT_VER  - ONNX Runtime version; pinned to 1.18.0
 #
 # Inputs (must exist at build time, relative to build context):
-#   artifacts/${SVC}.onnx              trained model
-#   artifacts/${SVC}-shortlist.json    metadata-only shortlist
+#   artifacts/${SVC}.onnx           trained model
+#   artifacts/${SVC}-config.json    trainer-emitted run config
+#                                   (post-training gru_config_run{N}.json
+#                                   with n_features/service_vocab/scaler)
 #
 # Build:
 #   docker build -t gordion-online-search:v1.0 \
@@ -117,9 +133,9 @@ COPY --from=base-build /workspace/build/${SVC} /usr/local/bin/${SVC}
 COPY --from=base-build /workspace/config.json /config.json
 RUN chmod +x /usr/local/bin/${SVC}
 
-# Per-service Stage 3 artifacts (model + shortlist).
-COPY artifacts/${SVC}.onnx              /etc/gordion/model.onnx
-COPY artifacts/${SVC}-shortlist.json    /etc/gordion/shortlist.json
+# Per-service Stage 3 artifacts (model + trainer run config).
+COPY artifacts/${SVC}.onnx           /etc/gordion/model.onnx
+COPY artifacts/${SVC}-config.json    /etc/gordion/model-config.json
 
 # /data is where windowed_sampler.go's writeRunData drops Stage 2 JSON
 # dumps. World-writable so rootless container modes still work.
@@ -138,11 +154,15 @@ ENV ENABLE_WINDOWED_SAMPLING=true \
     CPU_SET=0,1,2 \
     OUTPUT_DIR=/data
 
-# Stage 3 online-predictor env defaults; cmd/internal/stage3wire/setup.go reads these.
+# Stage 3 env defaults; cmd/internal/stage3wire/setup.go reads these.
+# GORDION_CONFIG points into the ConfigMap mount (see header); the
+# Deployment can override GORDION_MODEL="" to run this image in
+# prediction-OFF mode.
 ENV GORDION_MODEL=/etc/gordion/model.onnx \
-    GORDION_SHORTLIST=/etc/gordion/shortlist.json \
+    GORDION_MODEL_CONFIG=/etc/gordion/model-config.json \
+    GORDION_CONFIG=/etc/gordion-conf/gordion.json \
     GORDION_LIBONNXRUNTIME=/usr/lib/libonnxruntime.so \
-    GORDION_SCORE_SOURCE=onnx \
+    GORDION_SCORE_SOURCE=gordion \
     GORDION_SCORE_PORT=7900 \
     GORDION_INSTRUMENTATION_PORT=7901 \
     GORDION_INFLIGHT_DEPTH=16 \

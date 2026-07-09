@@ -20,12 +20,14 @@ show_usage() {
     echo "  • Applies updated deployments to Kubernetes"
     echo ""
     echo "Options:"
-    echo "  --mode-online          Stage 3: windowed sampling + in-pod ONNX online predictor."
-    echo "                         Strict superset of --mode-windowed (also builds the perf"
-    echo "                         counter and MSR libs and links them into the binary)."
-    echo "                         Uses Dockerfile.online. Requires artifacts/<svc>.onnx +"
-    echo "                         artifacts/<svc>-shortlist.json checked in beside the build."
-    echo "                         (Recommended for any service wired through stage3wire.Setup.)"
+    echo "  --mode-online          Stage 3 prediction-ON: windowed sampling + Gordion scorer"
+    echo "                         + in-pod ONNX predictor. Strict superset of --mode-windowed"
+    echo "                         (also builds the perf counter and MSR libs and links them"
+    echo "                         into the binary). Uses Dockerfile.online. Requires"
+    echo "                         artifacts/<svc>.onnx + artifacts/<svc>-config.json (the"
+    echo "                         trainer-emitted run config) checked in beside the build."
+    echo "                         Prediction-OFF (Gordion formula only) needs no model:"
+    echo "                         use --mode-windowed + the gordion ConfigMap instead."
     echo ""
     echo "  --mode-windowed        Windowed sampling only (timing + perf counters), no ONNX"
     echo "                         predictor. Use this when you don't have a trained model"
@@ -266,14 +268,15 @@ build_and_push_docker() {
         if [[ "$ONLINE_MODE" == "true" ]]; then
             # Stage 3 online predictor: use the static Dockerfile.online with
             # SVC build arg. Requires artifacts/${service}.onnx and
-            # artifacts/${service}-shortlist.json to exist relative to the
-            # build context (i.e. cwd = hotelReservation).
+            # artifacts/${service}-config.json (the POST-training
+            # gru_config_run{N}.json with n_features/service_vocab/scaler)
+            # to exist relative to the build context (cwd = hotelReservation).
             if [[ ! -f "artifacts/${service}.onnx" ]]; then
-                log_error "Missing artifacts/${service}.onnx; copy the trained model into artifacts/ before building (see STAGE3.md)"
+                log_error "Missing artifacts/${service}.onnx; copy the trained model into artifacts/ before building (see STAGE3-predictor.md)"
                 return 1
             fi
-            if [[ ! -f "artifacts/${service}-shortlist.json" ]]; then
-                log_error "Missing artifacts/${service}-shortlist.json; check that the per-service shortlist is in artifacts/"
+            if [[ ! -f "artifacts/${service}-config.json" ]]; then
+                log_error "Missing artifacts/${service}-config.json; copy the trainer-emitted run config (post-training gru_config_run{N}.json) into artifacts/"
                 return 1
             fi
 
@@ -710,7 +713,7 @@ fi
 
 log_info "Deploying services: ${services_to_deploy[*]} with tag: $tag"
 if [[ "$ONLINE_MODE" == "true" ]]; then
-    log_info "Stage 3 online mode enabled - building per-service images via Dockerfile.online (libonnxruntime + .onnx + shortlist baked in)"
+    log_info "Stage 3 online mode enabled - building per-service images via Dockerfile.online (libonnxruntime + .onnx + trainer run config baked in)"
 elif [[ "$WINDOWED_MODE" == "true" ]]; then
     log_info "Windowed sampling mode enabled - building service-specific images with perf counters"
 elif [[ "$TIMING_MODE" == "true" ]]; then

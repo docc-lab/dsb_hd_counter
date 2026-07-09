@@ -354,7 +354,8 @@ deploy_victim() {
     # below (mount + privileged + AppArmor + CAP_SYS_RAWIO), this restores the
     # full GORDION setup for whichever service is selected as the victim.
     kubectl set env "deployment/$VICTIM_DEPLOYMENT" \
-        "ENABLE_WINDOWED_SAMPLING=true" "GORDION_SCORE_SOURCE=${VICTIM_SCORE_SOURCE:-onnx}" \
+        "ENABLE_WINDOWED_SAMPLING=true" "GORDION_SCORE_SOURCE=${VICTIM_SCORE_SOURCE:-gordion}" \
+        "GORDION_CONFIG=${VICTIM_GORDION_CONFIG:-/etc/gordion-conf/gordion.json}" \
         >/dev/null 2>&1 \
         || s3_log "WARNING: failed to set instrumentation env on $VICTIM_DEPLOYMENT"
 
