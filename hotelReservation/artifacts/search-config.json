@@ -1,14 +1,14 @@
 {
  "_comment": [
-  "APPROXIMATED run config for the committed gru_model_run1.onnx (blob 9357ea3).",
-  "The trainer-emitted original was lost; service_vocab was deduced from",
-  "gru_train.py's manual_test_files and the scaler was re-fit on the committed",
-  "labeled test file (run_data_iter1_ready.json) using ONLINE-style extraction",
-  "(error_count=0, offset_from_workload_ms=0) to match the Go gru_v2 extractor.",
-  "Measured quality on that file's 810 labeled sequences: pearson r=0.917,",
-  "RMSE=0.153, prediction bias +0.12 (mean 0.386 vs label mean 0.267).",
-  "USE AS A TREND SIGNAL; calibrate absolute thresholds on the observed stream.",
-  "Replace with a trainer-emitted config when a new training run ships."
+  "APPROXIMATED run config for gru_model_run1.onnx @ a07a375 'model fixed size'",
+  "(input [batch,20,73], service_encoding scalar_index). The trainer-emitted",
+  "config was again not committed; service_vocab deduced from gru_train.py's",
+  "manual_test_files (unchanged), scaler re-fit on the committed labeled test",
+  "file with ONLINE-style gru_v3 extraction (error_count=0,",
+  "offset_from_workload_ms=0) matching the Go extractor, wall-clock offset",
+  "features neutralized. Measured on 810 labeled sequences: r=0.901,",
+  "RMSE=0.184, bias=+0.147. USE AS A TREND SIGNAL; supersede with a",
+  "trainer-emitted config when one ships."
  ],
  "run_id": 1,
  "config": {
@@ -19,12 +19,13 @@
    "dropout": 0.1
   }
  },
- "n_features": 75,
+ "n_features": 73,
  "service_vocab": [
   "profile",
   "search",
   "__unknown__"
  ],
+ "service_encoding": "scalar_index",
  "scaler": {
   "mean": [
    14.982398099,
@@ -94,9 +95,7 @@
    11.612707305,
    0.0,
    4.615120517,
-   0.0,
    1.0,
-   0.0,
    1.364875758,
    0.090808684,
    0.016853711,
@@ -172,20 +171,18 @@
    1.0,
    0.0,
    1.0,
-   1.0,
-   1.0,
    0.190862432,
    0.081056137,
    0.00533417,
    0.00099679,
    0.325497725
   ],
-  "n_features_in": 75
+  "n_features_in": 73
  },
  "metrics": {
-  "approx_eval_pearson_r": 0.917,
-  "approx_eval_rmse": 0.153,
-  "approx_eval_pred_bias": 0.119
+  "approx_eval_pearson_r": 0.901,
+  "approx_eval_rmse": 0.184,
+  "approx_eval_pred_bias": 0.147
  },
- "timestamp": "2026-07-09 approx-scaler"
+ "timestamp": "2026-07-09 approx-scaler-v3"
 }

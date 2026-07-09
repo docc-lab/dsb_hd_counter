@@ -1,5 +1,5 @@
 {
- "_comment": "Golden parity fixture for the gru_v2 extractor. Samples are real windows from run_data_iter1_ready.json @ d38b8dd; expected vectors were computed offline with the trainer's exact recipe (gru_train.py::extract_features) using the synthetic scaler below and online-visible inputs only (error_count=0, offset_from_workload_ms=0, window_interval_ms=100).",
+ "_comment": "Golden parity fixture for the gru_v3 extractor (a07a375 'model fixed size': service as scalar index, n_features fixed at 73). Samples are real windows from run_data_iter1_ready.json; expected vectors computed offline with the trainer's exact recipe using the synthetic scaler below and online-visible inputs (error_count=0, offset_from_workload_ms=0, window_interval_ms=100), wall-clock offset features (indices 64, 65) neutralized to z=0 post-standardization.",
  "service_name": "search",
  "window_interval_ms": 100.0,
  "run_config": {
@@ -9,12 +9,13 @@
     "sequence_length": 20
    }
   },
-  "n_features": 75,
+  "n_features": 73,
   "service_vocab": [
    "profile",
    "search",
    "__unknown__"
   ],
+  "service_encoding": "scalar_index",
   "scaler": {
    "mean": [
     0.0,
@@ -89,9 +90,7 @@
     1.5,
     0.0,
     0.25,
-    0.5,
-    0.75,
-    1.0
+    0.5
    ],
    "scale": [
     1.0,
@@ -166,9 +165,7 @@
     1.69,
     1.7000000000000002,
     1.71,
-    1.72,
-    1.73,
-    1.74
+    1.72
    ]
   },
   "timestamp": "2026-07-09 00:00:00"
@@ -493,17 +490,15 @@
    1.3248456212196038,
    3.8787904914946005,
    0.0,
-   6.663370817153468,
-   -0.30303030303030304,
+   0.0,
+   0.0,
    2.328385853518831,
-   -0.5988023952095809,
-   -0.1488095238095238,
-   -0.8875739644970414,
-   0.9300895152351167,
-   -0.1355227441949768,
-   -0.2800283990873924,
-   -0.4325271293784527,
-   -0.411154836506959
+   0.0,
+   0.1971143904164873,
+   -0.8767715340671067,
+   0.010794796217461803,
+   -0.145188265394575,
+   -0.12523803228029576
   ],
   [
    14.275896838412162,
@@ -570,17 +565,15 @@
    1.973871164545635,
    3.8787904914946005,
    0.0,
-   6.7438433644220925,
-   -0.30303030303030304,
+   0.0,
+   0.0,
    2.328385853518831,
-   -0.5988023952095809,
-   -0.1488095238095238,
-   -0.8875739644970414,
-   0.7225221940965679,
-   -0.046193601042002,
-   -0.2833430769519741,
-   -0.43350553029364924,
-   -0.09909152734452431
+   0.0,
+   -0.012923970259425186,
+   -0.7863852412910197,
+   0.0074411221427085825,
+   -0.14617810959532934,
+   0.1904539200119347
   ],
   [
    15.257584883298815,
@@ -647,17 +640,15 @@
    1.2471843696459055,
    3.8787904914946005,
    0.0,
-   6.987055984570179,
-   -0.30303030303030304,
+   0.0,
+   0.0,
    2.328385853518831,
-   -0.5988023952095809,
-   -0.1488095238095238,
-   -0.8875739644970414,
-   0.8655855220027004,
-   -0.1296653021544197,
-   -0.2823920103051935,
-   -0.4330020428092343,
-   -0.4310538623936407
+   0.0,
+   0.13184249250273264,
+   -0.870844773185833,
+   0.008403377808863004,
+   -0.14566873336840666,
+   -0.14536844218891554
   ]
  ]
 }

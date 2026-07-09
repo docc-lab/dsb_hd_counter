@@ -9,7 +9,7 @@ import (
 	"github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 )
 
-// parityFixture mirrors testdata/gru_v2_parity.json: real training
+// parityFixture mirrors testdata/gru_v3_parity.json: real training
 // windows + expected feature vectors computed offline with the
 // trainer's exact recipe (gru_train.py::extract_features) under
 // online-visible inputs (error_count=0, offset_from_workload_ms=0).
@@ -27,7 +27,7 @@ type parityFixture struct {
 
 func loadParityFixture(t *testing.T) *parityFixture {
 	t.Helper()
-	data, err := os.ReadFile("testdata/gru_v2_parity.json")
+	data, err := os.ReadFile("testdata/gru_v3_parity.json")
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
@@ -44,10 +44,10 @@ func loadParityFixture(t *testing.T) *parityFixture {
 	return &fx
 }
 
-func TestGruV2GoldenParity(t *testing.T) {
+func TestGruV3GoldenParity(t *testing.T) {
 	fx := loadParityFixture(t)
 
-	ex, vocabMiss := newExtractorV2(&fx.RunConfig, fx.ServiceName, fx.WindowIntervalMs)
+	ex, vocabMiss := newExtractorV3(&fx.RunConfig, fx.ServiceName, fx.WindowIntervalMs)
 	if vocabMiss {
 		t.Fatalf("fixture service %q unexpectedly not in vocab %v", fx.ServiceName, fx.RunConfig.ServiceVocab)
 	}
@@ -77,35 +77,34 @@ func TestGruV2GoldenParity(t *testing.T) {
 	}
 }
 
-// TestGruV2VocabFallback verifies the loud-fallback contract: a service
+// TestGruV3VocabFallback verifies the loud-fallback contract: a service
 // name missing from the vocab maps to the last (__unknown__) slot and
 // is reported so the caller can warn.
-func TestGruV2VocabFallback(t *testing.T) {
+func TestGruV3VocabFallback(t *testing.T) {
 	fx := loadParityFixture(t)
 
-	ex, vocabMiss := newExtractorV2(&fx.RunConfig, "not-a-real-service", fx.WindowIntervalMs)
+	ex, vocabMiss := newExtractorV3(&fx.RunConfig, "not-a-real-service", fx.WindowIntervalMs)
 	if !vocabMiss {
 		t.Fatal("expected vocabMiss=true for a name outside the vocab")
 	}
-	if ex.oneHotIdx != len(fx.RunConfig.ServiceVocab)-1 {
-		t.Fatalf("fallback one-hot index = %d, want last slot %d",
-			ex.oneHotIdx, len(fx.RunConfig.ServiceVocab)-1)
+	if want := float64(len(fx.RunConfig.ServiceVocab) - 1); ex.svcIndex != want {
+		t.Fatalf("fallback service index = %v, want last slot %v", ex.svcIndex, want)
 	}
 
 	// Explicit __unknown__ is a legitimate configuration, not a miss.
-	_, miss := newExtractorV2(&fx.RunConfig, unknownService, fx.WindowIntervalMs)
+	_, miss := newExtractorV3(&fx.RunConfig, unknownService, fx.WindowIntervalMs)
 	if miss {
 		t.Fatal("explicit __unknown__ must not be reported as a vocab miss")
 	}
 }
 
-// TestGruV2NilTimingWindow: the first window can arrive before the
+// TestGruV3NilTimingWindow: the first window can arrive before the
 // timing aggregator has emitted; the extractor must produce a full
 // vector of the right length with zeros in the timing groups (matching
 // the trainer's _safe(None)=0 path), not panic.
-func TestGruV2NilTimingWindow(t *testing.T) {
+func TestGruV3NilTimingWindow(t *testing.T) {
 	fx := loadParityFixture(t)
-	ex, _ := newExtractorV2(&fx.RunConfig, fx.ServiceName, fx.WindowIntervalMs)
+	ex, _ := newExtractorV3(&fx.RunConfig, fx.ServiceName, fx.WindowIntervalMs)
 
 	got := ex.Extract(perf.Sample{})
 	if len(got) != fx.RunConfig.NFeatures {
@@ -131,16 +130,26 @@ func TestRunConfigValidate(t *testing.T) {
 	// Vocab not ending in __unknown__.
 	bad := fx.RunConfig
 	bad.ServiceVocab = []string{"search", "profile"}
-	bad.NFeatures = gruV2FixedFeatures + 2
 	if err := bad.Validate(); err == nil {
 		t.Fatal("vocab without trailing __unknown__ must fail validation")
 	}
 
-	// n_features inconsistent with recipe.
+	// Missing / legacy service_encoding (pre-a07a375 one-hot config).
 	bad = fx.RunConfig
-	bad.NFeatures = fx.RunConfig.NFeatures + 1
+	bad.ServiceEncoding = ""
 	if err := bad.Validate(); err == nil {
-		t.Fatal("n_features != 72+len(vocab) must fail validation")
+		t.Fatal("missing service_encoding must fail validation (legacy one-hot config)")
+	}
+	bad.ServiceEncoding = "one_hot"
+	if err := bad.Validate(); err == nil {
+		t.Fatal("unsupported service_encoding must fail validation")
+	}
+
+	// n_features inconsistent with the fixed recipe width.
+	bad = fx.RunConfig
+	bad.NFeatures = gruV3NFeatures + 1
+	if err := bad.Validate(); err == nil {
+		t.Fatal("n_features != 73 must fail validation")
 	}
 
 	// Scaler length mismatch.
