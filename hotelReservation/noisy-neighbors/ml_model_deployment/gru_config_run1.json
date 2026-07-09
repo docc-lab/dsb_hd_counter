@@ -1,13 +1,13 @@
 {
   "model": {
-    "sequence_length": 50,
+    "sequence_length": 20,
     "hidden_size": 64,
     "num_layers": 1,
     "dropout": 0.1
   },
   "training": {
-    "epochs": 100,
-    "batch_size": 64,
+    "epochs": 5,
+    "batch_size": 256,
     "learning_rate": 0.001,
     "optimizer": "adam",
     "criterion": "mse",

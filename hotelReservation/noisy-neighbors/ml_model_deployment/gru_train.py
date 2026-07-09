@@ -3,17 +3,23 @@ gru_train.py
 ============
 GRU-based contention severity predictor.
   • Predicts:  p50_contention_score  [0, 1]  (regression only)
-  • Features:  all perf_counters (absolute) + all perf_deltas + full timing
-               percentiles + freq fields + derived ratios
+  • Features:  perf_counters (absolute) + perf_deltas + timing scalars
+               (incl. error_count) + full timing percentiles + freq fields +
+               sample offsets (offset_ms, offset_from_workload_ms,
+               window_interval_ms) + service_name (one-hot) + derived ratios
   • Outputs:   gru_model_run{N}.pth  +  gru_model_run{N}.onnx
                gru_model_best.pth    +  gru_model_best.onnx
+
+NOTE: p90_contention_score / pct_ext_50 / pct_ext_90 are present in the raw
+data but are intentionally NOT used as inputs (they are alternate score
+variants derived similarly to the label and could leak information) and are
+NOT used as targets — only p50_contention_score is predicted, per spec.
 """
 
-import sys
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -32,7 +38,6 @@ print(torch.version.git_version)
 # FEATURE EXTRACTION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# All keys that may appear in perf_counters / perf_deltas
 PERF_COUNTER_KEYS = [
     "LLC-load-misses",
     "LLC-loads",
@@ -46,7 +51,6 @@ PERF_COUNTER_KEYS = [
     "ref-cycles",
 ]
 
-# Latency distribution percentiles available in processing/total/blocking
 TIMING_PCT_KEYS = ["p50_ns", "p60_ns", "p70_ns", "p75_ns",
                    "p80_ns", "p90_ns", "p99_ns"]
 
@@ -54,9 +58,10 @@ TIMING_STAT_KEYS = ["min_ns", "max_ns", "mean_ns"] + TIMING_PCT_KEYS + ["count"]
 
 TIMING_SECTIONS = ["processing_time", "total_time", "blocking_time"]
 
-# freq sub-fields (numeric only)
 FREQ_KEYS = ["actual_freq_mhz", "current_max_mhz", "active_n",
              "freq_util_pct", "tsc_freq_mhz"]
+
+UNKNOWN_SERVICE = "__unknown__"
 
 
 def _safe(val, default=0.0) -> float:
@@ -68,55 +73,88 @@ def _safe(val, default=0.0) -> float:
         return default
 
 
-def extract_features(sample: Dict) -> np.ndarray:
+def build_service_vocab(files_samples: List[List[Dict]]) -> List[str]:
+    """Vocab is built ONLY from training data. Always ends with the
+    UNKNOWN_SERVICE bucket so unseen service names at val/test/inference
+    time map somewhere safely instead of raising."""
+    names = set()
+    for samples in files_samples:
+        for s in samples:
+            names.add(s.get("service_name", UNKNOWN_SERVICE) or UNKNOWN_SERVICE)
+    vocab = sorted(names)
+    if UNKNOWN_SERVICE in vocab:
+        vocab.remove(UNKNOWN_SERVICE)
+    vocab.append(UNKNOWN_SERVICE)
+    return vocab
+
+
+def _one_hot_service(name: str, vocab: List[str]) -> np.ndarray:
+    vec = np.zeros(len(vocab), dtype=np.float64)
+    idx = vocab.index(name) if name in vocab else len(vocab) - 1
+    vec[idx] = 1.0
+    return vec
+
+
+def extract_features(sample: Dict, service_vocab: List[str]) -> np.ndarray:
     """
-    Extract every numeric field from a sample into a 1-D feature vector.
+    Extract every relevant numeric/categorical field from a sample.
 
-    Feature groups (all log1p-transformed before StandardScaler):
-      1.  perf_counters  (absolute snapshot)       – 10 values
-      2.  perf_deltas    (inter-sample deltas)      – 10 values
-      3.  timing scalars (arrival/rps)              –  3 values
-      4.  timing distributions per section          –  3 × 11 = 33 values
-      5.  freq fields                               –  5 values
-      6.  derived ratios (no log1p on these)        –  5 values
-
-    Total: 66 features (derived ratios appended after log1p block).
+    Feature groups (groups 1-6 log1p-transformed before StandardScaler):
+      1.  perf_counters  (absolute snapshot)        – 10 values
+      2.  perf_deltas    (inter-sample deltas)       – 10 values
+      3.  timing scalars (arrival/rps/error_count)   –  5 values
+      4.  timing distributions per section           –  3 × 11 = 33 values
+      5.  freq fields                                –  6 values
+      6.  sample offsets / window interval           –  3 values
+      7.  service_name one-hot (NOT log1p'd)         –  len(service_vocab)
+      8.  derived ratios (NOT log1p'd)                –  5 values
     """
-    perf_c  = sample.get("perf_counters", {})
-    perf_d  = sample.get("perf_deltas",   {})
-    timing  = sample.get("timing_window", {})
-    freq    = sample.get("freq", {})
+    perf_c = sample.get("perf_counters", {})
+    perf_d = sample.get("perf_deltas", {})
+    timing = sample.get("timing_window", {})
+    freq   = sample.get("freq", {})
 
-    # ── group 1: perf_counters absolute ──────────────────────────────────────
+    # ── group 1: perf_counters absolute ─────────────────────────────────────
     g1 = [_safe(perf_c.get(k)) for k in PERF_COUNTER_KEYS]
 
-    # ── group 2: perf_deltas ──────────────────────────────────────────────────
+    # ── group 2: perf_deltas ─────────────────────────────────────────────────
     g2 = [_safe(perf_d.get(k)) for k in PERF_COUNTER_KEYS]
 
-    # ── group 3: arrival / rps ────────────────────────────────────────────────
+    # ── group 3: arrival / rps / errors ─────────────────────────────────────
     g3 = [
         _safe(timing.get("arrival_count")),
         _safe(timing.get("request_count")),
+        _safe(timing.get("error_count")),
         _safe(timing.get("arrival_rps_1s")),
         _safe(timing.get("arrival_rps_3s")),
     ]
 
-    # ── group 4: timing distributions ────────────────────────────────────────
+    # ── group 4: timing distributions ───────────────────────────────────────
     g4 = []
     for section in TIMING_SECTIONS:
         sec = timing.get(section, {})
         for k in TIMING_STAT_KEYS:
             g4.append(_safe(sec.get(k)))
 
-    # ── group 5: freq ─────────────────────────────────────────────────────────
+    # ── group 5: freq ────────────────────────────────────────────────────────
     g5 = [_safe(freq.get(k)) for k in FREQ_KEYS]
-    # turbo_on as binary
     g5.append(1.0 if freq.get("turbo_on") else 0.0)
 
-    # ── log1p on all the above ────────────────────────────────────────────────
-    raw_log = np.log1p(np.array(g1 + g2 + g3 + g4 + g5, dtype=np.float64))
+    # ── group 6: sample position / window info ──────────────────────────────
+    g6 = [
+        _safe(sample.get("offset_ms")),
+        _safe(sample.get("offset_from_workload_ms")),
+        _safe(sample.get("window_interval_ms")),
+    ]
 
-    # ── group 6: derived ratios (not log1p'd; already in [0,1] range) ─────────
+    # ── log1p on groups 1-6 ──────────────────────────────────────────────────
+    raw_log = np.log1p(np.array(g1 + g2 + g3 + g4 + g5 + g6, dtype=np.float64))
+
+    # ── group 7: service_name one-hot ───────────────────────────────────────
+    service_name = sample.get("service_name", UNKNOWN_SERVICE) or UNKNOWN_SERVICE
+    g7 = _one_hot_service(service_name, service_vocab)
+
+    # ── group 8: derived ratios ──────────────────────────────────────────────
     delta_cyc   = _safe(perf_d.get("cycles"))       + 1e-9
     delta_inst  = _safe(perf_d.get("instructions")) + 1e-9
     delta_llc_m = _safe(perf_d.get("LLC-load-misses")) + 1e-9
@@ -135,13 +173,7 @@ def extract_features(sample: Dict) -> np.ndarray:
     ratios = np.array([ipc, llc_mrate, br_mrate, dtlb_mrate, freq_util],
                       dtype=np.float64)
 
-    return np.concatenate([raw_log, ratios]).astype(np.float32)
-
-
-# report feature dimensionality once
-_DUMMY       = extract_features({})
-N_FEATURES   = len(_DUMMY)
-print(f"[feature extractor] {N_FEATURES} features per sample")
+    return np.concatenate([raw_log, g7, ratios]).astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -156,7 +188,7 @@ class ContentionDataset(Dataset):
     """
     def __init__(self, sequences: np.ndarray, labels: np.ndarray):
         self.sequences = torch.FloatTensor(sequences)
-        self.labels    = torch.FloatTensor(labels)   # (N,)
+        self.labels    = torch.FloatTensor(labels)
 
     def __len__(self):
         return len(self.sequences)
@@ -199,11 +231,11 @@ class GRUContentionPredictor(nn.Module):
         self.head = nn.Linear(hidden_size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gru_out, _ = self.gru(x)                          # (B, T, H)
-        mean_pool  = gru_out.mean(dim=1)                  # (B, H)
-        max_pool   = gru_out.max(dim=1).values            # (B, H)
-        pooled     = torch.cat([mean_pool, max_pool], dim=1)   # (B, 2H)
-        out        = self.head(self.neck(pooled)).squeeze(-1)   # (B,)
+        gru_out, _ = self.gru(x)
+        mean_pool  = gru_out.mean(dim=1)
+        max_pool   = gru_out.max(dim=1).values
+        pooled     = torch.cat([mean_pool, max_pool], dim=1)
+        out        = self.head(self.neck(pooled)).squeeze(-1)
         return out
 
 
@@ -225,25 +257,22 @@ class GRUTrainer:
 
         self.model  = None
         self.scaler = StandardScaler()
+        self.service_vocab: List[str] = [UNKNOWN_SERVICE]
+        self.n_features: int = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.use_amp     = (self.training_config.get('mixed_precision', False)
+        self.use_amp     = (self.training_config.get('mixed_precision', True)
                             and torch.cuda.is_available())
         self.grad_scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
 
-        print(f"Initialized GRU Trainer  (p50 regression only)")
-        print(f"  Device:         {self.device}")
-        print(f"  Features/step:  {N_FEATURES}")
+        print("Initialized GRU Trainer  (p50 regression only)")
+        print(f"  Device: {self.device}")
         if self.use_amp:
-            print(f"  Mixed precision: ENABLED")
+            print("  Mixed precision: ENABLED")
         self._print_config()
 
-    # ── config printing ────────────────────────────────────────────────────────
-
     def _print_config(self):
-        print(f"\n{'='*70}")
-        print("CONFIGURATION")
-        print(f"{'='*70}")
+        print(f"\n{'='*70}\nCONFIGURATION\n{'='*70}")
         for section in ('model', 'training', 'data'):
             print(f"\n{section.capitalize()}:")
             skip = {'optimizer_params', 'scheduler_params'}
@@ -259,13 +288,29 @@ class GRUTrainer:
     # ── file loading ───────────────────────────────────────────────────────────
 
     def load_from_file(self, filepath: str) -> List[Dict]:
+        """Loads a run file and injects file-level metadata
+        (service_name, window_interval_ms) into every sample so
+        extract_features can see them."""
         with open(filepath, 'r') as f:
             data = json.load(f)
+
         if isinstance(data, dict) and 'samples' in data:
-            return data['samples']
+            samples = data['samples']
+            service_name       = data.get('service_name', UNKNOWN_SERVICE)
+            window_interval_ms = data.get('window_interval_ms')
         elif isinstance(data, list):
-            return data
-        return [data]
+            samples = data
+            service_name, window_interval_ms = UNKNOWN_SERVICE, None
+        else:
+            samples = [data]
+            service_name       = data.get('service_name', UNKNOWN_SERVICE)
+            window_interval_ms = data.get('window_interval_ms')
+
+        for s in samples:
+            s.setdefault('service_name', service_name)
+            if window_interval_ms is not None:
+                s.setdefault('window_interval_ms', window_interval_ms)
+        return samples
 
     def load_multiple_files(self, filepaths: List[str]) -> List[List[Dict]]:
         out = []
@@ -282,26 +327,24 @@ class GRUTrainer:
 
     def prepare_sequences(self, files_samples: List[List[Dict]],
                           fit_scaler: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns
-        -------
-        X : (N, seq_len, n_features)   log1p + StandardScaler
-        y : (N,)                       p50_contention_score
-        """
         if fit_scaler:
-            all_feats = [extract_features(s)
+            self.service_vocab = build_service_vocab(files_samples)
+            all_feats = [extract_features(s, self.service_vocab)
                          for samples in files_samples for s in samples]
             self.scaler.fit(np.array(all_feats))
+            self.n_features = len(all_feats[0])
+            print(f"[feature extractor] {self.n_features} features/sample "
+                  f"({len(self.service_vocab)} service classes: {self.service_vocab})")
 
         all_seqs, all_labels = [], []
 
         for samples in files_samples:
-            feats  = np.array([extract_features(s) for s in samples])
-            labels = np.array([
-                float(s.get('p50_contention_score',
-                             s.get('contention_score', 0.0)))
-                for s in samples
-            ], dtype=np.float32)
+            feats = np.array([extract_features(s, self.service_vocab) for s in samples])
+            labels = np.array(
+                [float(s.get('p50_contention_score',
+                              s.get('contention_score', 0.0))) for s in samples],
+                dtype=np.float32,
+            )
 
             feats_scaled = self.scaler.transform(feats)
 
@@ -309,7 +352,7 @@ class GRUTrainer:
                 all_seqs.append(feats_scaled[i: i + self.sequence_length])
                 all_labels.append(labels[i + self.sequence_length])
 
-        return (np.array(all_seqs,   dtype=np.float32),
+        return (np.array(all_seqs, dtype=np.float32),
                 np.array(all_labels, dtype=np.float32))
 
     # ── optimiser / scheduler factories ───────────────────────────────────────
@@ -406,13 +449,10 @@ class GRUTrainer:
     # ── ONNX export ────────────────────────────────────────────────────────────
 
     def export_onnx(self, onnx_path: str):
-        """Export current model weights to ONNX (opset 14)."""
         self.model.eval()
-        seq_len    = self.sequence_length
-        dummy_input = torch.zeros(1, seq_len, N_FEATURES, device=self.device)
+        dummy_input = torch.zeros(1, self.sequence_length, self.n_features,
+                                  device=self.device)
 
-        # Move model to CPU for ONNX export (avoids CUDA device mismatch on
-        # machines that run inference CPU-only)
         cpu_model = self.model.cpu().eval()
         dummy_cpu = dummy_input.cpu()
 
@@ -430,7 +470,6 @@ class GRUTrainer:
                 'p50_score': {0: 'batch_size'},
             },
         )
-        # move model back to original device
         self.model.to(self.device)
         print(f"  ✓ ONNX model saved: {onnx_path}")
 
@@ -501,7 +540,6 @@ class GRUTrainer:
         torch.save(self.model.state_dict(), model_path)
         self.export_onnx(onnx_path)
 
-        # save scaler params alongside so inference can reconstruct it
         scaler_meta = {
             'mean':  self.scaler.mean_.tolist(),
             'scale': self.scaler.scale_.tolist(),
@@ -511,14 +549,15 @@ class GRUTrainer:
         cfg = {
             'run_id':        run_id,
             'config':        self.config,
-            'n_features':    N_FEATURES,
+            'n_features':    self.n_features,
+            'service_vocab': self.service_vocab,
             'scaler':        scaler_meta,
             'metrics': {
                 'p50_rmse': float(metrics['p50_rmse']),
                 'p50_mae':  float(metrics['p50_mae']),
                 'p50_r2':   float(metrics['p50_r2']),
-                'rmse':     float(metrics['p50_rmse']),  # compat
-                'mae':      float(metrics['p50_mae']),   # compat
+                'rmse':     float(metrics['p50_rmse']),
+                'mae':      float(metrics['p50_mae']),
             },
             'training': {
                 'final_train_loss':      float(train_losses[-1]),
@@ -543,8 +582,7 @@ class GRUTrainer:
         should_update = False
 
         if not best_path.exists():
-            print(f"\n{'='*70}")
-            print(f"RUN {run_id} — FIRST RUN, SETTING AS BEST")
+            print(f"\n{'='*70}\nRUN {run_id} — FIRST RUN, SETTING AS BEST")
             print(f"  p50 RMSE: {cur_rmse:.6f}  p50 MAE: {cur_mae:.6f}")
             should_update = True
         else:
@@ -554,8 +592,7 @@ class GRUTrainer:
             best_mae    = best_cfg['metrics']['mae']
             best_run_id = best_cfg.get('run_id', '?')
 
-            print(f"\n{'='*70}")
-            print(f"RUN {run_id} vs BEST (Run {best_run_id})")
+            print(f"\n{'='*70}\nRUN {run_id} vs BEST (Run {best_run_id})")
             print(f"  Prev  RMSE:{best_rmse:.6f}  MAE:{best_mae:.6f}")
             print(f"  Curr  RMSE:{cur_rmse:.6f}   MAE:{cur_mae:.6f}")
 
@@ -582,9 +619,7 @@ class GRUTrainer:
         epochs     = self.training_config['epochs']
         batch_size = self.training_config['batch_size']
 
-        print("\n" + "="*70)
-        print("LOADING DATA")
-        print("="*70)
+        print(f"\n{'='*70}\nLOADING DATA\n{'='*70}")
 
         train_samples = self.load_multiple_files(train_files)
         val_samples   = self.load_multiple_files(val_files)
@@ -598,14 +633,12 @@ class GRUTrainer:
 
         train_loader = DataLoader(ContentionDataset(X_train, y_train),
                                   batch_size=batch_size, shuffle=True,
-                                  num_workers=0, pin_memory=self.use_amp)
+                                  num_workers=4, pin_memory=self.use_amp)
         val_loader   = DataLoader(ContentionDataset(X_val,   y_val),
                                   batch_size=batch_size, shuffle=False,
-                                  num_workers=0, pin_memory=self.use_amp)
+                                  num_workers=4, pin_memory=self.use_amp)
 
-        print("\n" + "="*70)
-        print("BUILDING MODEL")
-        print("="*70)
+        print(f"\n{'='*70}\nBUILDING MODEL\n{'='*70}")
 
         input_size = X_train.shape[2]
         self.model = GRUContentionPredictor(
@@ -618,8 +651,8 @@ class GRUTrainer:
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"  Input size:       {input_size}")
         print(f"  Total parameters: {total_params:,}")
-        print(f"  Output:           p50_score  [regression, no sigmoid]")
-        print(f"  Pooling:          mean + max over all timesteps")
+        print("  Output:           p50_score  [regression, no sigmoid]")
+        print("  Pooling:          mean + max over all timesteps")
 
         criterion   = self.get_criterion()
         optimizer   = self.get_optimizer()
@@ -633,9 +666,7 @@ class GRUTrainer:
         train_losses, val_losses = [], []
         best_val_loss = float('inf')
 
-        print("\n" + "="*70)
-        print("TRAINING")
-        print("="*70)
+        print(f"\n{'='*70}\nTRAINING\n{'='*70}")
 
         start_time = time.time()
 
@@ -686,9 +717,7 @@ class GRUTrainer:
     def test(self, test_files: List[str], training_time: float,
              train_losses, val_losses, run_id: int) -> Dict:
 
-        print("\n" + "="*70)
-        print("TESTING")
-        print("="*70)
+        print(f"\n{'='*70}\nTESTING\n{'='*70}")
 
         test_samples     = self.load_multiple_files(test_files)
         X_test, y_actual = self.prepare_sequences(test_samples, fit_scaler=False)
@@ -752,9 +781,9 @@ class GRUTrainer:
             'p50_rmse':  p50_rmse,
             'p50_mae':   p50_mae,
             'p50_r2':    p50_r2,
-            'rmse':      p50_rmse,   # compat
-            'mae':       p50_mae,    # compat
-            'r2':        p50_r2,     # compat
+            'rmse':      p50_rmse,
+            'mae':       p50_mae,
+            'r2':        p50_r2,
             'training_time': training_time,
             'inference':     infer_stats,
             'peak_memory_mb':    peak_mem_mb,
@@ -770,18 +799,14 @@ class GRUTrainer:
               f"Throughput:{infer_stats['throughput_sequences_per_second']:.0f} seq/s")
         print(f"  Train:{training_time:.2f}s  Peak mem:{peak_mem_mb:.1f}MB")
 
-        print("\n" + "="*70)
-        print("GENERATING PLOTS")
-        print("="*70)
+        print(f"\n{'='*70}\nGENERATING PLOTS\n{'='*70}")
         Path('Plots').mkdir(exist_ok=True)
         self.plot_training_history(train_losses, val_losses, run_id,
                                    f'training_history_run{run_id}.png')
         self.plot_predictions(y_actual, preds, run_id, test_files,
                               f'Plots/predictions_run{run_id}.png')
 
-        print("\n" + "="*70)
-        print(f"SAVING RUN {run_id}")
-        print("="*70)
+        print(f"\n{'='*70}\nSAVING RUN {run_id}\n{'='*70}")
         self.save_current_run(metrics, train_losses, val_losses, run_id)
         self.compare_and_update_best(metrics, run_id)
 
@@ -793,17 +818,13 @@ class GRUTrainer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_experiments(configs: List[Dict], data_files: List[str]):
-    print("="*70)
-    print("MULTI-CONFIG GRU EXPERIMENTS  (p50 regression)")
-    print("="*70)
+    print(f"{'='*70}\nMULTI-CONFIG GRU EXPERIMENTS  (p50 regression)\n{'='*70}")
     print(f"Configs to run: {len(configs)}")
 
     all_results = []
 
     for run_id, config in enumerate(configs, start=1):
-        print("\n" + "#"*70)
-        print(f"RUN {run_id} / {len(configs)}")
-        print("#"*70)
+        print(f"\n{'#'*70}\nRUN {run_id} / {len(configs)}\n{'#'*70}")
 
         seed = config['data']['random_seed']
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -843,10 +864,7 @@ def run_experiments(configs: List[Dict], data_files: List[str]):
         all_results.append(metrics)
         print(f"\n✓ Run {run_id} complete!")
 
-    # ── summary table ──────────────────────────────────────────────────────────
-    print("\n" + "="*70)
-    print("EXPERIMENT SUMMARY")
-    print("="*70)
+    print(f"\n{'='*70}\nEXPERIMENT SUMMARY\n{'='*70}")
     header = f"{'Run':<5} {'p50 RMSE':<11} {'p50 MAE':<11} {'p50 R²':<9} {'Train(s)'}"
     print(header)
     print("-" * len(header))
@@ -862,9 +880,7 @@ def run_experiments(configs: List[Dict], data_files: List[str]):
         print(f"{r['run_id']:<5} {r['p50_rmse']:<11.6f} {r['p50_mae']:<11.6f} "
               f"{r['p50_r2']:<9.4f} {r['training_time']:.2f}{marker}")
 
-    print("\n" + "="*70)
-    print("ALL EXPERIMENTS COMPLETE!")
-    print("="*70)
+    print(f"\n{'='*70}\nALL EXPERIMENTS COMPLETE!\n{'='*70}")
     return all_results
 
 
@@ -874,14 +890,14 @@ def run_experiments(configs: List[Dict], data_files: List[str]):
 
 config_plato = {
     'model': {
-        'sequence_length': 50,
+        'sequence_length': 20,
         'hidden_size':     64,
         'num_layers':      1,
         'dropout':         0.1,
     },
     'training': {
-        'epochs':                  100,
-        'batch_size':              64,
+        'epochs':                  5,
+        'batch_size':              256,
         'learning_rate':           0.001,
         'optimizer':               'adam',
         'criterion':               'mse',
@@ -994,9 +1010,7 @@ if __name__ == "__main__":
         data_files = all_files,
     )
 
-    print("\n" + "="*70)
-    print("FILES GENERATED PER RUN")
-    print("="*70)
+    print(f"\n{'='*70}\nFILES GENERATED PER RUN\n{'='*70}")
     for i in range(1, len(configs_to_run) + 1):
         print(f"  Run {i}: gru_model_run{i}.pth  gru_model_run{i}.onnx  "
               f"gru_config_run{i}.json  gru_results_run{i}.json  "
