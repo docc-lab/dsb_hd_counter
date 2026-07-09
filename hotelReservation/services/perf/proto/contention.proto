@@ -38,25 +38,50 @@ message ScoreSubscribeReq {
   float min_tail_trend = 3;
 }
 
-// ScoreEvent is the score for one window. Both p50_trend_pred and
-// tail_trend_label are continuous regression outputs in [0, 1].
-// During the single-head transitional period, tail_trend_label may be
-// 0.0 with a startup warning logged on the producer side.
+// ScoreEvent is the score for one window. All score fields are
+// continuous values in [0, 1]; higher = more contention.
+//
+// Producer is the in-pod Gordion scorer (Algorithm 1) which always
+// computes the formula outputs (y50_current, tail_trend_label,
+// ext_pct_50, ext_pct_90). When the pod additionally runs the ONNX
+// predictor (prediction_on = true), p50_trend_pred carries the model's
+// predicted next-window y50; otherwise p50_trend_pred = y50_current so
+// consumers always have one primary p50 signal regardless of mode.
 message ScoreEvent {
   int64  sample_id        = 1;   // joins to Sample.sample_id from instrumentation
   int64  timestamp_ns     = 2;
   string service          = 3;
 
-  float  p50_trend_pred   = 4;   // p50-side trend prediction, [0, 1]
-  float  tail_trend_label = 5;   // p90/p99-combined tail trend, [0, 1]
+  // Primary p50-side signal, [0, 1]. Predicted next-window y50 (ONNX)
+  // when prediction_on; the formula's current y50 otherwise.
+  float  p50_trend_pred   = 4;
 
-  // Stable identifier echoing the score source's model_version (e.g. the
-  // shortlist.schema_version for ONNX). Mitigation consumers can use
-  // this to reject stale streams after a model change.
+  // Tail-side signal (formula y90), [0, 1].
+  float  tail_trend_label = 5;
+
+  // Stable identifier for the producing configuration: the trainer run
+  // config id when prediction_on, the gordion config version otherwise.
+  // Mitigation consumers can use this to reject stale streams after a
+  // model / config change.
   string model_version    = 6;
 
-  // Tag for which producer emitted this event: "onnx", "formula",
-  // "rules", etc. Lets a mitigation differentiate when multiple sources
-  // are wired up to the same Publisher.
+  // Tag for which producer emitted this event ("gordion" for the
+  // in-pod scorer; future comparator sources use their own tags). Lets
+  // a mitigation differentiate when multiple sources are wired up to
+  // the same Publisher.
   string source_kind      = 7;
+
+  // The formula's CURRENT y50 (always populated). Equal to
+  // p50_trend_pred when prediction_on is false.
+  float  y50_current      = 8;
+
+  // Extrinsic contention percentages from the intrinsic-curve
+  // decomposition: (T~ - D(lambda)) / T~, clamped to [0, 1]. How much
+  // of the current p50/p90 shift is attributable to co-located
+  // neighbors rather than the service's own load.
+  float  ext_pct_50       = 9;
+  float  ext_pct_90       = 10;
+
+  // True when p50_trend_pred came from the in-pod ONNX predictor.
+  bool   prediction_on    = 11;
 }

@@ -2,8 +2,8 @@ package onnx
 
 import "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf"
 
-// Ring is a bounded sequence buffer of perf.Sample values, sized at
-// shortlist.SeqLen. The predictor pushes one Sample per window; once
+// Ring is a bounded sequence buffer of perf.Sample values, sized at the
+// run config's sequence_length. The Model pushes one Sample per window; once
 // Full reports true, View returns the SeqLen most-recent Samples in
 // arrival order (oldest first).
 //
@@ -28,7 +28,7 @@ func NewRing(n int) *Ring {
 	return &Ring{buf: make([]perf.Sample, n)}
 }
 
-// Cap returns the configured capacity (= shortlist.SeqLen).
+// Cap returns the configured capacity (= run config sequence_length).
 func (r *Ring) Cap() int { return len(r.buf) }
 
 // Len returns the number of samples currently in the ring (caps at Cap

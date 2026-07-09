@@ -17,6 +17,10 @@ func scoreEventToProto(ev ScoreEvent) *pb.ScoreEvent {
 		TailTrendLabel: ev.TailTrendLabel,
 		ModelVersion:   ev.ModelVersion,
 		SourceKind:     ev.SourceKind,
+		Y50Current:     ev.Y50Current,
+		ExtPct_50:      ev.ExtPct50,
+		ExtPct_90:      ev.ExtPct90,
+		PredictionOn:   ev.PredictionOn,
 	}
 }
 

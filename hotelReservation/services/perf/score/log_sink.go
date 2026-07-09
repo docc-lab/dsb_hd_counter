@@ -25,6 +25,10 @@ func (s *LogSink) Emit(ev ScoreEvent) {
 		Time("timestamp", ev.Timestamp).
 		Float32("p50_trend_pred", ev.P50TrendPred).
 		Float32("tail_trend_label", ev.TailTrendLabel).
+		Float32("y50_current", ev.Y50Current).
+		Float32("ext_pct_50", ev.ExtPct50).
+		Float32("ext_pct_90", ev.ExtPct90).
+		Bool("prediction_on", ev.PredictionOn).
 		Str("model_version", ev.ModelVersion).
 		Str("source_kind", ev.SourceKind).
 		Msg("score_event")

@@ -8,7 +8,7 @@ import "github.com/docc-lab/dsb_hd_counter/hotelReservation/services/perf/instru
 // directly with an instrumentation.Publisher in the same way as any
 // other Sink.
 //
-// Concrete sources (e.g. score/onnx.Predictor) typically receive a
+// Concrete sources (e.g. score/gordion.Source) typically receive a
 // *score.Publisher at construction time so they can call its Publish
 // method with the ScoreEvents they produce. The Source interface
 // itself is intentionally minimal -- the contract is: "I'm a Sink

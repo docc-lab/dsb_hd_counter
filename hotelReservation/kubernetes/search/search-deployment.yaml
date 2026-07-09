@@ -34,11 +34,16 @@ spec:
       containers:
         - command:
             - search
-          # Use the online image (gordion-online-search:vN) when running
-          # with ENABLE_WINDOWED_SAMPLING=true + a model baked in. The
-          # online image extends the base via Dockerfile.online and
-          # ships /etc/gordion/{model.onnx,shortlist.json} +
-          # /usr/lib/libonnxruntime.so plus default GORDION_* env vars.
+          # Stage 3 images:
+          #   prediction-ON:  the per-service online image built by
+          #     `ims-build-push-rollout.sh --mode-online search vN`
+          #     (Dockerfile.online: /etc/gordion/{model.onnx,model-config.json}
+          #     + /usr/lib/libonnxruntime.so + default GORDION_* env).
+          #   prediction-OFF: any windowed-sampling image works -- the
+          #     Gordion formula source has no ONNX dependency; just keep
+          #     the gordion ConfigMap mounted and GORDION_MODEL unset.
+          # The base image below has NO stage-3 wiring; switch to an
+          # online/windowed image before expecting events on :7900.
           image: docclabgroup/hotelreservation:panic-fixed-1.3
           name: hotel-reserv-search
           ports:
@@ -65,10 +70,16 @@ spec:
           # host node (Daemonset or one-time setup); without these mounts
           # the freq fields land with ok=false and the rest zeroed.
           volumeMounts:
-            - {name: cpu-devices, mountPath: /dev/cpu, readOnly: true}
-          # Stage 3 env vars. Comment out or set GORDION_SCORE_SOURCE=none
-          # to disable Stage 3 entirely while keeping the Stage 2
-          # disk-dump path intact.
+            - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
+            # Gordion calibration (gordion.json + stage-1 curve.csv).
+            # Mounted at /etc/gordion-conf (NOT /etc/gordion, which would
+            # shadow the baked model files). Create/update with:
+            #   kubectl create configmap gordion-search \
+            #       --from-file=gordion.json --from-file=curve.csv
+            - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
+          # Stage 3 env vars. Set GORDION_SCORE_SOURCE=none to disable
+          # scoring entirely while keeping the Stage 2 disk-dump path
+          # intact.
           env:
             # Match GOMAXPROCS to the cpu limit (3). Without this the Go
             # runtime defaults to the node core count (~32) and fans threads
@@ -77,18 +88,27 @@ spec:
             # Go-in-Kubernetes practice. Adjust if the cpu limit changes.
             - {name: GOMAXPROCS,              value: "3"}
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
-            - {name: GORDION_SCORE_SOURCE,    value: "onnx"}
-            # The remaining GORDION_* env vars (paths, ports, buffers)
-            # default sensibly via Dockerfile.online ENV; uncomment below
-            # to override per-pod.
-            # - {name: GORDION_MODEL,        value: "/etc/gordion/model.onnx"}
-            # - {name: GORDION_SHORTLIST,    value: "/etc/gordion/shortlist.json"}
-            # - {name: GORDION_SCORE_PORT,   value: "7900"}
+            - {name: GORDION_SCORE_SOURCE,    value: "gordion"}
+            - {name: GORDION_CONFIG,          value: "/etc/gordion-conf/gordion.json"}
+            # Prediction mode: the online image defaults GORDION_MODEL /
+            # GORDION_MODEL_CONFIG via Dockerfile.online ENV (prediction
+            # ON). Override GORDION_MODEL with "" here to force
+            # prediction-OFF on the online image:
+            # - {name: GORDION_MODEL,         value: ""}
+            # - {name: GORDION_MODEL_CONFIG,  value: "/etc/gordion/model-config.json"}
+            # - {name: GORDION_SCORE_PORT,    value: "7900"}
             # - {name: GORDION_INSTRUMENTATION_PORT, value: "7901"}
       volumes:
         - name: cpu-devices
           hostPath:
             path: /dev/cpu
             type: Directory
+        # optional: pods still start without the ConfigMap; the score
+        # source then logs a config-load failure and stays disabled
+        # (business RPC unaffected).
+        - name: gordion-conf
+          configMap:
+            name: gordion-search
+            optional: true
       restartPolicy: Always
 status: {}
