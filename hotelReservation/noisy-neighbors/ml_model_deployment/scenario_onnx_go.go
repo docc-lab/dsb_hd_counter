@@ -32,6 +32,12 @@ var freqKeys = []string{
 
 const unknownService = "__unknown__"
 
+// nFeaturesFixed mirrors N_FEATURES_FIXED in gru_train.py: 67 (log1p groups
+// 1-6) + 1 (service index scalar) + 5 (ratios) = 73. Kept here purely as a
+// sanity check against the loaded config; the authoritative value at
+// runtime is always cfg.NFeatures.
+const nFeaturesFixed = 73
+
 // ── run config (gru_config_run{N}.json / gru_config_best.json) ────────────
 
 type RunConfig struct {
@@ -40,10 +46,11 @@ type RunConfig struct {
 			SequenceLength int `json:"sequence_length"`
 		} `json:"model"`
 	} `json:"config"`
-	NFeatures    int      `json:"n_features"`
-	ServiceVocab []string `json:"service_vocab"`
-	Scaler       struct {
-		Mean []float64 `json:"mean"`
+	NFeatures        int      `json:"n_features"`
+	ServiceVocab     []string `json:"service_vocab"`
+	ServiceEncoding  string   `json:"service_encoding"` // "scalar_index" (new) or "" / "one_hot" (legacy)
+	Scaler           struct {
+		Mean  []float64 `json:"mean"`
 		Scale []float64 `json:"scale"`
 	} `json:"scaler"`
 }
@@ -62,6 +69,28 @@ func loadRunConfig(path string) RunConfig {
 	}
 	if len(cfg.Scaler.Mean) != cfg.NFeatures || len(cfg.Scaler.Scale) != cfg.NFeatures {
 		panic("scaler mean/scale length does not match n_features")
+	}
+	// This binary only implements the scalar-index service encoding
+	// (matching the current gru_train.py). Configs produced before that
+	// change used one-hot and had a variable-length feature vector
+	// (72 + len(service_vocab)) — loading one of those here would silently
+	// produce a mis-shaped input, so fail loudly instead.
+	switch cfg.ServiceEncoding {
+	case "scalar_index":
+		// expected
+	case "":
+		panic("config has no \"service_encoding\" field — this looks like a " +
+			"legacy one-hot config, which this binary does not support. " +
+			"Re-train with the updated gru_train.py or use the matching " +
+			"legacy inference binary.")
+	default:
+		panic(fmt.Sprintf("unsupported service_encoding %q — this binary only "+
+			"supports \"scalar_index\"", cfg.ServiceEncoding))
+	}
+	if cfg.NFeatures != nFeaturesFixed {
+		panic(fmt.Sprintf("config n_features=%d does not match expected fixed "+
+			"count %d for scalar_index encoding — code/config mismatch",
+			cfg.NFeatures, nFeaturesFixed))
 	}
 	return cfg
 }
@@ -91,8 +120,11 @@ func clip(v, lo, hi float64) float64 {
 	return v
 }
 
-func oneHotService(name string, vocab []string) []float64 {
-	vec := make([]float64, len(vocab))
+// serviceIndex returns the index of name within vocab as a float64,
+// mirroring _service_index() in gru_train.py. Unknown/unseen names fall
+// back to the last index (the UNKNOWN_SERVICE bucket), matching Python's
+// fallback behavior exactly.
+func serviceIndex(name string, vocab []string) float64 {
 	idx := len(vocab) - 1 // default: unknown bucket is always last
 	for i, v := range vocab {
 		if v == name {
@@ -100,8 +132,7 @@ func oneHotService(name string, vocab []string) []float64 {
 			break
 		}
 	}
-	vec[idx] = 1.0
-	return vec
+	return float64(idx)
 }
 
 // ── feature extraction (mirrors extract_features in gru_train.py) ─────────
@@ -176,12 +207,13 @@ func extractFeaturesRaw(sample map[string]interface{}, serviceVocab []string) []
 		logRaw[i] = math.Log1p(v)
 	}
 
-	// group 7: service_name one-hot (NOT log1p'd)
+	// group 7: service_name as a single scalar index (NOT one-hot,
+	// NOT log1p'd) — matches gru_train.py's _service_index()
 	serviceName, _ := sample["service_name"].(string)
 	if serviceName == "" {
 		serviceName = unknownService
 	}
-	g7 := oneHotService(serviceName, serviceVocab)
+	g7 := []float64{serviceIndex(serviceName, serviceVocab)}
 
 	// group 8: derived ratios (NOT log1p'd)
 	deltaCyc := safeFloat(perfD["cycles"]) + 1e-9

@@ -6,7 +6,8 @@ GRU-based contention severity predictor.
   • Features:  perf_counters (absolute) + perf_deltas + timing scalars
                (incl. error_count) + full timing percentiles + freq fields +
                sample offsets (offset_ms, offset_from_workload_ms,
-               window_interval_ms) + service_name (one-hot) + derived ratios
+               window_interval_ms) + service_name (single scalar index) +
+               derived ratios
   • Outputs:   gru_model_run{N}.pth  +  gru_model_run{N}.onnx
                gru_model_best.pth    +  gru_model_best.onnx
 
@@ -14,6 +15,16 @@ NOTE: p90_contention_score / pct_ext_50 / pct_ext_90 are present in the raw
 data but are intentionally NOT used as inputs (they are alternate score
 variants derived similarly to the label and could leak information) and are
 NOT used as targets — only p50_contention_score is predicted, per spec.
+
+NOTE ON SERVICE ENCODING: service_name is encoded as a SINGLE scalar feature
+(its integer index in service_vocab), not a one-hot vector. This keeps
+n_features FIXED at 73 regardless of how many distinct service names appear
+in the training data (previously n_features = 72 + len(service_vocab), which
+varied run to run and caused feature-count mismatches against downstream
+consumers that assume a fixed input size, e.g. the Go/ONNX inference code).
+service_vocab is still built and saved to the run config, since the scalar
+index is only meaningful relative to that vocabulary — any consumer (e.g.
+the Go inference code) MUST use the same vocab to map service_name -> index.
 """
 
 import json
@@ -63,6 +74,10 @@ FREQ_KEYS = ["actual_freq_mhz", "current_max_mhz", "active_n",
 
 UNKNOWN_SERVICE = "__unknown__"
 
+# Fixed feature count breakdown (see extract_features docstring):
+#   67 (groups 1-6, log1p'd) + 1 (group 7, service index scalar) + 5 (group 8, ratios)
+N_FEATURES_FIXED = 73
+
 
 def _safe(val, default=0.0) -> float:
     if val is None:
@@ -76,7 +91,13 @@ def _safe(val, default=0.0) -> float:
 def build_service_vocab(files_samples: List[List[Dict]]) -> List[str]:
     """Vocab is built ONLY from training data. Always ends with the
     UNKNOWN_SERVICE bucket so unseen service names at val/test/inference
-    time map somewhere safely instead of raising."""
+    time map somewhere safely instead of raising.
+
+    NOTE: service_name is now encoded as a single scalar (this vocab's
+    index of the name), NOT as one-hot. The vocab itself is still needed
+    (and still saved to the run config) purely to define what each index
+    means, and MUST be reused unchanged by any downstream consumer.
+    """
     names = set()
     for samples in files_samples:
         for s in samples:
@@ -88,11 +109,12 @@ def build_service_vocab(files_samples: List[List[Dict]]) -> List[str]:
     return vocab
 
 
-def _one_hot_service(name: str, vocab: List[str]) -> np.ndarray:
-    vec = np.zeros(len(vocab), dtype=np.float64)
+def _service_index(name: str, vocab: List[str]) -> float:
+    """Returns the integer index of `name` within `vocab` as a float scalar.
+    Unseen names (or None) map to the last index (the UNKNOWN_SERVICE
+    bucket), matching the previous one-hot fallback behavior."""
     idx = vocab.index(name) if name in vocab else len(vocab) - 1
-    vec[idx] = 1.0
-    return vec
+    return float(idx)
 
 
 def extract_features(sample: Dict, service_vocab: List[str]) -> np.ndarray:
@@ -106,8 +128,13 @@ def extract_features(sample: Dict, service_vocab: List[str]) -> np.ndarray:
       4.  timing distributions per section           –  3 × 11 = 33 values
       5.  freq fields                                –  6 values
       6.  sample offsets / window interval           –  3 values
-      7.  service_name one-hot (NOT log1p'd)         –  len(service_vocab)
+      7.  service_name index (NOT log1p'd)           –  1 value (SCALAR,
+                                                          not one-hot — see
+                                                          module docstring)
       8.  derived ratios (NOT log1p'd)                –  5 values
+
+    Total = 67 (groups 1-6) + 1 (group 7) + 5 (group 8) = 73 features,
+    FIXED regardless of how many services are in service_vocab.
     """
     perf_c = sample.get("perf_counters", {})
     perf_d = sample.get("perf_deltas", {})
@@ -150,9 +177,9 @@ def extract_features(sample: Dict, service_vocab: List[str]) -> np.ndarray:
     # ── log1p on groups 1-6 ──────────────────────────────────────────────────
     raw_log = np.log1p(np.array(g1 + g2 + g3 + g4 + g5 + g6, dtype=np.float64))
 
-    # ── group 7: service_name one-hot ───────────────────────────────────────
+    # ── group 7: service_name as a single scalar index (NOT one-hot) ────────
     service_name = sample.get("service_name", UNKNOWN_SERVICE) or UNKNOWN_SERVICE
-    g7 = _one_hot_service(service_name, service_vocab)
+    g7 = np.array([_service_index(service_name, service_vocab)], dtype=np.float64)
 
     # ── group 8: derived ratios ──────────────────────────────────────────────
     delta_cyc   = _safe(perf_d.get("cycles"))       + 1e-9
@@ -333,8 +360,14 @@ class GRUTrainer:
                          for samples in files_samples for s in samples]
             self.scaler.fit(np.array(all_feats))
             self.n_features = len(all_feats[0])
+            assert self.n_features == N_FEATURES_FIXED, (
+                f"Expected fixed n_features={N_FEATURES_FIXED}, got "
+                f"{self.n_features} — extract_features() and "
+                f"N_FEATURES_FIXED are out of sync."
+            )
             print(f"[feature extractor] {self.n_features} features/sample "
-                  f"({len(self.service_vocab)} service classes: {self.service_vocab})")
+                  f"(fixed; service encoded as scalar index into "
+                  f"{len(self.service_vocab)} service classes: {self.service_vocab})")
 
         all_seqs, all_labels = [], []
 
@@ -551,6 +584,8 @@ class GRUTrainer:
             'config':        self.config,
             'n_features':    self.n_features,
             'service_vocab': self.service_vocab,
+            'service_encoding': 'scalar_index',  # NOT 'one_hot' — downstream
+                                                  # consumers must branch on this
             'scaler':        scaler_meta,
             'metrics': {
                 'p50_rmse': float(metrics['p50_rmse']),
