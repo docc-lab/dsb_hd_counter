@@ -28,6 +28,15 @@ spec:
       containers:
         - image: jaegertracing/all-in-one:latest
           name: hotel-reserv-jaeger
+          # all-in-one stores traces IN MEMORY and grows without bound.
+          # Uncapped it filled node-1 over hours of experiment traffic,
+          # driving the node into direct-reclaim stalls (20-40 s freezes
+          # of everything co-located: etcd, kube-scheduler, frontend,
+          # geo, mongodb-rate) until the kernel OOM-killer reaped it
+          # (observed 2026-07-10 15:03, exit 137). max-traces bounds the
+          # store; the memory limit below contains any future blowup to
+          # a cgroup-local OOM instead of a node-wide reclaim storm.
+          args: ["--memory.max-traces=50000"]
           ports:
             - containerPort: 14269
             - containerPort: 5778
@@ -43,7 +52,9 @@ spec:
           resources:
             requests:
               cpu: "1"
+              memory: 1Gi
             limits:
               cpu: "3"
+              memory: 2Gi
       restartPolicy: Always
 status: {}
