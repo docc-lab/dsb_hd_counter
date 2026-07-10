@@ -149,9 +149,12 @@ def main():
     ap.add_argument("--version", default="gordion-v2-streamcal")
     ap.add_argument("--out-curve", default="curve.csv")
     ap.add_argument("--out-config", default="gordion.json")
+    ap.add_argument("--force", action="store_true",
+                    help="write outputs even if contamination is detected")
     args = ap.parse_args()
 
     levels = []
+    contaminated = []
     for spec in args.level:
         try:
             rps_s, path = spec.split(":", 1)
@@ -171,12 +174,35 @@ def main():
         d90 = st.median(smooth_stream([w[1] for w in windows], args.window))
         wm50 = wmean([(w[0], w[2]) for w in windows])
         wm90 = wmean([(w[1], w[2]) for w in windows])
+        # Contamination tripwire: on a clean capture the smoothed median
+        # sits near the raw window median (smoothing is averaging; the p50
+        # stream is not heavily skewed). If d50 >> raw median, the stream
+        # contains large periodic stalls (the node-3 "metronome": 20-30 ms
+        # all-core freezes) and this level does NOT measure the service's
+        # intrinsic latency. Applying such a calibration silently poisons
+        # the baseline/curve (observed: raw 109 kcyc -> smoothed 1983).
+        raw50 = st.median([w[0] for w in windows])
+        bad = d50 > 2.0 * raw50
+        if bad:
+            contaminated.append(f"loadgen={loadgen_rps:g} (d50 {d50:.0f} vs raw median {raw50:.0f} kcyc)")
         levels.append(dict(loadgen=loadgen_rps, arrival=arrival,
                            d50=d50, d90=d90, wm50=wm50, wm90=wm90,
                            n=len(windows), windows=windows))
         print(f"level loadgen={loadgen_rps:g}: arrival_mean={arrival:.0f} "
               f"d50={d50:.1f} d90={d90:.1f} kcyc (smoothed-median; "
-              f"wmean {wm50:.0f}/{wm90:.0f}) over {len(windows)} windows")
+              f"wmean {wm50:.0f}/{wm90:.0f}; raw p50 median {raw50:.1f}) "
+              f"over {len(windows)} windows"
+              + ("  <-- CONTAMINATED" if bad else ""))
+
+    if contaminated and not args.force:
+        sys.exit(
+            "\nABORT: periodic-stall contamination detected in "
+            f"{len(contaminated)} level(s):\n  " + "\n  ".join(contaminated) +
+            "\nThe node was suffering intermittent all-core stalls during "
+            "these captures (the ~1.1 s metronome). Re-record the flagged "
+            "levels in a quiet window (verify with the :7901 probe first: "
+            "proc_p50 ~44 us steady, no >1 ms windows), or pass --force to "
+            "write outputs anyway (they will NOT represent intrinsic latency).")
 
     # Curve rows keyed by the victim's OWN arrival rate (what the scorer
     # indexes with); loadgen rate kept as provenance in target_rps... no:
