@@ -153,9 +153,18 @@ func NewRingBufferTimingAggregator(config TimingConfig) *RingBufferTimingAggrega
 		go agg.consumeTimingData()
 	}
 	
-	// Start periodic window flush loop
-	agg.wg.Add(1)
-	go agg.windowedFlushLoop()
+	// Start the periodic window flush loop only when there is a window to
+	// flush: basic (non-windowed) timing mode has no WindowInterval, and
+	// time.NewTicker(0) panics -- which crashed any service that enabled
+	// plain ENABLE_TIMING without windowed sampling (observed: user).
+	if config.WindowInterval > 0 {
+		agg.wg.Add(1)
+		go agg.windowedFlushLoop()
+	} else if config.EnableWindowed {
+		log.Warn().
+			Str("service", config.ServiceName).
+			Msg("EnableWindowed set but WindowInterval is 0; window flush loop disabled")
+	}
 	
 	log.Info().
 		Str("service", config.ServiceName).
