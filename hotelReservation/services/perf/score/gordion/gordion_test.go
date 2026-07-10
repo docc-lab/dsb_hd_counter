@@ -426,6 +426,12 @@ func TestSourceEndToEnd(t *testing.T) {
 	src, err := New(SourceConfig{
 		ServiceName: "search",
 		ConfigPath:  cfgPath,
+		// The test floods 40 Emits synchronously before the loop
+		// goroutine is guaranteed scheduled; the default depth (16)
+		// legitimately drops the overflow (that's production behavior).
+		// Size the channel to hold the whole burst so the test is
+		// deterministic.
+		InflightDepth: 64,
 	}, pub, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
