@@ -145,18 +145,41 @@ def main():
                     f"{l['d50']:.3f},{l['d90']:.3f},{l['n']}\n")
     print(f"wrote {args.out_curve} ({len(levels)} levels)")
 
-    # Baseline from the operating-rate capture. Sigma uses the robust
-    # MAD estimator (x1.4826 for normal-consistency) rather than raw
-    # stdev: a handful of straggler windows would otherwise inflate
-    # sigma and flatten the tanh's dynamic range.
+    # Baseline from the operating-rate capture -- computed in the SAME
+    # domain the scorer operates in. The runtime tanh compares the
+    # baseline against the causally Gaussian-SMOOTHED per-window stream,
+    # and smoothing is averaging: for the heavily right-skewed window-p90
+    # stream (occasional millisecond straggler windows), the smoothed
+    # signal sits near the MEAN, far above the raw median. A raw-median
+    # baseline therefore pins y90 at 1 on a perfectly healthy system.
+    # Fix: replay the captured stream through the identical smoother and
+    # take median + MAD of the SMOOTHED values.
+    def smooth_stream(xs, w):
+        import math
+        if w < 2:
+            return list(xs)
+        s = w / 3.0
+        weights = [math.exp(-(a * a) / (2 * s * s)) for a in range(w)]
+        out, buf = [], []
+        for x in xs:
+            buf.append(x)
+            if len(buf) > w:
+                buf.pop(0)
+            num = den = 0.0
+            for age, v in enumerate(reversed(buf)):
+                num += weights[age] * v
+                den += weights[age]
+            out.append(num / den)
+        return out
+
     def sigma(xs):
         med = st.median(xs)
         mad = st.median([abs(x - med) for x in xs])
         return 1.4826 * mad if mad > 0 else st.stdev(xs)
 
     op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
-    k50 = [w[0] for w in op["windows"]]
-    k90 = [w[1] for w in op["windows"]]
+    k50 = smooth_stream([w[0] for w in op["windows"]], args.window)
+    k90 = smooth_stream([w[1] for w in op["windows"]], args.window)
     freqs = [w[4] for w in op["windows"]]
     cfg = {
         "version": args.version,
@@ -178,7 +201,11 @@ def main():
         "ablations": {"no_smoothing": False, "no_ext": False,
                       "raw_rate_index": False, "use_current_y50": False},
         "_provenance": {
-            "method": "calibrate_from_stream",
+            "method": "calibrate_from_stream (baseline stats over the smoothed stream)",
+            "raw_window_medians": {
+                "p50_kcyc": round(st.median([w[0] for w in op["windows"]]), 1),
+                "p90_kcyc": round(st.median([w[1] for w in op["windows"]]), 1),
+            },
             "levels": [{"loadgen": l["loadgen"], "arrival": round(l["arrival"], 1),
                         "d50": round(l["d50"], 1), "d90": round(l["d90"], 1),
                         "n_windows": l["n"]} for l in levels],
