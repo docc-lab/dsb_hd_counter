@@ -77,13 +77,40 @@ func NewSession(modelPath string, seqLen, nFeatures int, libPath string) (*Sessi
 		return nil, fmt.Errorf("alloc output tensor: %w", err)
 	}
 
+	// CRITICAL: pin ORT to a single thread. The default thread pool
+	// sizes to the NODE's core count (32 on the eval nodes) inside the
+	// pod's 3-core CFS quota; the thread herd waking at every 100 ms
+	// inference exhausted the quota and throttled the whole pod for
+	// ~20 ms -- a stall every in-flight request recorded as processing
+	// time, so the scorer ended up scoring its own interference
+	// (measured: periodic 20 ms proc_p50 spikes with scoring on, none
+	// with scoring off). The model is tiny (GRU-64); one thread is
+	// plenty at 10 Hz.
+	sessOpts, err := ort.NewSessionOptions()
+	if err != nil {
+		inputTensor.Destroy()
+		outputTensor.Destroy()
+		return nil, fmt.Errorf("new session options: %w", err)
+	}
+	defer sessOpts.Destroy()
+	if err := sessOpts.SetIntraOpNumThreads(1); err != nil {
+		inputTensor.Destroy()
+		outputTensor.Destroy()
+		return nil, fmt.Errorf("set intra-op threads: %w", err)
+	}
+	if err := sessOpts.SetInterOpNumThreads(1); err != nil {
+		inputTensor.Destroy()
+		outputTensor.Destroy()
+		return nil, fmt.Errorf("set inter-op threads: %w", err)
+	}
+
 	sess, err := ort.NewAdvancedSession(
 		modelPath,
 		[]string{inputTensorName},
 		[]string{outputTensorName},
 		[]ort.ArbitraryTensor{inputTensor},
 		[]ort.ArbitraryTensor{outputTensor},
-		nil, // SessionOptions; default
+		sessOpts,
 	)
 	if err != nil {
 		inputTensor.Destroy()
