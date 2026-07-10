@@ -23,6 +23,7 @@ WARMUP=20         # wrk2 settle time before recording starts (s)
 OPERATING_RPS=2400
 THREADS=4
 CONNS=256
+TARGET_NODE="node-3"   # node the victim MUST be on (pinned + freq-floored)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
         --duration) DURATION="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --operating-rps) OPERATING_RPS="$2"; shift 2 ;;
+        --target-node) TARGET_NODE="$2"; shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -67,7 +69,28 @@ sleep 1
 
 POD=$(kubectl get pods -l io.kompose.service=search -o jsonpath='{.items[0].metadata.name}')
 [[ -n "$POD" ]] || { echo "ERROR: no search pod found" >&2; exit 1; }
-log "victim pod: $POD"
+
+# Placement guard: stage3-eval's cleanup trap (hr_teardown) strips the
+# victim's nodeSelector + toleration after EVERY harness run, and the
+# NoSchedule taint on the target node keeps the re-rolled pod OFF it.
+# A sweep against that pod calibrates a shared, unfloored node (~180
+# kcyc instead of the true ~105) -- fail loudly instead.
+POD_NODE=$(kubectl get pod "$POD" -o jsonpath='{.spec.nodeName}')
+if [[ "$POD_NODE" != "$TARGET_NODE" ]]; then
+    cat >&2 <<EOF
+ERROR: victim pod $POD is on '$POD_NODE', not '$TARGET_NODE'.
+Re-pin it first (mirrors aggressor-place.sh), then re-run this sweep:
+
+  kubectl patch deployment search --type='merge' -p '{
+    "spec":{"template":{"spec":{
+      "nodeSelector":{"kubernetes.io/hostname":"$TARGET_NODE"},
+      "tolerations":[{"key":"dedicated","operator":"Equal","value":"special","effect":"NoSchedule"}]
+    }}}}'
+  kubectl rollout restart deployment/search && kubectl rollout status deployment/search
+EOF
+    exit 1
+fi
+log "victim pod: $POD (on $TARGET_NODE)"
 kubectl port-forward "$POD" 7901:7901 >/dev/null 2>&1 &
 sleep 2
 
