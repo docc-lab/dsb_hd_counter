@@ -1,0 +1,34 @@
+# Stage 3 score-verification BASELINE — victim at the 2400 rps operating
+# point, ZERO aggressors, no SN / sockshop testbeds.
+#
+# Purpose: the discrimination test for the Gordion scorer. This config is
+# identical to the mixed-aggressors run in every respect (victim service,
+# image, loadgen rate + shape, target node) EXCEPT that nothing else runs
+# on the node — so the score stream should read y50/y90 ~ 0 and ext ~ 0.
+#
+#   ./stage3-eval.sh configs/baseline-search-2400.yaml
+#   cd data/<new exp dir>
+#   python3 ../../score-verify/make_phases.py --phase baseline:0:runs/run_1 --out phases.yaml
+#   python3 ../../score-verify/verify_score_tracking.py \
+#       --scores runs/run_1/score_events.log --phases phases.yaml
+#
+# Expected: phase-mean y50/y90 near 0. If they pin at 1.0 here, the
+# calibration chain is wrong (kcyc spot-check a :7901 sample, then verify
+# the stage-1 curve came from the same node type as target_node).
+
+experiment:
+  name: baseline-search-2400
+  duration_s: 120
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-3
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 2400, shape: exp}   # same victim load as the mixed runs
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.0.2
+  score_log: true
+aggressors: []
