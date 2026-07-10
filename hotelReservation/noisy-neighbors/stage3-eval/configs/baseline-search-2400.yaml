@@ -29,6 +29,6 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.0.2
+  image: docclabgroup/search-online:v2.1.1
   score_log: true
 aggressors: []
