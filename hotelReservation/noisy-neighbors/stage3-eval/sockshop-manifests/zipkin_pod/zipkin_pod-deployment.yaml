@@ -23,5 +23,18 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 9411
+          # Zipkin defaults to UNBOUNDED in-memory span storage; at the
+          # SS aggressor rates (~6k rps traced) the JVM heap OOMs within
+          # minutes and the pod crash-loops, adding restart churn on the
+          # aggressor node. Cap the heap, bound span retention, and give
+          # the scheduler honest limits.
+          env:
+            - {name: JAVA_OPTS,     value: "-Xms256m -Xmx512m"}
+            - {name: MEM_MAX_SPANS, value: "100000"}
+          resources:
+            requests:
+              memory: "256Mi"
+            limits:
+              memory: "768Mi"
       restartPolicy: Always
       hostname: zipkin-pod

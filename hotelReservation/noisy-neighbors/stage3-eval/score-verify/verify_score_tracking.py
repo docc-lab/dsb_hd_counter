@@ -100,11 +100,15 @@ import re
 # ext_pct_50=0.79 ... y50_current=1 ..." — leading RFC3339 timestamp,
 # then key=value fields. The kv timestamp field (sub-second, from the
 # Sample) is preferred over the 1 s-resolution line timestamp.
+# ConsoleWriter colorizes by default, and kubectl logs preserves the
+# ANSI escapes into the captured file — strip them before parsing.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _KV_RE = re.compile(r"(\w+)=(\S+)")
 _LEAD_TS_RE = re.compile(r"^(\S+)\s")
 
 
 def parse_console_line(line):
+    line = _ANSI_RE.sub("", line)
     if "score_event" not in line:
         return None
     kv = dict(_KV_RE.findall(line))
