@@ -304,12 +304,21 @@ def main():
         pred = [e["p50_pred"] for e in pred_events]
         cur = [e["y50"] for e in pred_events]
         r = pearson(pred, cur)
-        lag, rlag = best_lag(pred, cur)
-        print(f"[5] prediction: r(y-hat50, y50)={r:.3f}; "
-              f"best lag {lag:+d} windows (r={rlag:.3f}) "
-              f"[positive lag = model leads]")
-        if not math.isnan(r) and r < 0.3:
-            failures.append(f"prediction: correlation with formula suspiciously low (r={r:.3f})")
+        if math.isnan(r):
+            # Correlation is undefined when a series is constant -- e.g.
+            # y50 saturated at 1.0 for the whole window. Not a failure;
+            # it just needs a run spanning multiple contention levels.
+            print(f"[5] prediction: correlation undefined over this window "
+                  f"(y50 range [{min(cur):.3f}, {max(cur):.3f}], "
+                  f"y-hat50 range [{min(pred):.3f}, {max(pred):.3f}]) -- "
+                  f"evaluate on a multi-level run")
+        else:
+            lag, rlag = best_lag(pred, cur)
+            print(f"[5] prediction: r(y-hat50, y50)={r:.3f}; "
+                  f"best lag {lag:+d} windows (r={rlag:.3f}) "
+                  f"[positive lag = model leads]")
+            if r < 0.3:
+                failures.append(f"prediction: correlation with formula suspiciously low (r={r:.3f})")
     else:
         print("[5] prediction: no prediction_on events (prediction-OFF run)")
 
