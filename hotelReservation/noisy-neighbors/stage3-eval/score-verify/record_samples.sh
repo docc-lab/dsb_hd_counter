@@ -18,18 +18,23 @@ DURATION="${3:-0}"
 command -v grpcurl >/dev/null || { echo "grpcurl not found" >&2; exit 1; }
 command -v jq      >/dev/null || { echo "jq not found" >&2; exit 1; }
 
-SUBSCRIBE=(grpcurl -plaintext -d '{}' "$ADDR" gordion.instrumentation.InstrumentationStream/Subscribe)
-
 echo "recording Samples from $ADDR -> $OUT (duration: ${DURATION}s; 0 = until Ctrl-C)" >&2
 
-run() {
-    "${SUBSCRIBE[@]}" | jq -c --unbuffered '.' >> "$OUT"
-}
+# Truncate: a stale file from an earlier run must never leak into this
+# capture (level files feed calibration; contamination corrupts it).
+: > "$OUT"
 
+# The timeout wraps grpcurl ITSELF (not a bash wrapper): when grpcurl
+# dies, jq reads EOF and the whole pipeline exits. Wrapping in bash -c
+# orphans the pipeline past the timeout, and the orphan keeps appending
+# while later captures run -- which silently blends levels together.
 if [[ "$DURATION" -gt 0 ]]; then
-    timeout --foreground "${DURATION}s" bash -c "$(declare -f run); $(declare -p SUBSCRIBE OUT); run" || true
+    timeout --foreground "${DURATION}s" \
+        grpcurl -plaintext -d '{}' "$ADDR" gordion.instrumentation.InstrumentationStream/Subscribe \
+        | jq -c --unbuffered '.' >> "$OUT" || true
 else
-    run
+    grpcurl -plaintext -d '{}' "$ADDR" gordion.instrumentation.InstrumentationStream/Subscribe \
+        | jq -c --unbuffered '.' >> "$OUT"
 fi
 
 echo "recorded $(wc -l < "$OUT") samples into $OUT" >&2

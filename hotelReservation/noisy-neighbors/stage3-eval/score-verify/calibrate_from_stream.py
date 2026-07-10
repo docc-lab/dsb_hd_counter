@@ -47,7 +47,7 @@ def load_level(path, section, trim_s):
         "blocking_time": "blockingTime",
     }[section]
 
-    windows, t0 = [], None
+    windows, t0, tlast = [], None, None
     for lineno, line in enumerate(open(path), 1):
         line = line.strip()
         if not line:
@@ -60,6 +60,7 @@ def load_level(path, section, trim_s):
         ts = int(fget(s, "timestampNs", "timestamp_ns", default=0))
         if t0 is None:
             t0 = ts
+        tlast = ts
         if ts - t0 < trim_s * 1e9:
             continue
         tw = fget(s, "timingWindow", "timing_window", default=None) or {}
@@ -79,6 +80,12 @@ def load_level(path, section, trim_s):
 
     if len(windows) < 30:
         sys.exit(f"{path}: only {len(windows)} clean windows after trim (need >= 30)")
+    span_s = (tlast - t0) / 1e9 if t0 is not None else 0
+    if span_s > 300:
+        sys.exit(f"{path}: capture spans {span_s:.0f}s -- far longer than one recording. "
+                 f"This is the orphaned-recorder contamination signature (multiple levels "
+                 f"blended into one file); re-record this level with the fixed "
+                 f"record_samples.sh and try again.")
     arrival_mean = sum(w[3] for w in windows) / len(windows)
     return arrival_mean, windows
 
@@ -138,7 +145,15 @@ def main():
                     f"{l['d50']:.3f},{l['d90']:.3f},{l['n']}\n")
     print(f"wrote {args.out_curve} ({len(levels)} levels)")
 
-    # Baseline from the operating-rate capture.
+    # Baseline from the operating-rate capture. Sigma uses the robust
+    # MAD estimator (x1.4826 for normal-consistency) rather than raw
+    # stdev: a handful of straggler windows would otherwise inflate
+    # sigma and flatten the tanh's dynamic range.
+    def sigma(xs):
+        med = st.median(xs)
+        mad = st.median([abs(x - med) for x in xs])
+        return 1.4826 * mad if mad > 0 else st.stdev(xs)
+
     op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
     k50 = [w[0] for w in op["windows"]]
     k90 = [w[1] for w in op["windows"]]
@@ -151,8 +166,8 @@ def main():
         "baseline": {
             "p50_kcyc": round(st.median(k50), 3),
             "p90_kcyc": round(st.median(k90), 3),
-            "sigma50_kcyc": round(st.stdev(k50), 3),
-            "sigma90_kcyc": round(st.stdev(k90), 3),
+            "sigma50_kcyc": round(sigma(k50), 3),
+            "sigma90_kcyc": round(sigma(k90), 3),
             "freq_mhz": round(st.median(freqs), 1),
         },
         "curve_csv": args.curve_csv_pod_path,
