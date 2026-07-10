@@ -99,6 +99,15 @@ type Config struct {
 		StallWindows int `json:"stall_windows"`
 	} `json:"failure"`
 
+	// IdleHoldWindows bounds the zero-completion hold: after this many
+	// CONSECUTIVE windows with no completions AND no arrivals (service
+	// genuinely idle, not stalled), the scorer stops publishing and
+	// resets, so late subscribers never see a stale frozen score from
+	// the end of the last load period. Scoring restarts (with smoothing
+	// warm-up) when traffic returns. Default 100 (= 10 s at the 100 ms
+	// window interval).
+	IdleHoldWindows int `json:"idle_hold_windows"`
+
 	// Ablations remove or replace one design element at a time, for the
 	// internal ablation studies. All default false (full pipeline).
 	Ablations struct {
@@ -154,6 +163,9 @@ func (c *Config) applyDefaults() {
 	if c.Failure.StallWindows == 0 {
 		c.Failure.StallWindows = 5
 	}
+	if c.IdleHoldWindows == 0 {
+		c.IdleHoldWindows = 100
+	}
 }
 
 // Validate rejects configs that would score garbage. Returns error,
@@ -197,6 +209,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Failure.StallWindows < 1 {
 		return fmt.Errorf("failure.stall_windows must be >= 1 (got %d)", c.Failure.StallWindows)
+	}
+	if c.IdleHoldWindows < 1 {
+		return fmt.Errorf("idle_hold_windows must be >= 1 (got %d)", c.IdleHoldWindows)
 	}
 	return nil
 }
