@@ -60,10 +60,11 @@ func (s *Server) Run() error {
 		statsFile = "timing_stats_user.json"
 	}
 
+	// StatsFile was removed from TimingConfig when the interceptor moved
+	// to the aggregator design; STATS_FILE is kept only for the log line.
 	timingConfig := interceptor.TimingConfig{
 		EnableTiming: enableTiming,
 		ServiceName:  name,
-		StatsFile:    statsFile,
 	}
 
 	serverOpts := interceptor.ServerOptions{
