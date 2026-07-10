@@ -26,18 +26,20 @@ command -v jq      >/dev/null || { echo "jq not found" >&2; exit 1; }
 # grpcurl pretty-prints each streamed message; jq -c re-flattens to one
 # line per event and stamps the local receive time. --unbuffered so
 # events land in the file as they arrive, not on pipe-buffer flushes.
-SUBSCRIBE=(grpcurl -plaintext -d '{}' "$ADDR" gordion.contention.ContentionStream/Subscribe)
-
+#
+# The timeout wraps grpcurl ITSELF: when it dies, jq reads EOF and the
+# pipeline exits. (A bash -c wrapper orphans the pipeline past the
+# timeout and it keeps appending into the file -- observed corrupting
+# multi-capture sessions.)
 echo "recording ScoreEvents from $ADDR -> $OUT (duration: ${DURATION}s; 0 = until Ctrl-C)" >&2
 
-run() {
-    "${SUBSCRIBE[@]}" | jq -c --unbuffered '. + {recv_unix_ns: (now * 1e9 | floor)}' >> "$OUT"
-}
-
 if [[ "$DURATION" -gt 0 ]]; then
-    timeout --foreground "${DURATION}s" bash -c "$(declare -f run); $(declare -p SUBSCRIBE OUT); run" || true
+    timeout --foreground "${DURATION}s" \
+        grpcurl -plaintext -d '{}' "$ADDR" gordion.contention.ContentionStream/Subscribe \
+        | jq -c --unbuffered '. + {recv_unix_ns: (now * 1e9 | floor)}' >> "$OUT" || true
 else
-    run
+    grpcurl -plaintext -d '{}' "$ADDR" gordion.contention.ContentionStream/Subscribe \
+        | jq -c --unbuffered '. + {recv_unix_ns: (now * 1e9 | floor)}' >> "$OUT"
 fi
 
 echo "recorded $(wc -l < "$OUT") events into $OUT" >&2
