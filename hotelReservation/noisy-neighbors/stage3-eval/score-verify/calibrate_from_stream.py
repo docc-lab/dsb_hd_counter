@@ -96,6 +96,34 @@ def wmean(pairs):
     return num / den if den else 0.0
 
 
+def smooth_stream(xs, w):
+    """Replay the identical causal Gaussian smoother the Go scorer uses
+    (sigma = w/3, partial-kernel renormalization during warm-up)."""
+    import math
+    if w < 2:
+        return list(xs)
+    s = w / 3.0
+    weights = [math.exp(-(a * a) / (2 * s * s)) for a in range(w)]
+    out, buf = [], []
+    for x in xs:
+        buf.append(x)
+        if len(buf) > w:
+            buf.pop(0)
+        num = den = 0.0
+        for age, v in enumerate(reversed(buf)):
+            num += weights[age] * v
+            den += weights[age]
+        out.append(num / den)
+    return out
+
+
+def sigma(xs):
+    """Robust spread: MAD x 1.4826 (normal-consistent), stdev fallback."""
+    med = st.median(xs)
+    mad = st.median([abs(x - med) for x in xs])
+    return 1.4826 * mad if mad > 0 else st.stdev(xs)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", action="append", required=True,
@@ -125,12 +153,24 @@ def main():
         except ValueError:
             sys.exit(f"bad --level {spec!r}: want LOADGEN_RPS:NDJSON")
         arrival, windows = load_level(path, args.section, args.trim_s)
-        d50 = wmean([(w[0], w[2]) for w in windows])
-        d90 = wmean([(w[1], w[2]) for w in windows])
+        # Curve values live in the SAME domain the scorer compares them
+        # against: the runtime ext term is (T~ - D)/T~ where T~ is the
+        # Gaussian-smoothed stream, so D must be the typical value of
+        # that smoothed stream at this rate -- median of the replayed
+        # smoothed signal. (A request-weighted MEAN is dominated by rare
+        # straggler windows on the skewed p90 stream: it measured ~6x
+        # the typical smoothed level, leaving ext90 clamped at 0 until
+        # the tail exceeded 6x intrinsic.)
+        d50 = st.median(smooth_stream([w[0] for w in windows], args.window))
+        d90 = st.median(smooth_stream([w[1] for w in windows], args.window))
+        wm50 = wmean([(w[0], w[2]) for w in windows])
+        wm90 = wmean([(w[1], w[2]) for w in windows])
         levels.append(dict(loadgen=loadgen_rps, arrival=arrival,
-                           d50=d50, d90=d90, n=len(windows), windows=windows))
+                           d50=d50, d90=d90, wm50=wm50, wm90=wm90,
+                           n=len(windows), windows=windows))
         print(f"level loadgen={loadgen_rps:g}: arrival_mean={arrival:.0f} "
-              f"d50={d50:.1f} d90={d90:.1f} kcyc over {len(windows)} windows")
+              f"d50={d50:.1f} d90={d90:.1f} kcyc (smoothed-median; "
+              f"wmean {wm50:.0f}/{wm90:.0f}) over {len(windows)} windows")
 
     # Curve rows keyed by the victim's OWN arrival rate (what the scorer
     # indexes with); loadgen rate kept as provenance in target_rps... no:
@@ -153,30 +193,8 @@ def main():
     # signal sits near the MEAN, far above the raw median. A raw-median
     # baseline therefore pins y90 at 1 on a perfectly healthy system.
     # Fix: replay the captured stream through the identical smoother and
-    # take median + MAD of the SMOOTHED values.
-    def smooth_stream(xs, w):
-        import math
-        if w < 2:
-            return list(xs)
-        s = w / 3.0
-        weights = [math.exp(-(a * a) / (2 * s * s)) for a in range(w)]
-        out, buf = [], []
-        for x in xs:
-            buf.append(x)
-            if len(buf) > w:
-                buf.pop(0)
-            num = den = 0.0
-            for age, v in enumerate(reversed(buf)):
-                num += weights[age] * v
-                den += weights[age]
-            out.append(num / den)
-        return out
-
-    def sigma(xs):
-        med = st.median(xs)
-        mad = st.median([abs(x - med) for x in xs])
-        return 1.4826 * mad if mad > 0 else st.stdev(xs)
-
+    # take median + MAD of the SMOOTHED values (smooth_stream / sigma at
+    # module level; the curve's D values use the same domain).
     op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
     k50 = smooth_stream([w[0] for w in op["windows"]], args.window)
     k90 = smooth_stream([w[1] for w in op["windows"]], args.window)
@@ -208,6 +226,7 @@ def main():
             },
             "levels": [{"loadgen": l["loadgen"], "arrival": round(l["arrival"], 1),
                         "d50": round(l["d50"], 1), "d90": round(l["d90"], 1),
+                        "wmean_d50": round(l["wm50"], 1), "wmean_d90": round(l["wm90"], 1),
                         "n_windows": l["n"]} for l in levels],
             "baseline_level_loadgen": op["loadgen"],
         },
