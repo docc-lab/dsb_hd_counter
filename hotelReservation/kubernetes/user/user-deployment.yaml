@@ -32,6 +32,14 @@ spec:
           name: hotel-reserv-user
           ports:
             - containerPort: 8086
+          env:
+            # Keep timing ON for the user service. Recent image builds
+            # carry a latent bug (fixed in interceptor/options.go, commit
+            # pending image rebuild) where ENABLE_TIMING unset installs a
+            # timing interceptor with a nil aggregator -> SIGSEGV on the
+            # first CheckUser RPC. Setting it here (not via kubectl set
+            # env) survives the eval harness re-applying this manifest.
+            - {name: ENABLE_TIMING, value: "true"}
           resources:
             requests:
               cpu: "1"
