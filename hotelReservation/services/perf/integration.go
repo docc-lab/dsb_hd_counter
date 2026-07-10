@@ -100,6 +100,16 @@ func ParseWindowedSamplingConfig(serviceName string, iterationID int) (*RunConfi
 // Returns 0 when no source produces a usable value, in which case the
 // windowed sampler emits Freq.OK=false for every sample.
 func parseTscFreqMHz() float64 {
+	// 0) Kill switch. WINDOWED_FREQ_ENABLED=false disables the MSR-based
+	// frequency sampler entirely (Freq.OK=false on every sample; timing
+	// windows and perf counters unaffected). The env already existed on
+	// deployments as a stage-1 convention but nothing consumed it; it is
+	// the A/B lever for isolating MSR-read cost from the sampling path.
+	if v := os.Getenv("WINDOWED_FREQ_ENABLED"); strings.EqualFold(v, "false") {
+		log.Info().Msg("WINDOWED_FREQ_ENABLED=false: MSR frequency sampling disabled")
+		return 0
+	}
+
 	// 1) Operator override
 	if v := os.Getenv("TSC_FREQ_MHZ"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {

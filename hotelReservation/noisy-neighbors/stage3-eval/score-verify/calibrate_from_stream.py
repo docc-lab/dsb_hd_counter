@@ -124,6 +124,26 @@ def sigma(xs):
     return 1.4826 * mad if mad > 0 else st.stdev(xs)
 
 
+def despike(xs, w, k):
+    """Mirror of the Go scorer's Despiker (services/perf/score/gordion/
+    despike.go): replace any sample exceeding k x the rolling median of
+    the previous w RAW samples with that median. k <= 0 disables. Keeps
+    the calibration in the same signal domain the runtime scorer sees."""
+    if k <= 0:
+        return list(xs)
+    out, hist = [], []
+    for v in xs:
+        med = st.median(hist) if hist else 0.0
+        hist.append(v)
+        if len(hist) > w:
+            hist.pop(0)
+        if len(hist) <= 5 or med <= 0 or v <= k * med:
+            out.append(v)
+        else:
+            out.append(med)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", action="append", required=True,
@@ -142,6 +162,10 @@ def main():
                          "--operating-rps provides the baseline.")
     ap.add_argument("--k", type=float, default=1.0)
     ap.add_argument("--window", type=int, default=30)
+    ap.add_argument("--despike-k", type=float, default=8.0,
+                    help="impulse filter threshold (x rolling median) applied "
+                         "before smoothing, matching the Go scorer's despike_k; "
+                         "0 disables. Written into gordion.json.")
     ap.add_argument("--rate-signal", default="arrival_rps_3s",
                     choices=["arrival_rps_1s", "arrival_rps_3s"])
     ap.add_argument("--curve-csv-pod-path", default="/etc/gordion-conf/curve.csv",
@@ -170,8 +194,12 @@ def main():
         # straggler windows on the skewed p90 stream: it measured ~6x
         # the typical smoothed level, leaving ext90 clamped at 0 until
         # the tail exceeded 6x intrinsic.)
-        d50 = st.median(smooth_stream([w[0] for w in windows], args.window))
-        d90 = st.median(smooth_stream([w[1] for w in windows], args.window))
+        raw50_series = [w[0] for w in windows]
+        x50 = despike(raw50_series, args.window, args.despike_k)
+        x90 = despike([w[1] for w in windows], args.window, args.despike_k)
+        n_despiked = sum(1 for a, b in zip(raw50_series, x50) if a != b)
+        d50 = st.median(smooth_stream(x50, args.window))
+        d90 = st.median(smooth_stream(x90, args.window))
         wm50 = wmean([(w[0], w[2]) for w in windows])
         wm90 = wmean([(w[1], w[2]) for w in windows])
         # Contamination tripwire: on a clean capture the smoothed median
@@ -190,8 +218,8 @@ def main():
                            n=len(windows), windows=windows))
         print(f"level loadgen={loadgen_rps:g}: arrival_mean={arrival:.0f} "
               f"d50={d50:.1f} d90={d90:.1f} kcyc (smoothed-median; "
-              f"wmean {wm50:.0f}/{wm90:.0f}; raw p50 median {raw50:.1f}) "
-              f"over {len(windows)} windows"
+              f"wmean {wm50:.0f}/{wm90:.0f}; raw p50 median {raw50:.1f}; "
+              f"{n_despiked} despiked) over {len(windows)} windows"
               + ("  <-- CONTAMINATED" if bad else ""))
 
     if contaminated and not args.force:
@@ -234,13 +262,14 @@ def main():
         op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
         base_windows = op["windows"]
         base_src = f"level loadgen={op['loadgen']:g}"
-    k50 = smooth_stream([w[0] for w in base_windows], args.window)
-    k90 = smooth_stream([w[1] for w in base_windows], args.window)
+    k50 = smooth_stream(despike([w[0] for w in base_windows], args.window, args.despike_k), args.window)
+    k90 = smooth_stream(despike([w[1] for w in base_windows], args.window, args.despike_k), args.window)
     freqs = [w[4] for w in base_windows]
     cfg = {
         "version": args.version,
         "k": args.k,
         "smooth_window": args.window,
+        "despike_k": args.despike_k,
         "latency_section": args.section,
         "baseline": {
             "p50_kcyc": round(st.median(k50), 3),

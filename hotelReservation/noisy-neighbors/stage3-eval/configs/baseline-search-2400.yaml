@@ -29,6 +29,6 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.1
+  image: docclabgroup/search-online:v2.2.2   # despike_k impulse filter
   score_log: true
 aggressors: []
