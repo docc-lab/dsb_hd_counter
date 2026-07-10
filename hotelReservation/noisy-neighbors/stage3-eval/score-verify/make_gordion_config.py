@@ -55,11 +55,12 @@ from datetime import datetime, timezone
 
 
 def to_epoch(ts):
-    """RFC3339 timestamp (possibly nanosecond precision, trailing Z)
-    -> unix epoch seconds. Mirrors the stage-1 tooling's parsing."""
+    """RFC3339 timestamp -> unix epoch seconds. Robust to any fractional
+    precision (Go emits 1-9 digits; datetime.fromisoformat before Python
+    3.11 accepts only exactly 3 or 6), missing fractions, and trailing Z."""
     s = str(ts).strip().replace("Z", "+00:00")
-    # datetime.fromisoformat on older Pythons rejects >6 fractional digits.
-    s = re.sub(r"\.(\d{6})\d+", r".\1", s)
+    # Pad/truncate the fractional seconds (if any) to exactly 6 digits.
+    s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
