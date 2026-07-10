@@ -281,16 +281,22 @@ def main():
             if not ok:
                 failures.append(f"extrinsic: {label} aggressor mean {ma:.3f} <= baseline {mb:.3f}")
 
-    # 4. stream health.
-    gaps = [b["t"] - a["t"] for a, b in zip(events, events[1:])]
-    gaps_sorted = sorted(gaps)
-    med = gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else 0
-    worst = max(gaps) if gaps else 0
-    ok = med > 0 and worst <= 10 * med
+    # 4. stream health. Console-log timestamps are quantized to 1 s
+    #    (zerolog default), so many events share a stamp and the median
+    #    gap is 0 -- judge dropouts against the MEAN interval (robust to
+    #    quantization) and tolerate gaps up to 3x the stamp quantum.
+    worst = max((b["t"] - a["t"] for a, b in zip(events, events[1:])), default=0)
+    span = events[-1]["t"] - events[0]["t"]
+    mean_int = span / (len(events) - 1) if len(events) > 1 else 0
+    quantum = min((g for g in (b["t"] - a["t"] for a, b in zip(events, events[1:])) if g > 0),
+                  default=0)
+    threshold = max(10 * mean_int, 3 * quantum)
+    ok = mean_int > 0 and worst <= threshold
     print(f"[4] stream health: {'PASS' if ok else 'FAIL'} "
-          f"(median interval {med * 1000:.0f} ms, worst gap {worst:.2f} s)")
+          f"(mean interval {mean_int * 1000:.0f} ms, stamp quantum {quantum * 1000:.0f} ms, "
+          f"worst gap {worst:.2f} s, threshold {threshold:.2f} s)")
     if not ok:
-        failures.append(f"stream: worst gap {worst:.2f}s > 10x median {med:.3f}s")
+        failures.append(f"stream: worst gap {worst:.2f}s > threshold {threshold:.2f}s")
 
     # 5. prediction vs formula (only when a model was attached).
     pred_events = [e for e in events if e["pred_on"]]
