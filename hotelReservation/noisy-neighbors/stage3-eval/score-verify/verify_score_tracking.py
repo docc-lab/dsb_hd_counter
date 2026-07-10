@@ -4,7 +4,12 @@ verify_score_tracking.py — check that the published score stream tracks
 contention up AND down across a phased aggressor schedule.
 
 Inputs:
-  --scores scores.ndjson   from record_scores.sh (one ScoreEvent JSON/line)
+  --scores FILE            either grpcurl NDJSON from record_scores.sh
+                           (one ScoreEvent JSON per line) OR a
+                           score_events.log captured by stage3-eval.sh
+                           (zerolog console lines with key=value fields;
+                           requires victim.score_log: true). Format is
+                           auto-detected per line; both may be mixed.
   --phases phases.yaml     phase schedule (see below)
   [--plot timeline.png]    optional score timeline with phase shading
   [--trim-s 15]            seconds trimmed from each phase start before
@@ -49,10 +54,14 @@ from datetime import datetime, timezone
 # ── input parsing ─────────────────────────────────────────────────────
 
 def parse_ts(v):
-    """ISO8601 string or unix seconds -> unix seconds (float)."""
+    """ISO8601 string or unix seconds -> unix seconds (float). Robust to
+    any fractional precision (pre-3.11 fromisoformat accepts only
+    exactly 3 or 6 digits; Go emits 1-9)."""
     if isinstance(v, (int, float)):
         return float(v)
+    import re as _re
     s = str(v).strip().replace("Z", "+00:00")
+    s = _re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -85,28 +94,72 @@ def fget(ev, *names, default=0.0):
     return default
 
 
+import re
+
+# zerolog console line: "2026-07-10T00:50:27Z INF <caller> > score_event
+# ext_pct_50=0.79 ... y50_current=1 ..." — leading RFC3339 timestamp,
+# then key=value fields. The kv timestamp field (sub-second, from the
+# Sample) is preferred over the 1 s-resolution line timestamp.
+_KV_RE = re.compile(r"(\w+)=(\S+)")
+_LEAD_TS_RE = re.compile(r"^(\S+)\s")
+
+
+def parse_console_line(line):
+    if "score_event" not in line:
+        return None
+    kv = dict(_KV_RE.findall(line))
+    t = None
+    if "timestamp" in kv:
+        try:
+            t = parse_ts(kv["timestamp"])
+        except ValueError:
+            t = None
+    if t is None:
+        m = _LEAD_TS_RE.match(line)
+        if not m:
+            return None
+        t = parse_ts(m.group(1))
+    return {
+        "t": t,
+        "p50_pred": float(kv.get("p50_trend_pred", 0)),
+        "y90": float(kv.get("tail_trend_label", 0)),
+        "y50": float(kv.get("y50_current", 0)),
+        "ext50": float(kv.get("ext_pct_50", 0)),
+        "ext90": float(kv.get("ext_pct_90", 0)),
+        "pred_on": kv.get("prediction_on", "false").lower() == "true",
+    }
+
+
 def load_events(path):
     events = []
     for lineno, line in enumerate(open(path), 1):
         line = line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            print(f"WARN: {path}:{lineno}: bad JSON, skipped", file=sys.stderr)
-            continue
-        # int64 arrives as a string in proto3 JSON.
-        ts_ns = int(fget(ev, "timestampNs", "timestamp_ns", default=0))
-        events.append({
-            "t": ts_ns / 1e9,
-            "p50_pred": float(fget(ev, "p50TrendPred", "p50_trend_pred")),
-            "y90": float(fget(ev, "tailTrendLabel", "tail_trend_label")),
-            "y50": float(fget(ev, "y50Current", "y50_current")),
-            "ext50": float(fget(ev, "extPct50", "ext_pct_50")),
-            "ext90": float(fget(ev, "extPct90", "ext_pct_90")),
-            "pred_on": bool(fget(ev, "predictionOn", "prediction_on", default=False)),
-        })
+        if line.startswith("{"):
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"WARN: {path}:{lineno}: bad JSON, skipped", file=sys.stderr)
+                continue
+            # int64 arrives as a string in proto3 JSON.
+            ts_ns = int(fget(ev, "timestampNs", "timestamp_ns", default=0))
+            events.append({
+                "t": ts_ns / 1e9,
+                "p50_pred": float(fget(ev, "p50TrendPred", "p50_trend_pred")),
+                "y90": float(fget(ev, "tailTrendLabel", "tail_trend_label")),
+                "y50": float(fget(ev, "y50Current", "y50_current")),
+                "ext50": float(fget(ev, "extPct50", "ext_pct_50")),
+                "ext90": float(fget(ev, "extPct90", "ext_pct_90")),
+                "pred_on": bool(fget(ev, "predictionOn", "prediction_on", default=False)),
+            })
+        else:
+            try:
+                ev = parse_console_line(line)
+            except (ValueError, KeyError):
+                ev = None
+            if ev is not None:
+                events.append(ev)
     events.sort(key=lambda e: e["t"])
     return events
 
