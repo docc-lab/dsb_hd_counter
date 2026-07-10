@@ -134,6 +134,12 @@ def main():
     ap.add_argument("--trim-s", type=float, default=15.0)
     ap.add_argument("--operating-rps", type=float, default=2400.0,
                     help="loadgen rate whose capture provides the baseline stats")
+    ap.add_argument("--baseline", metavar="NDJSON",
+                    help="dedicated capture for the baseline stats (e.g. recorded "
+                         "during a harness baseline run, so pod-restart/cache "
+                         "conditions match the eval); the curve still comes from "
+                         "the --level sweep. Default: the level nearest "
+                         "--operating-rps provides the baseline.")
     ap.add_argument("--k", type=float, default=1.0)
     ap.add_argument("--window", type=int, default=30)
     ap.add_argument("--rate-signal", default="arrival_rps_3s",
@@ -195,10 +201,16 @@ def main():
     # Fix: replay the captured stream through the identical smoother and
     # take median + MAD of the SMOOTHED values (smooth_stream / sigma at
     # module level; the curve's D values use the same domain).
-    op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
-    k50 = smooth_stream([w[0] for w in op["windows"]], args.window)
-    k90 = smooth_stream([w[1] for w in op["windows"]], args.window)
-    freqs = [w[4] for w in op["windows"]]
+    if args.baseline:
+        _, base_windows = load_level(args.baseline, args.section, args.trim_s)
+        base_src = args.baseline
+    else:
+        op = min(levels, key=lambda l: abs(l["loadgen"] - args.operating_rps))
+        base_windows = op["windows"]
+        base_src = f"level loadgen={op['loadgen']:g}"
+    k50 = smooth_stream([w[0] for w in base_windows], args.window)
+    k90 = smooth_stream([w[1] for w in base_windows], args.window)
+    freqs = [w[4] for w in base_windows]
     cfg = {
         "version": args.version,
         "k": args.k,
@@ -221,14 +233,14 @@ def main():
         "_provenance": {
             "method": "calibrate_from_stream (baseline stats over the smoothed stream)",
             "raw_window_medians": {
-                "p50_kcyc": round(st.median([w[0] for w in op["windows"]]), 1),
-                "p90_kcyc": round(st.median([w[1] for w in op["windows"]]), 1),
+                "p50_kcyc": round(st.median([w[0] for w in base_windows]), 1),
+                "p90_kcyc": round(st.median([w[1] for w in base_windows]), 1),
             },
             "levels": [{"loadgen": l["loadgen"], "arrival": round(l["arrival"], 1),
                         "d50": round(l["d50"], 1), "d90": round(l["d90"], 1),
                         "wmean_d50": round(l["wm50"], 1), "wmean_d90": round(l["wm90"], 1),
                         "n_windows": l["n"]} for l in levels],
-            "baseline_level_loadgen": op["loadgen"],
+            "baseline_source": base_src,
         },
     }
     with open(args.out_config, "w") as f:
@@ -236,7 +248,7 @@ def main():
     b = cfg["baseline"]
     print(f"wrote {args.out_config}: baseline p50={b['p50_kcyc']} p90={b['p90_kcyc']} kcyc, "
           f"sigma50={b['sigma50_kcyc']} sigma90={b['sigma90_kcyc']}, f={b['freq_mhz']} MHz "
-          f"(from loadgen={op['loadgen']:g} level, {op['n']} windows)")
+          f"(baseline from {base_src}, {len(base_windows)} windows)")
 
 
 if __name__ == "__main__":
