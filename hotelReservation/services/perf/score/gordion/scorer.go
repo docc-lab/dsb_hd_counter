@@ -42,11 +42,28 @@ type Scorer struct {
 
 	// Hold state: windows with zero completions carry the last observed
 	// normalized latency forward so the smoothed estimate decays on the
-	// kernel's schedule instead of collapsing toward zero.
+	// kernel's schedule instead of collapsing toward zero. The hold is
+	// BOUNDED by cfg.IdleHoldWindows: a genuinely idle service (no
+	// arrivals either) stops publishing after that many windows and the
+	// scorer resets, so a frozen end-of-load score never outlives the
+	// load by more than the hold budget.
 	lastT50, lastT90 float64
 	haveLast         bool
 
 	stallRun int // consecutive windows with arrivals but no completions
+	idleRun  int // consecutive windows with no completions at all
+}
+
+// reset clears all streaming state; the next scored window starts a
+// fresh smoothing warm-up.
+func (sc *Scorer) reset() {
+	cfg := sc.cfg
+	sc.s50 = NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing)
+	sc.s90 = NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing)
+	sc.sRate = NewSmoother(cfg.SmoothWindow, cfg.Ablations.RawRateIndex)
+	sc.lastT50, sc.lastT90 = 0, 0
+	sc.haveLast = false
+	sc.stallRun, sc.idleRun = 0, 0
 }
 
 // NewScorer wires a Scorer from a validated Config and its loaded curve
@@ -64,6 +81,21 @@ func NewScorer(cfg *Config, curve *Curve) *Scorer {
 // Score processes one window. See Output for field semantics.
 func (sc *Scorer) Score(in WindowInput) Output {
 	cfg := sc.cfg
+
+	// ── idle timeout ─────────────────────────────────────────────────
+	// A stall (arrivals but no completions) is a failure signal and is
+	// handled below; genuine idleness (nothing arriving) just bounds the
+	// hold. After IdleHoldWindows of it, stop publishing and reset --
+	// stale scores must not outlive the traffic that produced them.
+	if in.RequestCount == 0 {
+		sc.idleRun++
+	} else {
+		sc.idleRun = 0
+	}
+	if in.RequestCount == 0 && in.ArrivalCount == 0 && sc.idleRun > cfg.IdleHoldWindows {
+		sc.reset()
+		return Output{}
+	}
 
 	// ── failure short-circuit inputs ─────────────────────────────────
 	// Stall: requests arriving but none completing, sustained over

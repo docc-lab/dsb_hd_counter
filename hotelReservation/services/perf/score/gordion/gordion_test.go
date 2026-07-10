@@ -272,6 +272,53 @@ func TestScorerHoldOnEmptyWindow(t *testing.T) {
 	}
 }
 
+// TestScorerIdleTimeout: the zero-completion hold must be bounded --
+// after IdleHoldWindows of genuine idleness the scorer stops publishing
+// and resets, so a frozen end-of-load score never outlives the load.
+// (Field-observed: a subscriber connecting minutes after a load burst
+// saw y=1 held indefinitely from the burst's drain windows.)
+func TestScorerIdleTimeout(t *testing.T) {
+	cfg := testConfig()
+	cfg.IdleHoldWindows = 10
+	sc := NewScorer(cfg, testCurve(t))
+
+	// Sustained contention, then traffic stops entirely.
+	high := baselineWindow()
+	high.P50Ns, high.P90Ns = 400_000, 900_000
+	for i := 0; i < 30; i++ {
+		sc.Score(high)
+	}
+	idle := WindowInput{FreqMHz: 2400, FreqOK: true}
+
+	// Within the hold budget: still publishing the held (high) score.
+	var out Output
+	for i := 0; i < cfg.IdleHoldWindows; i++ {
+		out = sc.Score(idle)
+		if !out.OK {
+			t.Fatalf("idle window %d within hold budget must still publish", i+1)
+		}
+	}
+	if out.Y50 < 0.9 {
+		t.Fatalf("held score should still be high inside the budget, got %v", out.Y50)
+	}
+
+	// Budget exceeded: stop publishing.
+	out = sc.Score(idle)
+	if out.OK {
+		t.Fatalf("idle window past hold budget must not publish: %+v", out)
+	}
+
+	// Traffic returns at baseline: scoring restarts FRESH (no stale
+	// high-latency history in the smoother).
+	out = sc.Score(baselineWindow())
+	if !out.OK {
+		t.Fatal("first window after traffic returns must publish")
+	}
+	if out.Y50 > 0.01 {
+		t.Fatalf("post-reset baseline window must score ~0 (stale history leaked): %v", out.Y50)
+	}
+}
+
 func TestScorerPreSignalWindowsSkipped(t *testing.T) {
 	sc := NewScorer(testConfig(), testCurve(t))
 	out := sc.Score(WindowInput{FreqMHz: 2400, FreqOK: true})
