@@ -1,0 +1,2 @@
+2026-07-10T00:50:27Z INF x > score_event event=score ext_pct_50=0.79697883 ext_pct_90=0.81161076 p50_trend_pred=0.42 prediction_on=true sample_id=14048 tail_trend_label=0.63 timestamp=2026-07-10T00:50:27.793447479Z y50_current=0.41
+{"sampleId":"14048","timestampNs":"1783644627793447479","p50TrendPred":0.42,"tailTrendLabel":0.63,"y50Current":0.41,"extPct50":0.79697883,"extPct90":0.81161076,"predictionOn":true}
