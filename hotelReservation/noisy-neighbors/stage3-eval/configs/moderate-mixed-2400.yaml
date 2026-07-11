@@ -1,0 +1,44 @@
+# Stage 3 five-phase discrimination — MODERATE arm (phases 2 and 4 of
+# the baseline/moderate/severe/moderate/baseline schedule).
+#
+# Identical to severe-mixed-2400.yaml except the SN/SS driver rates sit
+# one step below the victim-tipping ladder (SN 5400 / SS 6300), so the
+# scorer must read this as "contended but less than severe".
+#
+#   ./stage3-eval.sh configs/moderate-mixed-2400.yaml
+#
+# Victim load is FIXED at 2400 rps across all five phases — any score
+# movement is extrinsic by construction (rate signal unchanged).
+
+experiment:
+  name: moderate-mixed-2400
+  duration_s: 120
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-3
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 2400, shape: exp}   # victim load -- keep fixed across phases
+  socialNetwork:
+    loadgen: {rps: 5200, shape: exp}   # moderate: one step below severe 5400
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 6100, shape: exp}   # moderate: one step below severe 6300
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.2.3
+  score_log: true
+aggressors:
+  # Same 9-co-tenant mix as severe; only the SN/SS driver rates differ.
+  - {testbed: hotelReservation, service: profile, role: bad}
+  - {testbed: hotelReservation, service: geo,     role: good}
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}
