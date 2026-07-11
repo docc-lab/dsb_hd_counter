@@ -39,7 +39,6 @@ type Scorer struct {
 	curve *Curve // nil iff cfg.Ablations.NoExt
 
 	s50, s90, sRate *Smoother
-	d50, d90        *Despiker // nil unless cfg.DespikeK > 0
 
 	// Hold state: windows with zero completions carry the last observed
 	// normalized latency forward so the smoothed estimate decays on the
@@ -62,8 +61,6 @@ func (sc *Scorer) reset() {
 	sc.s50 = NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing)
 	sc.s90 = NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing)
 	sc.sRate = NewSmoother(cfg.SmoothWindow, cfg.Ablations.RawRateIndex)
-	sc.d50 = NewDespiker(cfg.SmoothWindow, cfg.DespikeK)
-	sc.d90 = NewDespiker(cfg.SmoothWindow, cfg.DespikeK)
 	sc.lastT50, sc.lastT90 = 0, 0
 	sc.haveLast = false
 	sc.stallRun, sc.idleRun = 0, 0
@@ -78,8 +75,6 @@ func NewScorer(cfg *Config, curve *Curve) *Scorer {
 		s50:   NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing),
 		s90:   NewSmoother(cfg.SmoothWindow, cfg.Ablations.NoSmoothing),
 		sRate: NewSmoother(cfg.SmoothWindow, cfg.Ablations.RawRateIndex),
-		d50:   NewDespiker(cfg.SmoothWindow, cfg.DespikeK),
-		d90:   NewDespiker(cfg.SmoothWindow, cfg.DespikeK),
 	}
 }
 
@@ -131,12 +126,6 @@ func (sc *Scorer) Score(in WindowInput) Output {
 		// kcyc = (ns / 1000 us) * MHz / 1000 = ns * MHz / 1e6
 		t50 = in.P50Ns * f / 1e6
 		t90 = in.P90Ns * f / 1e6
-		// Impulse rejection BEFORE the hold-state store: a spike must
-		// neither enter the smoother nor be what an empty window holds.
-		if sc.d50 != nil {
-			t50 = sc.d50.Push(t50)
-			t90 = sc.d90.Push(t90)
-		}
 		sc.lastT50, sc.lastT90 = t50, t90
 		sc.haveLast = true
 	} else if sc.haveLast {

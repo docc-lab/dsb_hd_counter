@@ -56,16 +56,6 @@ type Config struct {
 	// 30 (= 3 s at the 100 ms window interval).
 	SmoothWindow int `json:"smooth_window"`
 
-	// DespikeK enables the pre-smoothing impulse filter (see Despiker):
-	// a window whose normalized latency exceeds DespikeK x the rolling
-	// median of the raw stream is replaced by that median before it
-	// enters the Gaussian smoother. 0 (default) disables. Values in
-	// (0, 2) are rejected -- they would clip ordinary jitter and real
-	// moderate contention. 8-10 is the recommended range: far above
-	// genuine contention shifts (2-10x), far below the environment's
-	// stall impulses (200-500x).
-	DespikeK float64 `json:"despike_k"`
-
 	// LatencySection picks which interceptor duration block drives the
 	// score: processing_time (default; matches the stage-1 curve
 	// columns), total_time, or blocking_time. The baseline scalars and
@@ -187,9 +177,6 @@ func (c *Config) Validate() error {
 	}
 	if c.SmoothWindow < 1 {
 		return fmt.Errorf("smooth_window must be >= 1 (got %d)", c.SmoothWindow)
-	}
-	if c.DespikeK != 0 && c.DespikeK < 2 {
-		return fmt.Errorf("despike_k must be 0 (disabled) or >= 2 (got %v)", c.DespikeK)
 	}
 	switch c.LatencySection {
 	case SectionProcessingTime, SectionTotalTime, SectionBlockingTime:
