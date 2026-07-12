@@ -38,6 +38,17 @@ type PerfHandles struct {
 
 const name = "srv-search"
 
+// perRequestPerf gates the legacy per-request perf instrumentation
+// (C.perf_start / C.perf_stop around the Nearby handler). Root-caused
+// 2026-07-12 as the "metronome": the otgrpc interceptor puts a span in
+// EVERY request context regardless of sample ratio, so this path issued
+// three perf_event_open syscalls plus a read/close per request; those
+// syscalls periodically stall 10-50ms in the kernel's perf subsystem
+// (once-per-second unthrottle/context work, contention with the
+// windowed sampler), freezing in-flight handlers on a ~1s cadence on
+// every node. Keep OFF unless explicitly re-enabled for a reason.
+var perRequestPerf = os.Getenv("ENABLE_PER_REQUEST_PERF") == "true"
+
 // Server implments the search service
 type Server struct {
 	pb.UnimplementedSearchServer
@@ -203,8 +214,10 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	log.Trace().Msgf("nearby lat = %f", req.Lat)
@@ -244,9 +257,11 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
 		
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
