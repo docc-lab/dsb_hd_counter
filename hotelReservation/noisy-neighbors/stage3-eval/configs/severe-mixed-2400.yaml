@@ -1,24 +1,13 @@
-# Stage 3 five-phase discrimination — SEVERE arm (phase 3, the peak of
-# the baseline/moderate/severe/moderate/baseline schedule).
-#
-# SN 5400 / SS 6300 are the victim-tipping driver rates from the
-# example-mixed config; moderate-mixed-2400.yaml sits one step below.
-#
-#   ./stage3-eval.sh configs/severe-mixed-2400.yaml
-#
-# Victim load is FIXED at 2400 rps across all five phases — any score
-# movement is extrinsic by construction (rate signal unchanged).
-
 experiment:
   name: severe-mixed-2400
   duration_s: 120
   warmup_s: 30
   cooldown_s: 30
   runs: 1
-  target_node: node-3
+  target_node: node-4
 testbeds:
   hotelReservation:
-    loadgen: {rps: 2400, shape: exp}   # victim load -- keep fixed across phases
+    loadgen: {rps: 2400, shape: exp}
   socialNetwork:
     loadgen: {rps: 5400, shape: exp}
     replicas: 2
@@ -28,10 +17,9 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.3
+  image: docclabgroup/search-online:v2.2.5
   score_log: true
 aggressors:
-  # Same 9-co-tenant mix as moderate; only the SN/SS driver rates differ.
   - {testbed: hotelReservation, service: profile, role: bad}
   - {testbed: hotelReservation, service: geo,     role: good}
   - {testbed: socialNetwork, service: compose-post,  role: bad}

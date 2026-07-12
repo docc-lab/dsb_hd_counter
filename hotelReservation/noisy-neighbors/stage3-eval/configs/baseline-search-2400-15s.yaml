@@ -17,12 +17,12 @@
 # the stage-1 curve came from the same node type as target_node).
 
 experiment:
-  name: baseline-search-2400
-  duration_s: 120
+  name: baseline-search-2400-15s
+  duration_s: 15
   warmup_s: 30
   cooldown_s: 30
   runs: 1
-  target_node: node-4
+  target_node: node-3
 testbeds:
   hotelReservation:
     loadgen: {rps: 2400, shape: exp}   # same victim load as the mixed runs
