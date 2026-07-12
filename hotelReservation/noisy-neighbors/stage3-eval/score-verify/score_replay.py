@@ -205,6 +205,7 @@ def main():
                        {'offset_ms': samples[i]['off'],
                         'p50_contention_score': round(y50, 4),
                         'p90_contention_score': round(y90, 4),
+                        'p90_extrinsic_pct': round(e90, 4),
                         'timing_window': {
                             'arrival_rps_1s': samples[i]['rate1']}}
                        for ts, y50, y90, e50, e90, i in rows]}
@@ -278,13 +279,32 @@ def main():
                     state = 0
 
                 f.write(f"{s['ts']:.3f},{sr:.4f},{ci:.4f},{cpi:.4f},{rpctl:.4f},{state}\n")
-                rows.append((sr, ci, cpi, rpctl, state))
+                rows.append((sr, ci, cpi, rpctl, state, s))
         st = rows[150:] or rows
         n = len(st)
         names = ['slowdown_ratio', 'ci', 'cpi', 'rolling_pctl', 'binary(frac=1)']
         means = [sum(r[i] for r in st) / n for i in range(5)]
         print('  competitors (steady means): ' +
               ' | '.join(f'{nm}={m:.3f}' for nm, m in zip(names, means)) + f'  -> {out}')
+        if args.sim_json:
+            # RAW values, deliberately unnormalized -- only Gordion is [0,1]
+            # by construction; map competitors onto the controllers' score
+            # scale downstream (e.g. compare_drivers.py anchors baseline->0,
+            # severe->1) so the normalization choice stays in one place.
+            for j, nm in enumerate(('slowdown_ratio', 'ci', 'cpi',
+                                    'rolling_pctl', 'binary')):
+                sim = {'service_name': cfg.get('service', 'search'),
+                       'samples': [
+                           {'offset_ms': r[5]['off'],
+                            'p50_contention_score': round(r[j], 4),
+                            'p90_contention_score': round(r[j], 4),
+                            'timing_window': {
+                                'arrival_rps_1s': r[5]['rate1']}}
+                           for r in rows]}
+                with open(f'{args.out_prefix}_{nm}_sim.json', 'w') as f:
+                    json.dump(sim, f)
+            print(f'  competitors sim traces: {len(rows)} samples x 5 '
+                  f'-> {args.out_prefix}_<method>_sim.json (raw values)')
 
 
 if __name__ == '__main__':
