@@ -38,6 +38,11 @@ import (
 */
 import "C"
 
+// perRequestPerf gates the legacy per-request perf syscalls (the 2026-07
+// "metronome": stalls 10-50ms in the kernel perf subsystem on every
+// node; see services/search/server.go for the full story). Default OFF.
+var perRequestPerf = os.Getenv("ENABLE_PER_REQUEST_PERF") == "true"
+
 type PerfHandles struct {
     LeaderFD       int
     InstructionsFD int
@@ -124,8 +129,10 @@ type ImageHelper struct {
 
 func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 	
 	res := new(pb.Result)
@@ -193,9 +200,11 @@ func (s *Server) GetReviews(ctx context.Context, req *pb.Request) (*pb.Result, e
 
 	res.Reviews = reviews
 		
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
