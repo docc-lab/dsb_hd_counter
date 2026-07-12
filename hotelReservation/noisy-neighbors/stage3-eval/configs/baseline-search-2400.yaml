@@ -22,13 +22,13 @@ experiment:
   warmup_s: 30
   cooldown_s: 30
   runs: 1
-  target_node: node-3
+  target_node: node-4
 testbeds:
   hotelReservation:
     loadgen: {rps: 2400, shape: exp}   # same victim load as the mixed runs
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.2
+  image: docclabgroup/search-online:v2.2.5
   score_log: true
 aggressors: []
