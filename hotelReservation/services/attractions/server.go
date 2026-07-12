@@ -28,6 +28,10 @@ import (
 */
 import "C"
 
+// perRequestPerf gates the legacy per-request perf syscalls (the 2026-07
+// "metronome"; see services/search/server.go for the full story). Default OFF.
+var perRequestPerf = os.Getenv("ENABLE_PER_REQUEST_PERF") == "true"
+
 type PerfHandles struct {
     LeaderFD       int
     InstructionsFD int
