@@ -38,7 +38,7 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.2   # ORT single-thread fix
+  image: docclabgroup/search-online:v2.2.5   # ORT single-thread fix
   score_log: true   # GORDION_SCORE_LOG=true -> score_event lines in victim pod log
 aggressors:
   # ~9 co-tenants, all pinned to target_node with the victim. The SN/SS
