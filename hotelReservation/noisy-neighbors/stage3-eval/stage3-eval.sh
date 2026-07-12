@@ -670,6 +670,8 @@ run_one_iteration() {
     # next run's pod roll (kubectl logs is lost on restart).
     capture_victim_score_log "$run_dir" "$started_ns"
 
+    capture_victim_run_data "$run_dir"
+
     write_per_run_manifest "$run_id" "$run_dir" "$started_ns" "$ended_ns"
 
     s3_log "  Run $run_id complete ($(( (ended_ns - started_ns) / 1000000 )) ms)"
@@ -715,6 +717,38 @@ capture_victim_score_log() {
         s3_log "  Captured $n score_event line(s) -> runs/run_$(basename "$run_dir" | sed 's/run_//')/score_events.log"
     else
         s3_log "  WARNING: 0 score_event lines captured (victim emitted none in window; check GORDION_SCORE_SOURCE/model wiring)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# capture_victim_run_data <run_dir>
+#
+# Retrieves the windowed sampler's full-run raw JSON from the victim pod
+# (/data/run_data_<svc>_iter1.json -- the same file data-collector.sh's
+# retrieve_windowed_run_data pulls in other stages). The sampler flushes it
+# every 30s; /data is pod-local, so without this copy the file dies with the
+# next run's rollout restart. Best-effort: never dies. The file covers the
+# pod's whole lifetime (since this run's deploy), not just the driver window
+# -- slice by started/ended_epoch_ns.txt when analyzing.
+# ---------------------------------------------------------------------------
+capture_victim_run_data() {
+    local run_dir="$1"
+    local out="$run_dir/run_data.json"
+    local svc="$VICTIM_SERVICE"
+    local pod
+    pod=$(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT" \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod" ]]; then
+        s3_log "  WARNING: run_data capture skipped (no running victim pod found)"
+        return 0
+    fi
+    kubectl exec "$pod" -- cat "/data/run_data_${svc}_iter1.json" > "$out" 2>/dev/null || true
+    if [[ -s "$out" ]]; then
+        s3_log "  Captured run_data.json ($(wc -c < "$out" | tr -d ' ') bytes) from $pod"
+    else
+        rm -f "$out"
+        s3_log "  WARNING: run_data capture empty (sampler not writing /data/run_data_${svc}_iter1.json?)"
     fi
 }
 
