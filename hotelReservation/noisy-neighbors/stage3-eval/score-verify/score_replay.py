@@ -88,10 +88,13 @@ def load_samples(path, section, rate_signal):
         deltas = fget(s, 'perfDeltas', 'perf_deltas', default=None) or {}
         out.append(dict(
             ts=ts / 1e9,
+            off=int(fget(s, 'offsetMs', 'offset_ms', default=0) or 0),
             p50=int(fget(sec, 'p50Ns', 'p50_ns', default=0) or 0),
             p90=int(fget(sec, 'p90Ns', 'p90_ns', default=0) or 0),
             count=int(fget(sec, 'count', default=0) or 0),
             rate=float(fget(tw, rate_camel, rate_signal, default=0) or 0),
+            rate1=float(fget(tw, 'arrivalRps1s', 'arrival_rps_1s',
+                             default=0) or 0),
             f=float(fget(fq, 'actualFreqMhz', 'actual_freq_mhz', default=0) or 0),
             fok=bool(fget(fq, 'ok', default=False)),
             cycles=int(fget(deltas, 'cycles', 'cpu-cycles', default=0) or 0),
@@ -139,7 +142,7 @@ def replay(samples, cfg, curve, k, sig_mult):
         d50, d90 = curve_lookup(curve, rs[i])
         e50 = min(1.0, max(0.0, (t50s[i] - d50) / t50s[i])) if t50s[i] > 0 else 0.0
         e90 = min(1.0, max(0.0, (t90s[i] - d90) / t90s[i])) if t90s[i] > 0 else 0.0
-        rows.append((s['ts'], y50, y90, e50, e90))
+        rows.append((s['ts'], y50, y90, e50, e90, i))
     return rows
 
 
@@ -167,6 +170,11 @@ def main():
                     help='Binary Classifier enter threshold, x rolling median [default 2.0]')
     ap.add_argument('--bin-lo', type=float, default=1.5,
                     help='Binary Classifier exit threshold (hysteresis), x rolling median [default 1.5]')
+    ap.add_argument('--sim-json', action='store_true',
+                    help='also write <out-prefix>_<name>_sim.json per variant '
+                         'in the Gordion JSON format consumed by '
+                         'simulation.py (offset_ms, p50/p90_contention_score, '
+                         'timing_window.arrival_rps_1s)')
     ap.add_argument('--out-prefix', default='/tmp/replay')
     args = ap.parse_args()
 
@@ -186,11 +194,25 @@ def main():
         rows = replay(samples, cfg, curve, k, mult)
         out = f'{args.out_prefix}_{name}.log'
         with open(out, 'w') as f:
-            for ts, y50, y90, e50, e90 in rows:
+            for ts, y50, y90, e50, e90, _ in rows:
                 f.write(f'replay INF score_replay > score_event timestamp={ts:.3f} '
                         f'y50_current={y50:.4f} tail_trend_label={y90:.4f} '
                         f'ext_pct_50={e50:.4f} ext_pct_90={e90:.4f} '
                         f'p50_trend_pred={y50:.4f} prediction_on=false\n')
+        if args.sim_json:
+            sim = {'service_name': cfg.get('service', 'search'),
+                   'samples': [
+                       {'offset_ms': samples[i]['off'],
+                        'p50_contention_score': round(y50, 4),
+                        'p90_contention_score': round(y90, 4),
+                        'timing_window': {
+                            'arrival_rps_1s': samples[i]['rate1']}}
+                       for ts, y50, y90, e50, e90, i in rows]}
+            sim_out = f'{args.out_prefix}_{name}_sim.json'
+            with open(sim_out, 'w') as f:
+                json.dump(sim, f)
+            print(f'  {name:<8} sim trace: {len(sim["samples"])} samples '
+                  f'-> {sim_out}')
         st = rows[150:] or rows
         m50 = sum(r[1] for r in st) / len(st)
         m90 = sum(r[2] for r in st) / len(st)

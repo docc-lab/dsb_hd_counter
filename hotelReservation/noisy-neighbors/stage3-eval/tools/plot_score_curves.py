@@ -128,8 +128,11 @@ def main():
         print(f'{lab:<12} {n:>2}  ' + '  '.join(f'{c:<14}' for c in cells))
 
     # ---- figure ----
+    from matplotlib import font_manager
+    avail = {f.name for f in font_manager.fontManager.ttflist}
+    fonts = [f for f in ('Segoe UI', 'DejaVu Sans') if f in avail]
     plt.rcParams.update({
-        'font.family': ['Segoe UI', 'DejaVu Sans', 'sans-serif'],
+        'font.family': fonts + ['sans-serif'],
         'figure.facecolor': SURFACE, 'axes.facecolor': SURFACE,
         'savefig.facecolor': SURFACE,
         'text.color': INK, 'axes.edgecolor': BASELINE,
