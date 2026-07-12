@@ -1433,8 +1433,13 @@ reset_non_victim_services() {
         # panic-fixed-1.3 = panic->error + perf_api FD-leak fix + rate perf
         # disable + bounded mongo fallback + rate hotelId query filter (the
         # 117KB-cache-values bandwidth bug). 1.1/1.2 predate the rate fixes.
+        # panic-fixed-1.5 = 1.3 + ALL per-request perf_start/perf_stop call
+        # sites gated behind ENABLE_PER_REQUEST_PERF (default off) — the
+        # 2026-07 "metronome" fix (10-50ms kernel perf-syscall stalls in
+        # every handler; see services/search/server.go) — plus the sampler
+        # periodicFlushLoop no longer holds ws.mu across the disk write.
         # (Ported from batch-perf's data-collector.sh.)
-        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.3}"
+        local default_image="${HR_DEFAULT_IMAGE:-docclabgroup/hotelreservation:panic-fixed-1.5}"
 
         if [[ "$current_image" == "$default_image" ]]; then
             log "$exp_dir" "  $service already using default image ($default_image)"
