@@ -670,7 +670,10 @@ while [[ $# -gt 0 ]]; do
             fi
             services_to_deploy=("${VALID_SERVICES[@]}")
             shift
-            break
+            # NOTE: no `break` here — breaking discarded any trailing [tag]
+            # argument, silently deploying the default debug0.1 tag
+            # (observed 2026-07-12: `all panic-fixed-1.5` re-pushed and
+            # rolled debug0.1 everywhere, incl. clobbering online search).
             ;;
         *)
             # Check if this argument is a valid service
