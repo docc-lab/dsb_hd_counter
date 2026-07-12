@@ -16,7 +16,7 @@ experiment:
   warmup_s: 30
   cooldown_s: 30
   runs: 1
-  target_node: node-3
+  target_node: node-4
 testbeds:
   hotelReservation:
     loadgen: {rps: 2400, shape: exp}   # victim load -- keep fixed across phases
@@ -29,7 +29,7 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.3
+  image: docclabgroup/search-online:v2.2.5
   score_log: true
 aggressors:
   # Same 9-co-tenant mix as severe; only the SN/SS driver rates differ.
