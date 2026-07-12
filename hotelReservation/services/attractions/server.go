@@ -1,6 +1,7 @@
 package attractions
 
 import (
+	"os"
 	"context"
 	"fmt"
 	"net"
@@ -126,8 +127,10 @@ func (s *Server) Shutdown() {
 func (s *Server) NearbyRest(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyRest")
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_restaurant")
@@ -160,9 +163,11 @@ func (s *Server) NearbyRest(ctx context.Context, req *pb.Request) (*pb.Result, e
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
@@ -172,8 +177,10 @@ func (s *Server) NearbyRest(ctx context.Context, req *pb.Request) (*pb.Result, e
 func (s *Server) NearbyMus(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyMus")
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_museum")
@@ -206,9 +213,11 @@ func (s *Server) NearbyMus(ctx context.Context, req *pb.Request) (*pb.Result, er
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
@@ -218,8 +227,10 @@ func (s *Server) NearbyMus(ctx context.Context, req *pb.Request) (*pb.Result, er
 func (s *Server) NearbyCinema(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	log.Trace().Msgf("In Attractions NearbyCinema")
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_cinema")
@@ -252,9 +263,11 @@ func (s *Server) NearbyCinema(ctx context.Context, req *pb.Request) (*pb.Result,
 		res.AttractionIds = append(res.AttractionIds, p.Id())
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
@@ -263,8 +276,10 @@ func (s *Server) NearbyCinema(ctx context.Context, req *pb.Request) (*pb.Result,
 func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	center := &geoindex.GeoPoint{
@@ -273,9 +288,11 @@ func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []g
 		Plon: lon,
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
 
 	return s.indexH.KNearest(
@@ -290,8 +307,10 @@ func (s *Server) getNearbyPointsHotel(ctx context.Context, lat, lon float64) []g
 func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsRest, lat = %f, lon = %f", lat, lon)
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	center := &geoindex.GeoPoint{
@@ -300,9 +319,11 @@ func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []ge
 		Plon: lon,
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return s.indexR.KNearest(
@@ -317,8 +338,10 @@ func (s *Server) getNearbyPointsRest(ctx context.Context, lat, lon float64) []ge
 func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsMus, lat = %f, lon = %f", lat, lon)
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	center := &geoindex.GeoPoint{
@@ -327,9 +350,11 @@ func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geo
 		Plon: lon,
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return s.indexM.KNearest(
@@ -344,8 +369,10 @@ func (s *Server) getNearbyPointsMus(ctx context.Context, lat, lon float64) []geo
 func (s *Server) getNearbyPointsCinema(ctx context.Context, lat, lon float64) []geoindex.Point {
 	log.Trace().Msgf("In geo getNearbyPointsCinema, lat = %f, lon = %f", lat, lon)
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	center := &geoindex.GeoPoint{
@@ -354,9 +381,11 @@ func (s *Server) getNearbyPointsCinema(ctx context.Context, lat, lon float64) []
 		Plon: lon,
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return s.indexC.KNearest(

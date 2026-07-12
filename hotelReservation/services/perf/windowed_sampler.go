@@ -332,29 +332,40 @@ func (ws *windowedSampler) periodicFlushLoop() {
 	for {
 		select {
 		case <-flushTicker.C:
+			// Snapshot under the lock; marshal + disk write OUTSIDE it.
+			// Holding ws.mu across writeRunData serialized the sampler
+			// tick against an ever-growing indented-JSON disk write (the
+			// mutex profile measured seconds of waiter delay per flush).
+			// Elements [0:len) of ws.samples are never mutated after
+			// append, so marshaling the capped snapshot lock-free is safe.
+			// NOTE: samples still grow unboundedly in stream mode (full
+			// history rewritten every flush); bounding is future work.
 			ws.mu.Lock()
-			if len(ws.samples) > 0 {
-				runData := &RunData{
+			var runData *RunData
+			if n := len(ws.samples); n > 0 {
+				runData = &RunData{
 					ServiceName:    ws.config.ServiceName,
 					IterationID:    ws.config.IterationID,
 					RunStart:       ws.runStartTime,
 					RunEnd:         time.Now(),
 					RunDurationMs:  time.Since(ws.runStartTime).Milliseconds(),
 					WindowInterval: ws.config.WindowInterval.Milliseconds(),
-					SampleCount:    len(ws.samples),
+					SampleCount:    n,
 					PerfEvents:     ws.config.PerfEvents,
-					Samples:        ws.samples,
+					Samples:        ws.samples[:n:n],
 					Aggregates:     ws.calculateAggregates(),
 				}
+			}
+			ws.mu.Unlock()
+			if runData != nil {
 				if err := ws.writeRunData(runData); err != nil {
 					log.Error().Err(err).Msg("Periodic flush failed")
 				} else {
 					log.Info().
-						Int("samples_written", len(ws.samples)).
+						Int("samples_written", runData.SampleCount).
 						Msg("Periodic flush: wrote samples to file")
 				}
 			}
-			ws.mu.Unlock()
 			
 		case <-ws.ctx.Done():
 			return

@@ -1,6 +1,7 @@
 package rate
 
 import (
+	"os"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -105,8 +106,10 @@ func (s *Server) Shutdown() {
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	var cHandles C.struct_perf_handles
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		cHandles = C.perf_start()
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			cHandles = C.perf_start()
+		}
 	}
 
 	
@@ -217,9 +220,11 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	sort.Sort(ratePlans)
 	res.RatePlans = ratePlans
 	
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd),C.int(cHandles.instructions_fd),C.int(cHandles.l1_misses_fd)))
-		span.SetTag("Machine Counter Readings", counterResults)
+	if perRequestPerf {
+		if span := opentracing.SpanFromContext(ctx); span != nil {
+			counterResults := C.GoString(C.perf_stop(C.int(cHandles.leader_fd), C.int(cHandles.instructions_fd), C.int(cHandles.l1_misses_fd)))
+			span.SetTag("Machine Counter Readings", counterResults)
+		}
 	}
  
 	return res, nil
