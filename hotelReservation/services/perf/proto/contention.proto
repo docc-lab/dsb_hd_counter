@@ -84,4 +84,14 @@ message ScoreEvent {
 
   // True when p50_trend_pred came from the in-pod ONNX predictor.
   bool   prediction_on    = 11;
+
+  // FIELD ALLOCATION -- this message is a cross-repo wire contract; the
+  // mitigation controller (simple-mitigation repo) decodes it with its
+  // own copy of this proto. Fields 12-14 are allocated to that repo's
+  // multi-horizon prediction arrays (repeated float p50_horizons = 12;
+  // repeated float tail_horizons = 13; repeated int32 horizon_ms = 14).
+  // Do NOT reuse 12-14 here, and never renumber 1-11: a 2026-07-13
+  // incident had the consumer's horizons squatting on 8-10, which made
+  // scalar y50_current/ext_pct_* parse as one-element arrays on the
+  // consumer and silently dropped the extrinsic signal.
 }

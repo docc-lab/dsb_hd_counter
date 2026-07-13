@@ -205,6 +205,7 @@ def main():
                        {'offset_ms': samples[i]['off'],
                         'p50_contention_score': round(y50, 4),
                         'p90_contention_score': round(y90, 4),
+                        'p50_extrinsic_pct': round(e50, 4),
                         'p90_extrinsic_pct': round(e90, 4),
                         'timing_window': {
                             'arrival_rps_1s': samples[i]['rate1']}}

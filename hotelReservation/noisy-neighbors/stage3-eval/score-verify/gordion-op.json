@@ -1,0 +1,38 @@
+{
+ "version": "gordion-v3-opanchor",
+ "k": 0.07,
+ "smooth_window": 30,
+ "latency_section": "processing_time",
+ "baseline": {
+  "p50_kcyc": 51.36,
+  "p90_kcyc": 76.87,
+  "sigma50_kcyc": 3.086,
+  "sigma90_kcyc": 4.077,
+  "freq_mhz": 2299.0
+ },
+ "curve_csv": "/etc/gordion-conf/curve.csv",
+ "curve_columns": {
+  "rate": "target_rps",
+  "p50": "svc_p50_norm_kcyc",
+  "p90": "svc_p90_norm_kcyc"
+ },
+ "rate_signal": "arrival_rps_3s",
+ "failure": {
+  "slo_p90_ms": 0,
+  "stall_windows": 5
+ },
+ "ablations": {
+  "no_smoothing": false,
+  "no_ext": false,
+  "raw_rate_index": false,
+  "use_current_y50": false
+ },
+ "_provenance": {
+  "anchor_domain": "operating point: baseline arm, victim 2400 rps, no co-tenants",
+  "source_capture": "data/stage3eval_20260712_083207_c70bcd6e/runs/run_1/samples.ndjson",
+  "convention": "median + MADx1.4826 of smoothed (w=30) processing_time kcyc stream, steady state (>15s)",
+  "k_rationale": "k=0.07 with sigma50=3.086 preserves the validated k=0.025/sigma=1.09 slope; ladder replays 0.03/0.48/0.61/0.69/0.76/0.77 baseline..severe, zero pinning incl. live mitigated captures (y50 0.68)",
+  "curve": "unchanged from gordion-v2-streamcal",
+  "generated": "2026-07-13, replay-validated on pass-12 sweep arms + mildA2/mildB2 mitigation captures"
+ }
+}
