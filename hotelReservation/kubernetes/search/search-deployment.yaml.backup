@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: kompose convert
+    kompose.version: 1.22.0 (955b78124)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: search
+  name: search
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: search
+  strategy: {}
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert
+        kompose.version: 1.22.0 (955b78124)
+        sidecar.istio.io/statsInclusionPrefixes: cluster.outbound,cluster_manager,listener_manager,http_mixer_filter,tcp_mixer_filter,server,cluster.xds-grp,listener,connection_manager
+        sidecar.istio.io/statsInclusionRegexps: http.*
+        # AppArmor's docker-default profile blocks /dev/cpu/N/msr access
+        # even with CAP_SYS_RAWIO; opt this container out so the MSR-based
+        # freq sampler in services/perf/msr_reader.c can pread the device.
+        # The container name (right of the slash) MUST match the
+        # spec.containers[].name below.
+        container.apparmor.security.beta.kubernetes.io/hotel-reserv-search: unconfined
+      creationTimestamp: null
+      labels:
+        io.kompose.service: search
+    spec:
+      containers:
+        - command:
+            - search
+          # Stage 3 images:
+          #   prediction-ON:  the per-service online image built by
+          #     `ims-build-push-rollout.sh --mode-online search vN`
+          #     (Dockerfile.online: /etc/gordion/{model.onnx,model-config.json}
+          #     + /usr/lib/libonnxruntime.so + default GORDION_* env).
+          #   prediction-OFF: any windowed-sampling image works -- the
+          #     Gordion formula source has no ONNX dependency; just keep
+          #     the gordion ConfigMap mounted and GORDION_MODEL unset.
+          # The base image below has NO stage-3 wiring; switch to an
+          # online/windowed image before expecting events on :7900.
+          image: docclabgroup/hotelreservation:panic-fixed-1.5
+          name: hotel-reserv-search
+          ports:
+            - {name: rpc,     containerPort: 8082}
+            - {name: score,   containerPort: 7900}   # Stage 3 ContentionStream
+            - {name: instrum, containerPort: 7901}   # Stage 3 InstrumentationStream
+          resources:
+            requests:
+              cpu: "1"
+            limits:
+              cpu: "3"
+          securityContext:
+            # privileged is broader than strictly needed but works on every
+            # CRI / kubelet config. The narrower alternative is:
+            #   capabilities: { add: [SYS_ADMIN, SYS_RAWIO] }
+            # but on many self-managed clusters (CloudLab, kind, k3s) the
+            # CRI runtime silently filters SYS_RAWIO out of the allow-list,
+            # leaving /dev/cpu/N/msr reads as EPERM. privileged sidesteps
+            # that. Restrict back to specific capabilities if your cluster
+            # operator gets nervous about privileged pods.
+            privileged: true
+          # /dev/cpu/<N>/msr device files for the MSR-based freq sampler
+          # (services/perf/msr_reader.c). Requires `modprobe msr` on the
+          # host node (Daemonset or one-time setup); without these mounts
+          # the freq fields land with ok=false and the rest zeroed.
+          volumeMounts:
+            - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
+            # Gordion calibration (gordion.json + stage-1 curve.csv).
+            # Mounted at /etc/gordion-conf (NOT /etc/gordion, which would
+            # shadow the baked model files). Create/update with:
+            #   kubectl create configmap gordion-search \
+            #       --from-file=gordion.json --from-file=curve.csv
+            - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
+          # Stage 3 env vars. Set GORDION_SCORE_SOURCE=none to disable
+          # scoring entirely while keeping the Stage 2 disk-dump path
+          # intact.
+          env:
+            # Match GOMAXPROCS to the cpu limit (3). Without this the Go
+            # runtime defaults to the node core count (~32) and fans threads
+            # past the 3-core CFS quota -> heavy throttling + latency jitter on
+            # the victim (measured: nr_throttled climbing constantly). Standard
+            # Go-in-Kubernetes practice. Adjust if the cpu limit changes.
+            - {name: GOMAXPROCS,              value: "3"}
+            - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
+            - {name: GORDION_SCORE_SOURCE,    value: "gordion"}
+            - {name: GORDION_CONFIG,          value: "/etc/gordion-conf/gordion.json"}
+            # Prediction mode: the online image defaults GORDION_MODEL /
+            # GORDION_MODEL_CONFIG via Dockerfile.online ENV (prediction
+            # ON). Override GORDION_MODEL with "" here to force
+            # prediction-OFF on the online image:
+            # - {name: GORDION_MODEL,         value: ""}
+            # - {name: GORDION_MODEL_CONFIG,  value: "/etc/gordion/model-config.json"}
+            # - {name: GORDION_SCORE_PORT,    value: "7900"}
+            # - {name: GORDION_INSTRUMENTATION_PORT, value: "7901"}
+      volumes:
+        - name: cpu-devices
+          hostPath:
+            path: /dev/cpu
+            type: Directory
+        # optional: pods still start without the ConfigMap; the score
+        # source then logs a config-load failure and stays disabled
+        # (business RPC unaffected).
+        - name: gordion-conf
+          configMap:
+            name: gordion-search
+            optional: true
+      restartPolicy: Always
+status: {}
