@@ -1,0 +1,31 @@
+experiment:
+  name: severe-mixed-2400-60s
+  duration_s: 60
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 2400, shape: exp}
+  socialNetwork:
+    loadgen: {rps: 5400, shape: exp}
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 6300, shape: exp}
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.2.6
+  score_log: true
+aggressors:
+  - {testbed: hotelReservation, service: profile, role: bad}
+  - {testbed: hotelReservation, service: geo,     role: good}
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

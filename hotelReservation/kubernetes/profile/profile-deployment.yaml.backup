@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: kompose convert
+    kompose.version: 1.22.0 (955b78124)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: profile
+  name: profile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: profile
+  strategy: {}
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert
+        kompose.version: 1.22.0 (955b78124)
+        sidecar.istio.io/statsInclusionPrefixes: cluster.outbound,cluster_manager,listener_manager,http_mixer_filter,tcp_mixer_filter,server,cluster.xds-grp,listener,connection_manager
+        sidecar.istio.io/statsInclusionRegexps: http.*
+      creationTimestamp: null
+      labels:
+        io.kompose.service: profile
+    spec:
+      # Plain stock service -- no MSR mount / privileged / AppArmor / GORDION
+      # env here, so profile schedules on ANY node (it does NOT need `msr`).
+      #
+      # When profile is selected as the VICTIM, the orchestrator restores the
+      # full instrumented setup at deploy time, NOT via this manifest:
+      #   - image swap -> victim.image (the instrumented online image)
+      #   - GORDION env (ENABLE_WINDOWED_SAMPLING, GORDION_SCORE_SOURCE,
+      #     GORDION_SCORE_LOG)                  -> stage3-eval.sh::deploy_victim
+      #   - /dev/cpu mount + privileged + AppArmor unconfined + CAP_SYS_RAWIO
+      #                                         -> data-collector.sh::apply_msr_pod_capabilities
+      containers:
+        - command:
+            - profile
+          image: docclabgroup/hotelreservation:panic-fixed-1.5
+          name: hotel-reserv-profile
+          ports:
+            - {name: rpc,     containerPort: 8081}
+            - {name: score,   containerPort: 7900}   # served only when run as the instrumented victim
+            - {name: instrum, containerPort: 7901}   # served only when run as the instrumented victim
+          resources:
+            requests:
+              cpu: "1"
+            limits:
+              cpu: "3"
+      restartPolicy: Always
+status: {}

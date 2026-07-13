@@ -29,7 +29,7 @@ testbeds:
 victim:
   testbed: hotelReservation
   service: search
-  image: docclabgroup/search-online:v2.2.5
+  image: docclabgroup/search-online:v2.2.6
   score_log: true
 aggressors:
   # Same 9-co-tenant mix as severe; only the SN/SS driver rates differ.

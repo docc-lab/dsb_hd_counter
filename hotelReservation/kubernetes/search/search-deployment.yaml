@@ -44,7 +44,7 @@ spec:
           #     the gordion ConfigMap mounted and GORDION_MODEL unset.
           # The base image below has NO stage-3 wiring; switch to an
           # online/windowed image before expecting events on :7900.
-          image: docclabgroup/hotelreservation:panic-fixed-1.3
+          image: docclabgroup/search-online:v2.2.6
           name: hotel-reserv-search
           ports:
             - {name: rpc,     containerPort: 8082}
