@@ -10,7 +10,7 @@
 #   EXPERIMENT_NAME, EXPERIMENT_DURATION_S, EXPERIMENT_WARMUP_S,
 #   EXPERIMENT_COOLDOWN_S, EXPERIMENT_RUNS, TARGET_NODE         (scalars)
 #   VICTIM_TESTBED, VICTIM_SERVICE, VICTIM_IMAGE,
-#   VICTIM_SCORE_LOG                                             (victim scalars)
+#   VICTIM_SCORE_LOG, VICTIM_CPU_SET                             (victim scalars)
 #   TESTBED_LOADGEN_JSON[<name>]                                 (per-testbed wrk2 cfg)
 #   AGGRESSOR_COUNT, AGGRESSOR_JSON[<i>]                         (aggressor list)
 #
@@ -59,6 +59,37 @@ require_yq_jq() {
 # cluster-state validation later.
 # ---------------------------------------------------------------------------
 
+# _validate_loadgen <yaml-path-for-messages> <loadgen-json>
+#
+# Checks the fields a loadgen (or its `extra`) shares: shape and
+# start_offset_s. Needs EXPERIMENT_DURATION_S set.
+_validate_loadgen() {
+    local where="$1" lg="$2"
+    # Validate shape: a string must be a known wrk2 distribution; an
+    # object is the bursty form (its fields are checked by the driver).
+    # Catches typos like shape: exp2 here instead of silently running
+    # fixed at run time.
+    local shape_type shape_val
+    shape_type=$(echo "$lg" | jq -r '.shape | type')
+    if [[ "$shape_type" == "string" ]]; then
+        shape_val=$(echo "$lg" | jq -r '.shape')
+        case "$shape_val" in
+            fixed|exp|norm|zipf) ;;
+            *) echo "ERROR: $where.shape='$shape_val' invalid (want fixed|exp|norm|zipf, or a bursty object {burst_s,idle_s,peak_rps,base_rps})" >&2
+               return 1 ;;
+        esac
+    fi
+    # start_offset_s delays the driver's first request; its window shrinks to
+    # duration_s - offset so every driver still ends together.
+    local off
+    off=$(echo "$lg" | jq -r '.start_offset_s // 0')
+    if ! [[ "$off" =~ ^[0-9]+$ ]] || [[ "$off" -ge "$EXPERIMENT_DURATION_S" ]]; then
+        echo "ERROR: $where.start_offset_s must be an integer in [0, duration_s=$EXPERIMENT_DURATION_S) (got: '$off')" >&2
+        return 1
+    fi
+    return 0
+}
+
 parse_config() {
     local config_file="$1"
 
@@ -102,6 +133,14 @@ parse_config() {
     # Default onnx. Lives here (not in the base manifests) so any HR service is
     # a clean stock service until it's selected as the victim.
     VICTIM_SCORE_SOURCE=$(yq -r       '.victim.score_source // "onnx"' "$config_file")
+    # Cores the victim is pinned to (taskset inside the container, see
+    # deploy_victim) and that the windowed sampler counts on. Empty = unpinned
+    # and counted on every CPU.
+    VICTIM_CPU_SET=$(yq -r            '.victim.cpu_set // ""' "$config_file")
+    if [[ -n "$VICTIM_CPU_SET" && ! "$VICTIM_CPU_SET" =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
+        echo "ERROR: victim.cpu_set must be a cpu list like 2,3,4 or 2-4 (got: '$VICTIM_CPU_SET')" >&2
+        return 1
+    fi
 
     if [[ "$VICTIM_TESTBED" != "hotelReservation" ]]; then
         echo "ERROR: victim.testbed must be 'hotelReservation' (only testbed with stage3wire.Setup wired today, got '$VICTIM_TESTBED')" >&2
@@ -126,26 +165,33 @@ parse_config() {
             echo "ERROR: testbeds.$tb.loadgen missing" >&2
             return 1
         fi
-        # Validate rps is present and an integer.
+        # Validate rps is present and an integer. rps: 0 is deploy-only: the
+        # testbed's pods are deployed/placed but no wrk2 driver runs (the
+        # intrinsic configs keep SN/SS co-tenants present but unloaded).
         local rps
         rps=$(echo "$lg" | jq -r '.rps // empty')
-        if [[ -z "$rps" ]] || ! [[ "$rps" =~ ^[0-9]+$ ]] || [[ "$rps" -le 0 ]]; then
-            echo "ERROR: testbeds.$tb.loadgen.rps must be a positive integer (got: '$rps')" >&2
+        if [[ -z "$rps" ]] || ! [[ "$rps" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: testbeds.$tb.loadgen.rps must be a non-negative integer (got: '$rps')" >&2
             return 1
         fi
-        # Validate shape: a string must be a known wrk2 distribution; an
-        # object is the bursty form (its fields are checked by the driver).
-        # Catches typos like shape: exp2 here instead of silently running
-        # fixed at run time.
-        local shape_type shape_val
-        shape_type=$(echo "$lg" | jq -r '.shape | type')
-        if [[ "$shape_type" == "string" ]]; then
-            shape_val=$(echo "$lg" | jq -r '.shape')
-            case "$shape_val" in
-                fixed|exp|norm|zipf) ;;
-                *) echo "ERROR: testbeds.$tb.loadgen.shape='$shape_val' invalid (want fixed|exp|norm|zipf, or a bursty object {burst_s,idle_s,peak_rps,base_rps})" >&2
-                   return 1 ;;
-            esac
+        if [[ "$rps" -eq 0 && "$tb" == "$VICTIM_TESTBED" ]]; then
+            echo "ERROR: testbeds.$tb.loadgen.rps=0 is not allowed for the victim's testbed" >&2
+            return 1
+        fi
+        _validate_loadgen "testbeds.$tb.loadgen" "$lg" || return 1
+        # extra: an OPTIONAL second driver against the same frontend (same
+        # script), how intrinsic overload is expressed:
+        #   extra: {rps: 1600, shape: fixed, start_offset_s: 20}
+        local extra
+        extra=$(echo "$lg" | jq -c '.extra // empty')
+        if [[ -n "$extra" ]]; then
+            local xrps
+            xrps=$(echo "$extra" | jq -r '.rps // empty')
+            if [[ -z "$xrps" ]] || ! [[ "$xrps" =~ ^[0-9]+$ ]] || [[ "$xrps" -le 0 ]]; then
+                echo "ERROR: testbeds.$tb.loadgen.extra.rps must be a positive integer (got: '$xrps')" >&2
+                return 1
+            fi
+            _validate_loadgen "testbeds.$tb.loadgen.extra" "$extra" || return 1
         fi
         # Optional per-testbed replica count for the compute services. Used to
         # scale non-HR aggressor testbeds up so their node-pinned services
@@ -207,7 +253,7 @@ parse_config() {
     export EXPERIMENT_NAME EXPERIMENT_DURATION_S EXPERIMENT_WARMUP_S \
            EXPERIMENT_COOLDOWN_S EXPERIMENT_RUNS TARGET_NODE \
            VICTIM_TESTBED VICTIM_SERVICE VICTIM_IMAGE VICTIM_SCORE_LOG \
-           VICTIM_SCORE_SOURCE AGGRESSOR_COUNT
+           VICTIM_SCORE_SOURCE VICTIM_CPU_SET AGGRESSOR_COUNT
 
     return 0
 }
@@ -243,6 +289,20 @@ testbed_loadgen_rps() {
     local lg="${TESTBED_LOADGEN_JSON[$tb]:-}"
     [[ -z "$lg" ]] && { echo ""; return; }
     echo "$lg" | jq -r '.rps'
+}
+
+# testbed_loadgen_offset <testbed-name>  -> start_offset_s (0 if unset)
+testbed_loadgen_offset() {
+    local lg="${TESTBED_LOADGEN_JSON[$1]:-}"
+    [[ -z "$lg" ]] && { echo 0; return; }
+    echo "$lg" | jq -r '.start_offset_s // 0'
+}
+
+# testbed_loadgen_extra_json <testbed-name>  -> the `extra` object, or ""
+testbed_loadgen_extra_json() {
+    local lg="${TESTBED_LOADGEN_JSON[$1]:-}"
+    [[ -z "$lg" ]] && { echo ""; return; }
+    echo "$lg" | jq -c '.extra // empty'
 }
 
 # testbed_loadgen_shape_json <testbed-name>
