@@ -90,11 +90,13 @@ resolve_wrk2_script() {
 
 # ---------------------------------------------------------------------------
 # start_wrk2_driver <label> <target_url> <shape_json> <duration_s> \
-#                   <out_file> <pid_file> <script_path>
+#                   <out_file> <pid_file> <script_path> [start_offset_s]
 #
 # Launches the wrk2 driver in the background. Returns 0 immediately
 # after fork; the driver runs until duration_s elapses or it's killed
-# via stop_wrk2_driver.
+# via stop_wrk2_driver. With start_offset_s > 0 the driver first sleeps
+# that long and then runs for duration_s - start_offset_s, so drivers
+# started together still end together.
 #
 # shape_json is one of:
 #   "fixed" | "exp" | "norm" | "zipf"       -> a wrk2 inter-arrival
@@ -121,6 +123,17 @@ start_wrk2_driver() {
     local out_file="$5"
     local pid_file="$6"
     local script_path="$7"
+    local offset_s="${8:-0}"
+    if ! [[ "$offset_s" =~ ^[0-9]+$ ]] || [[ "$offset_s" -ge "$duration_s" ]]; then
+        echo "ERROR [wrk2-driver:$label]: start_offset_s must be in [0, $duration_s) (got '$offset_s')" >&2
+        return 1
+    fi
+    local run_s=$(( duration_s - offset_s ))
+    # Prefix for both driver bodies: wait out the offset before the first request.
+    local wait_cmd=""
+    if [[ "$offset_s" -gt 0 ]]; then
+        wait_cmd="echo '--- waiting start_offset_s=$offset_s @ ' \$(date -Iseconds) >> '$out_file'; sleep $offset_s;"
+    fi
 
     if [[ ! -x "$WRK2_BIN" && ! -f "$WRK2_BIN" ]]; then
         echo "ERROR [wrk2-driver:$label]: WRK2_BIN not found at $WRK2_BIN" >&2
@@ -167,7 +180,8 @@ start_wrk2_driver() {
             # Size connections to the peak rate (binding constraint).
             local bconns; bconns=$(_wrk2_conns "$peak_rps")
             $launcher bash -c "
-                end=\$(( \$(date +%s) + $duration_s ))
+                $wait_cmd
+                end=\$(( \$(date +%s) + $run_s ))
                 while [[ \$(date +%s) -lt \$end ]]; do
                     # Peak window
                     remaining=\$(( end - \$(date +%s) ))
@@ -201,9 +215,10 @@ start_wrk2_driver() {
             fi
             local conns; conns=$(_wrk2_conns "$rps")
             $launcher bash -c "
-                echo '--- shape=$dist rps=$rps conns=$conns for ${duration_s}s @ ' \$(date -Iseconds) >> '$out_file'
+                $wait_cmd
+                echo '--- shape=$dist rps=$rps conns=$conns for ${run_s}s @ ' \$(date -Iseconds) >> '$out_file'
                 '$WRK2_BIN' -D $dist -t $WRK2_THREADS -c $conns \
-                    -d ${duration_s}s -L -R $rps -s '$script_path' '$target_url' \
+                    -d ${run_s}s -L -R $rps -s '$script_path' '$target_url' \
                     >> '$out_file' 2>&1 || true
             " &
             ;;

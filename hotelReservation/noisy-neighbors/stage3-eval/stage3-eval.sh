@@ -364,12 +364,56 @@ deploy_victim() {
             || s3_log "WARNING: apply_msr_pod_capabilities failed; freq.ok will be false in samples"
     fi
 
+    pin_victim_cpus "$container_name"
+
+    # Keep the horizontal arm's overflow twin on the same build as the victim
+    # (hr_deploy has just re-applied it at replicas=0).
+    if kubectl get deployment "${VICTIM_DEPLOYMENT}-overflow" >/dev/null 2>&1; then
+        kubectl set image "deployment/${VICTIM_DEPLOYMENT}-overflow" \
+            "${container_name}=${VICTIM_IMAGE}" >/dev/null 2>&1 \
+            || s3_log "WARNING: failed to set image for ${VICTIM_DEPLOYMENT}-overflow"
+    fi
+
     place_aggressor "default" "$VICTIM_DEPLOYMENT" "$TARGET_NODE" \
         || die "failed to pin victim to $TARGET_NODE"
 
     kubectl rollout restart "deployment/$VICTIM_DEPLOYMENT" >/dev/null 2>&1 || true
     kubectl rollout status  "deployment/$VICTIM_DEPLOYMENT" --timeout=180s \
         || die "victim rollout did not become Ready"
+}
+
+# ---------------------------------------------------------------------------
+# pin_victim_cpus <container_name>
+#
+# The online image pins itself: its CMD runs `taskset -c $CPU_SET` when
+# CPU_SET is non-empty (Dockerfile.online). The base manifests set
+# `command: [<svc>]`, which bypasses that CMD, so the victim ran unpinned
+# while CPU_SET only told the windowed sampler which CPUs to count. Drop
+# `command` so the CMD runs, and always set CPU_SET explicitly: unset, the
+# image's ENV default (0,1,2) would pin the victim there. An empty
+# victim.cpu_set leaves the victim unpinned and counted on every CPU.
+# ---------------------------------------------------------------------------
+pin_victim_cpus() {
+    local container_name="$1"
+    local idx
+    idx=$(kubectl get deployment "$VICTIM_DEPLOYMENT" -o json 2>/dev/null \
+        | jq --arg n "$container_name" \
+            '[.spec.template.spec.containers[].name] | index($n) // empty')
+    if [[ -z "$idx" ]]; then
+        s3_log "WARNING: container $container_name not found in $VICTIM_DEPLOYMENT; victim CPU pinning skipped"
+        return 0
+    fi
+    if kubectl get deployment "$VICTIM_DEPLOYMENT" -o json \
+        | jq -e ".spec.template.spec.containers[$idx].command" >/dev/null 2>&1; then
+        kubectl patch deployment "$VICTIM_DEPLOYMENT" --type=json \
+            -p "[{\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/$idx/command\"}]" \
+            >/dev/null 2>&1 \
+            || s3_log "WARNING: failed to drop command override on $VICTIM_DEPLOYMENT; victim stays unpinned"
+    fi
+    kubectl set env "deployment/$VICTIM_DEPLOYMENT" -c "$container_name" \
+        "CPU_SET=${VICTIM_CPU_SET}" >/dev/null 2>&1 \
+        || s3_log "WARNING: failed to set CPU_SET on $VICTIM_DEPLOYMENT"
+    s3_log "Victim CPU_SET='${VICTIM_CPU_SET}' (empty = unpinned)"
 }
 
 # ---------------------------------------------------------------------------
@@ -501,8 +545,9 @@ s3_consul_manual_register() {
         # matches the terminating old replica (which has no podIP), and
         # items[0] ordering is not guaranteed -- without this we'd grab the
         # dead pod's empty IP and skip a service that actually needs
-        # re-registering.
-        ip=$(kubectl get pod -l io.kompose.service="$svc" \
+        # re-registering. overflow!=true: search-overflow replicas share the
+        # victim's label and register themselves at startup.
+        ip=$(kubectl get pod -l "io.kompose.service=$svc,overflow!=true" \
             --field-selector=status.phase=Running \
             -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
         if [[ -z "$ip" ]]; then
@@ -736,7 +781,8 @@ capture_victim_run_data() {
     local out="$run_dir/run_data.json"
     local svc="$VICTIM_SERVICE"
     local pod
-    pod=$(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT" \
+    # overflow!=true: search-overflow replicas share the victim's label.
+    pod=$(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT,overflow!=true" \
           --field-selector=status.phase=Running \
           -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
     if [[ -z "$pod" ]]; then
@@ -759,10 +805,16 @@ start_testbed_drivers() {
     local run_id="$1"
     local run_dir="$2"
 
-    local tb rps shape url script pf out
+    local tb rps shape offset extra url script pf out
     for tb in "${DRIVEN_TESTBEDS[@]}"; do
         rps=$(testbed_loadgen_rps "$tb")
+        if [[ "$rps" -eq 0 ]]; then
+            # Deploy-only testbed: pods are placed on the node, no load.
+            s3_log "  driver: $tb rps=0 (deploy-only, no driver)"
+            continue
+        fi
         shape=$(testbed_loadgen_shape_json "$tb")
+        offset=$(testbed_loadgen_offset "$tb")
         out="$run_dir/wrk2/${tb}.txt"
         pf="$run_dir/wrk2/${tb}.pid"
 
@@ -771,10 +823,25 @@ start_testbed_drivers() {
 
         # WRK2_FIXED_RPS is read by start_wrk2_driver for the "fixed" shape.
         WRK2_FIXED_RPS="$rps" start_wrk2_driver \
-            "$tb" "$url" "$shape" "$EXPERIMENT_DURATION_S" "$out" "$pf" "$script" \
+            "$tb" "$url" "$shape" "$EXPERIMENT_DURATION_S" "$out" "$pf" "$script" "$offset" \
             || die "start_wrk2_driver failed for testbed $tb"
         RUN_WRK2_PIDFILES+=("$pf")
-        s3_log "  driver: $tb rps=$rps shape=$shape url=$url"
+        s3_log "  driver: $tb rps=$rps shape=$shape offset=${offset}s url=$url"
+
+        # Optional second driver on the same frontend (intrinsic overload).
+        extra=$(testbed_loadgen_extra_json "$tb")
+        if [[ -n "$extra" ]]; then
+            local xrps xshape xoff
+            xrps=$(echo "$extra" | jq -r '.rps')
+            xshape=$(echo "$extra" | jq -c '.shape // "fixed"')
+            xoff=$(echo "$extra" | jq -r '.start_offset_s // 0')
+            WRK2_FIXED_RPS="$xrps" start_wrk2_driver \
+                "${tb}-extra" "$url" "$xshape" "$EXPERIMENT_DURATION_S" \
+                "$run_dir/wrk2/${tb}-extra.txt" "$run_dir/wrk2/${tb}-extra.pid" "$script" "$xoff" \
+                || die "start_wrk2_driver failed for testbed $tb (extra)"
+            RUN_WRK2_PIDFILES+=("$run_dir/wrk2/${tb}-extra.pid")
+            s3_log "  driver: ${tb}-extra rps=$xrps shape=$xshape offset=${xoff}s url=$url"
+        fi
     done
 }
 

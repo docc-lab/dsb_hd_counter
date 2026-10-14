@@ -1,0 +1,78 @@
+# Overflow twin of the search victim, for the stage-3 horizontal arm.
+#
+# The victim deployment (search) stays at replicas=1, pinned to the target
+# node. The mitigation controller's Eq.(1) scales THIS deployment between 0
+# and n_max (HORIZONTAL_DEPLOYMENT=search-overflow), and the hard node
+# anti-affinity below keeps its replicas off the target node, so scale-out
+# adds capacity elsewhere instead of more contention next to the victim.
+#
+# Pods carry io.kompose.service=search so they register in Consul as
+# srv-search like the victim and the frontend load-balances across both.
+# The deployment's own selector adds overflow=true so it never adopts the
+# victim's pod. run-phased-stage3.sh sets the image to the config's
+# victim.image and resets replicas to 0 before every run.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    io.kompose.service: search
+    overflow: "true"
+  name: search-overflow
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      io.kompose.service: search
+      overflow: "true"
+  template:
+    metadata:
+      labels:
+        io.kompose.service: search
+        overflow: "true"
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/hotel-reserv-search: unconfined
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: [node-4]    # the stage-3 target node
+      containers:
+        - name: hotel-reserv-search
+          image: docclabgroup/search-online:v2.3.0
+          # No command override: the image CMD runs, and CPU_SET is empty, so
+          # the replica is unpinned (the image's ENV default would pin it to
+          # 0,1,2).
+          ports:
+            - {name: rpc,     containerPort: 8082}
+            - {name: score,   containerPort: 7900}
+            - {name: instrum, containerPort: 7901}
+          resources:
+            requests:
+              cpu: "1"
+            limits:
+              cpu: "3"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
+            - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
+          env:
+            - {name: GOMAXPROCS,               value: "3"}
+            - {name: CPU_SET,                  value: ""}
+            - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
+            - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
+            - {name: GORDION_CONFIG,           value: "/etc/gordion-conf/gordion.json"}
+      volumes:
+        - name: cpu-devices
+          hostPath:
+            path: /dev/cpu
+            type: Directory
+        - name: gordion-conf
+          configMap:
+            name: gordion-search
+            optional: true
+      restartPolicy: Always

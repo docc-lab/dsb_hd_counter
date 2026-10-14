@@ -208,7 +208,7 @@ hr_frontend_url() {
 hr_pod_for_deployment() {
     local deploy="$1"
     kubectl -n "$HR_NAMESPACE" get pods \
-        -l "io.kompose.service=$deploy" \
+        -l "io.kompose.service=$deploy,overflow!=true" \
         --field-selector=status.phase=Running \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
 }
