@@ -19,6 +19,24 @@ CPUS_PER_SERVICE="${CPUS_PER_SERVICE:-3}"  # Each service gets 3 CPUs by default
 STARTING_CPU="${STARTING_CPU:-0}"          # Start allocating from CPU 0
 ENABLE_CPU_PINNING="${ENABLE_CPU_PINNING:-true}"  # Enable taskset CPU pinning for no-instrumentation deployments (instrumented always pins via image ENTRYPOINT)
 
+# Comma-separated CPU set for a service: CPU_SET_<service> if set (e.g.
+# CPU_SET_search=2,3,4), else CPUS_PER_SERVICE CPUs from STARTING_CPU +
+# index * CPUS_PER_SERVICE.  The override is for nodes whose online CPUs
+# stop short of that range: sm110p with nosmt=force has only CPUs 0-15,
+# but search's index puts it at 18-20.
+service_cpu_set() {
+    local service="$1"
+    local service_index="$2"
+    local override
+    eval "override=\${CPU_SET_${service}:-}"
+    if [[ -n "$override" ]]; then
+        echo "$override"
+        return
+    fi
+    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
+    seq -s, $cpu_start $((cpu_start + CPUS_PER_SERVICE - 1))
+}
+
 # Valid services that support windowed sampling
 VALID_TIMING_SERVICES=("frontend" "geo" "profile" "rate" "recommendation" "reservation" "search" "user")
 
@@ -93,21 +111,9 @@ calculate_victim_cpu_allocation() {
     fi
     
     # Calculate CPU range using same logic as deployment
-    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
-    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
-    
-    # Build space-separated CPU list
-    local cpu_list=""
-    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
-        if [[ -z "$cpu_list" ]]; then
-            cpu_list="$cpu"
-        else
-            cpu_list="$cpu_list $cpu"
-        fi
-    done
-    
+    local cpu_list=$(service_cpu_set "$service" "$service_index" | tr ',' ' ')
+
     log "$exp_dir" "  Service index: $service_index"
-    log "$exp_dir" "  Expected CPU range: $cpu_start-$cpu_end"
     log "$exp_dir" "  Expected CPU list: $cpu_list"
     
     # Verify actual pinning by checking taskset in the pod
@@ -169,17 +175,8 @@ apply_cpu_pinning_to_deployment() {
     fi
     
     # Calculate CPU range using same logic as instrumented deployment
-    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
-    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
-    local cpu_set=""
-    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
-        if [[ -z "$cpu_set" ]]; then
-            cpu_set="$cpu"
-        else
-            cpu_set="$cpu_set,$cpu"
-        fi
-    done
-    
+    local cpu_set=$(service_cpu_set "$service" "$service_index")
+
     log "$exp_dir" "  Service index: $service_index"
     log "$exp_dir" "  CPU set: $cpu_set"
     
@@ -535,17 +532,8 @@ update_deployment_for_timing() {
         fi
     done
     
-    local cpu_start=$((STARTING_CPU + service_index * CPUS_PER_SERVICE))
-    local cpu_end=$((cpu_start + CPUS_PER_SERVICE - 1))
-    local cpu_set=""
-    for ((cpu=$cpu_start; cpu<=$cpu_end; cpu++)); do
-        if [ -z "$cpu_set" ]; then
-            cpu_set="$cpu"
-        else
-            cpu_set="$cpu_set,$cpu"
-        fi
-    done
-    
+    local cpu_set=$(service_cpu_set "$service" "$service_index")
+
     log "$exp_dir" "  Assigning CPU set for $service: $cpu_set"
     if ! kubectl set env "deployment/$service" "CPU_SET=${cpu_set}"; then
         log "$exp_dir" "ERROR: Failed to set CPU_SET for $service"
