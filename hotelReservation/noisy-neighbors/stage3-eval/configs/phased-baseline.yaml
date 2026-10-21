@@ -27,6 +27,6 @@ victim:
   testbed: hotelReservation
   service: search
   image: docclabgroup/search-online:v2.3.0
-  cpu_set: "4,6,8"   # pinned victim cores (node-4 2x 8360Y, socket 0 = even ids; HC Primary)
+  cpu_set: "4,6"     # pinned victim cores (node-4 2x 8360Y, socket 0 = even ids; HC Primary; 2 cores ~ July's 3 HTs)
   score_log: true
 aggressors: []

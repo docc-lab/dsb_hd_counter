@@ -46,6 +46,14 @@ ARM="${ARM:-}"
 MITIG_DIR="${MITIG_DIR:-/tmp/mitig}"
 ARM_OFFSET_S="${ARM_OFFSET_S:-80}"
 P3_SNAPSHOT_S="${P3_SNAPSHOT_S:-30}"
+# Aggressor pool: cpuset.cpus written to every aggressor pod on the target
+# node (pod-level cgroup, re-applied every 10 s with the label). On a
+# 72-core node unpinned aggressors never touch a 2-core victim; the pool
+# recreates July's shared-node contention: 10 cores of socket 0 that
+# include the victim's (4,6) and HC's Secondary cores (8-14), excluding
+# housekeeping (0,2), the controller (24) and the HC daemons (26-30).
+# Empty disables the confinement.
+AGGR_CPUSET="${AGGR_CPUSET-4,6,8,10,12,14,16,18,20,22}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 
 orch_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [phased] $*" >&2; }
@@ -110,8 +118,35 @@ label_loop() {
             [[ -z "$sel" ]] && continue
             kubectl -n "$ns" label pods -l "$sel" gordion-aggr=true --overwrite >/dev/null 2>&1 || true
         done
+        confine_aggressors
         sleep 10
     done
+}
+
+# Write AGGR_CPUSET into the pod-level cgroup of every labeled aggressor pod
+# running on the target node. Pod-level so it survives the hc actuator's
+# container-level writes (HC's secondary∪victim set is a subset of the pool
+# and HC restores the container value it saved, not ours). Handles both the
+# cgroupfs (kubepods/<qos>/pod<uid>) and systemd (…-pod<uid_>.slice) layouts.
+confine_aggressors() {
+    [[ -n "$AGGR_CPUSET" ]] || return 0
+    local uids
+    uids=$(kubectl get pods -A -l gordion-aggr=true --field-selector "spec.nodeName=$MITIG_HOST" \
+        -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort -u | tr '\n' ' ')
+    [[ -n "${uids// /}" ]] || return 0
+    on_target "sudo sh -c '
+        for u in $uids; do
+            u2=\$(echo \$u | tr - _)
+            found=0
+            for d in \$(find /sys/fs/cgroup -maxdepth 4 -type d \( -name \"pod\$u\" -o -name \"*-pod\$u2.slice\" \) 2>/dev/null); do
+                [ -f \$d/cpuset.cpus ] || { echo \"confine: no cpuset.cpus in \$d\" >&2; continue; }
+                found=1
+                cur=\$(cat \$d/cpuset.cpus)
+                [ \"\$cur\" = \"$AGGR_CPUSET\" ] || echo \"$AGGR_CPUSET\" > \$d/cpuset.cpus 2>/dev/null \
+                    || echo \"confine: write failed for \$d\" >&2
+            done
+            [ \$found = 1 ] || echo \"confine: no cgroup dir for pod \$u\" >&2
+        done'" 2>&1 | sed 's/^/[phased]   /' >&2 || true
 }
 
 preflight() {
@@ -136,7 +171,7 @@ run_config() {
     MITIG_HOST="${MITIG_HOST_OVERRIDE:-$TARGET_NODE}"
 
     orch_log "=================================================================="
-    orch_log " $name  (arm=$ARM, controller on $MITIG_HOST:$MITIG_DIR)"
+    orch_log " $name  (arm=$ARM, controller on $MITIG_HOST:$MITIG_DIR, aggressor pool=${AGGR_CPUSET:-none})"
     orch_log "=================================================================="
     preflight
 
@@ -215,6 +250,7 @@ run_config() {
             echo "$armed_ns" > "$run_dir/armed_epoch_ns.txt"
         fi
         echo "$ARM" > "$mdir/arm.txt"
+        echo "${AGGR_CPUSET:-none}" > "$mdir/aggr_cpuset.txt"
         local ext
         for ext in ctrl.log scores.csv env.txt; do
             "${SSH[@]}" "$MITIG_HOST" "cat $MITIG_DIR/$name.$ext" > "$mdir/$name.$ext" 2>/dev/null \

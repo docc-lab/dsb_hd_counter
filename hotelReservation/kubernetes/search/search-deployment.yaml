@@ -54,7 +54,7 @@ spec:
             requests:
               cpu: "1"
             limits:
-              cpu: "3"
+              cpu: "2"
           securityContext:
             # privileged is broader than strictly needed but works on every
             # CRI / kubelet config. The narrower alternative is:
@@ -81,12 +81,12 @@ spec:
           # scoring entirely while keeping the Stage 2 disk-dump path
           # intact.
           env:
-            # Match GOMAXPROCS to the cpu limit (3). Without this the Go
+            # Match GOMAXPROCS to the cpu limit (2). Without this the Go
             # runtime defaults to the node core count (~32) and fans threads
             # past the 3-core CFS quota -> heavy throttling + latency jitter on
             # the victim (measured: nr_throttled climbing constantly). Standard
             # Go-in-Kubernetes practice. Adjust if the cpu limit changes.
-            - {name: GOMAXPROCS,              value: "3"}
+            - {name: GOMAXPROCS,              value: "2"}
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,    value: "gordion"}
             - {name: GORDION_CONFIG,          value: "/etc/gordion-conf/gordion.json"}
