@@ -43,7 +43,7 @@ spec:
             - name: MEMCACHED_CACHE_SIZE
               value: "128"
             - name: MEMCACHED_THREADS
-              value: "2"
+              value: "8"
           image: memcached
           name: hotel-reserv-reservation-mmc
           ports:
