@@ -28,7 +28,7 @@ victim:
   testbed: hotelReservation
   service: search
   image: docclabgroup/search-online:v2.3.0
-  cpu_set: "2,3,4"   # pinned victim cores (sm110p, nosmt; HC Primary)
+  cpu_set: "4,6,8"   # pinned victim cores (node-4 2x 8360Y, socket 0 = even ids; HC Primary)
   score_log: true
 aggressors:
   # SN/SS co-tenants only. The HR services (profile/geo) are NOT listed:
