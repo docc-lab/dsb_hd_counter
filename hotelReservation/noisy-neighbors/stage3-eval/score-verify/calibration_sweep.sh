@@ -24,6 +24,11 @@ OPERATING_RPS=2400
 THREADS=4
 CONNS=256
 TARGET_NODE="node-3"   # node the victim MUST be on (pinned + freq-floored)
+# tanh gain k in gordion.json. calibrate_from_stream.py defaults to 1.0, which
+# saturates y at a ~4% deviation (sigma90 is a few kcyc); the stage-3 arm
+# thresholds (theta 0.35/0.4/0.55) were tuned against the 2026-07-13
+# calibration's k=0.025, so that is the default here. Pass --k to change.
+K=0.025
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --warmup) WARMUP="$2"; shift 2 ;;
         --operating-rps) OPERATING_RPS="$2"; shift 2 ;;
         --target-node) TARGET_NODE="$2"; shift 2 ;;
+        --k) K="$2"; shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -126,7 +132,7 @@ pkill -f "kubectl port-forward.*7901" 2>/dev/null || true
 # ── calibrate (does NOT apply the ConfigMap -- review first) ─────────
 log "running calibrate_from_stream.py"
 python3 calibrate_from_stream.py "${LEVEL_ARGS[@]}" \
-    --operating-rps "$OPERATING_RPS" \
+    --operating-rps "$OPERATING_RPS" --k "$K" \
     --out-curve curve.csv --out-config gordion.json
 
 cat <<'EOF'
