@@ -44,6 +44,11 @@ spec:
             - {name: rpc,     containerPort: 8081}
             - {name: score,   containerPort: 7900}   # served only when run as the instrumented victim
             - {name: instrum, containerPort: 7901}   # served only when run as the instrumented victim
+          env:
+            # Match GOMAXPROCS to the cpu limit. Go 1.18 sizes its scheduler from
+            # the host CPU count (144 on 2x 8360Y with SMT) and fans threads past
+            # the CFS quota -> heavy throttling. Adjust if the cpu limit changes.
+            - {name: GOMAXPROCS, value: "8"}
           resources:
             requests:
               cpu: "1"
