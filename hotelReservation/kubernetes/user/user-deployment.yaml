@@ -33,6 +33,10 @@ spec:
           ports:
             - containerPort: 8086
           env:
+            # Match GOMAXPROCS to the cpu limit. Go 1.18 sizes its scheduler from
+            # the host CPU count (144 on 2x 8360Y with SMT) and fans threads past
+            # the CFS quota -> heavy throttling. Adjust if the cpu limit changes.
+            - {name: GOMAXPROCS, value: "8"}
             # Keep timing ON for the user service. Recent image builds
             # carry a latent bug (fixed in interceptor/options.go, commit
             # pending image rebuild) where ENABLE_TIMING unset installs a
