@@ -22,7 +22,7 @@ testbeds:
     loadgen:
       rps: 800
       shape: exp
-      extra: {rps: 1400, shape: exp, start_offset_s: 20}
+      extra: {rps: 3600, shape: exp, start_offset_s: 20}   # base+extra = 4400 ~ the 1-P victim knee (~4.3k e2e on the 8360Y)
   socialNetwork:
     loadgen: {rps: 0}    # deploy-only: co-tenant pods present, no load
     replicas: 2
