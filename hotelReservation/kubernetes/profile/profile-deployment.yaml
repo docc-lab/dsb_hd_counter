@@ -48,6 +48,6 @@ spec:
             requests:
               cpu: "1"
             limits:
-              cpu: "3"
+              cpu: "8"
       restartPolicy: Always
 status: {}

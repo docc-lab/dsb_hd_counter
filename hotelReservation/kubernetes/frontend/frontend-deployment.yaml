@@ -36,7 +36,7 @@ spec:
             requests:
               cpu: "1"
             limits:
-              cpu: "3"
+              cpu: "16"
           securityContext:
             capabilities:
               add:
