@@ -22,7 +22,7 @@ testbeds:
     loadgen:
       rps: 800
       shape: exp
-      extra: {rps: 1600, shape: fixed, start_offset_s: 20}
+      extra: {rps: 4800, shape: fixed, start_offset_s: 20}   # base+extra = 5600 ~ 1.3x the knee, under the ~6.3k chain ceiling
   socialNetwork:
     loadgen: {rps: 0}    # deploy-only: co-tenant pods present, no load
     replicas: 2

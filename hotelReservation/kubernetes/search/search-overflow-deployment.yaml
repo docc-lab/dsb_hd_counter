@@ -61,7 +61,7 @@ spec:
             - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
             - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
           env:
-            - {name: GOMAXPROCS,               value: "2"}
+            - {name: GOMAXPROCS,               value: "1"}
             - {name: CPU_SET,                  value: ""}
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
