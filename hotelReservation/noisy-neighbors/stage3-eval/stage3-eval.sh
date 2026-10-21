@@ -447,6 +447,7 @@ place_all_aggressors() {
     s3_log "Waiting for placed aggressors to be Ready (serial)"
     local entry
     for entry in "${RUN_PLACED_AGGRESSORS[@]:-}"; do
+        [[ -n "$entry" ]] || continue   # ":-" yields one "" when no aggressors
         ns="${entry%%|*}"
         deploy="${entry#*|}"
         if wait_aggressor_ready "$ns" "$deploy" 180; then
@@ -469,6 +470,30 @@ place_all_aggressors() {
             fi
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# wait_http_ready <url> <timeout_s> <label>
+#
+# Poll until an HTTP request to <url>/ gets any response (curl rc 0). A
+# refused connect means the frontend pod is up but its server is not
+# listening yet; wrk2 exits on the first refused connect, so every driver
+# start goes through this first. Logs and returns 1 on timeout (the run
+# proceeds; the wrk2 output then shows the failure).
+# ---------------------------------------------------------------------------
+wait_http_ready() {
+    local url="$1" timeout="${2:-60}" label="${3:-$1}"
+    local waited=0
+    while (( waited < timeout )); do
+        if curl -s -o /dev/null --max-time 3 "${url%/}/" 2>/dev/null; then
+            (( waited > 0 )) && s3_log "  $label answered HTTP after ${waited}s"
+            return 0
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+    s3_log "  WARNING: $label at $url not answering HTTP after ${timeout}s; proceeding"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -603,6 +628,13 @@ recover_consul_state() {
     kubectl rollout restart deployment/frontend >/dev/null 2>&1 || true
     kubectl rollout status  deployment/frontend --timeout=120s >/dev/null 2>&1 \
         || s3_log "  WARNING: frontend rollout did not complete in 120s; proceeding"
+    # frontend has no readinessProbe, so `rollout status` returns as soon as
+    # the pod is Running -- while the binary is still dialing Consul and its
+    # gRPC backends and not yet listening on :5000. wrk2 does not retry a
+    # refused connect, so wait until the NodePort actually answers.
+    local fe_url
+    fe_url=$(hr_frontend_url "$TARGET_NODE" 2>/dev/null) \
+        && wait_http_ready "$fe_url" 120 "frontend"
 
     # 4. Poll the catalog; if anything is still missing after the window, do
     #    one more register pass before proceeding.
@@ -820,6 +852,7 @@ start_testbed_drivers() {
 
         script=$(resolve_wrk2_script "$tb") || die "no wrk2 script for testbed $tb"
         url=$(_resolve_frontend_url "$tb")  || die "could not resolve frontend URL for $tb"
+        wait_http_ready "$url" 60 "$tb frontend" || true
 
         # WRK2_FIXED_RPS is read by start_wrk2_driver for the "fixed" shape.
         WRK2_FIXED_RPS="$rps" start_wrk2_driver \

@@ -668,7 +668,10 @@ apply_msr_pod_capabilities() {
     local existing_volumes
     existing_volumes=$(kubectl get deployment "$service" \
         -o jsonpath='{.spec.template.spec.volumes}' 2>/dev/null || echo "")
-    if [[ "$existing_volumes" != *"dev-cpu"* ]]; then
+    # The stage-3 search manifest already mounts /dev/cpu under the volume
+    # name "cpu-devices"; match on the hostPath, not the name, or the patch
+    # tries to add a second mount at the same mountPath and fails.
+    if [[ "$existing_volumes" != *"dev-cpu"* && "$existing_volumes" != *'"path":"/dev/cpu"'* ]]; then
         # If the deployment has no volumes/volumeMounts arrays yet, JSON-patch
         # add-with-"-" fails. Use add-with-array-init in that case.
         local volumes_exist=true
