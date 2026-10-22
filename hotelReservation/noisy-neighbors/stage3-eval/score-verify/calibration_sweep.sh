@@ -25,10 +25,13 @@ THREADS=4
 CONNS=256
 TARGET_NODE="node-3"   # node the victim MUST be on (pinned + freq-floored)
 # tanh gain k in gordion.json. calibrate_from_stream.py defaults to 1.0, which
-# saturates y at a ~4% deviation (sigma90 is a few kcyc); the stage-3 arm
-# thresholds (theta 0.35/0.4/0.55) were tuned against the 2026-07-13
-# calibration's k=0.025, so that is the default here. Pass --k to change.
-K=0.025
+# saturates y at a ~4% deviation; the stage-3 arm thresholds (theta
+# 0.35/0.4/0.55) were tuned against the 2026-07-13 calibration (k=0.025,
+# sigma90 = 4.3% of baseline p90: y90 = 0.8 at a 2.9x tail). y = tanh(k*dT/
+# sigma), so k must scale with sigma/baseline to keep that sensitivity. The
+# 8360Y total_time calibration at 3600 rps has sigma90 = 7% of baseline, so
+# k = 0.06 (measured: a 2.7x tail read y90 = 0.35 at k = 0.025). Pass --k.
+K=0.06
 # Latency section scored. processing_time excludes downstream waits AND the
 # run-queue wait before the handler starts (the interceptor's timer starts
 # when the goroutine runs), so a CPU-saturated victim looks idle to it;
