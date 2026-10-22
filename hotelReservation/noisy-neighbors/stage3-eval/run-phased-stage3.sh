@@ -49,11 +49,12 @@ P3_SNAPSHOT_S="${P3_SNAPSHOT_S:-30}"
 # Aggressor pool: cpuset.cpus written to every aggressor pod on the target
 # node (pod-level cgroup, re-applied every 10 s with the label). On a
 # 72-core node unpinned aggressors never touch a 2-core victim; the pool
-# recreates July's shared-node contention: 10 cores of socket 0 that
-# include the victim's (4,6) and HC's Secondary cores (8-14), excluding
-# housekeeping (0,2), the controller (24) and the HC daemons (26-30).
-# Empty disables the confinement.
-AGGR_CPUSET="${AGGR_CPUSET-4,6,8,10,12,14,16,18,20,22}"
+# recreates July's shared-node contention. Sized from measurement: the
+# ext-severe aggressors burn ~9 cores on node-4 (two catalogue pods ~4
+# each), and a 10-core pool only cost the victim +25% latency, so the pool
+# is the victim's cores (4,6) plus HC's Secondary cores (8-14): 6 cores,
+# ~1.5x oversubscribed under severe load. Empty disables the confinement.
+AGGR_CPUSET="${AGGR_CPUSET-4,6,8,10,12,14}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 
 orch_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [phased] $*" >&2; }
