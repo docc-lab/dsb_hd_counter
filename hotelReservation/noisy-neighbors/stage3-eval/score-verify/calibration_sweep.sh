@@ -29,6 +29,12 @@ TARGET_NODE="node-3"   # node the victim MUST be on (pinned + freq-floored)
 # thresholds (theta 0.35/0.4/0.55) were tuned against the 2026-07-13
 # calibration's k=0.025, so that is the default here. Pass --k to change.
 K=0.025
+# Latency section scored. processing_time excludes downstream waits AND the
+# run-queue wait before the handler starts (the interceptor's timer starts
+# when the goroutine runs), so a CPU-saturated victim looks idle to it;
+# total_time sees the overload. Must match the latency_section the pod
+# runs with (written into gordion.json).
+SECTION=processing_time
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --operating-rps) OPERATING_RPS="$2"; shift 2 ;;
         --target-node) TARGET_NODE="$2"; shift 2 ;;
         --k) K="$2"; shift 2 ;;
+        --section) SECTION="$2"; shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -132,7 +139,7 @@ pkill -f "kubectl port-forward.*7901" 2>/dev/null || true
 # ── calibrate (does NOT apply the ConfigMap -- review first) ─────────
 log "running calibrate_from_stream.py"
 python3 calibrate_from_stream.py "${LEVEL_ARGS[@]}" \
-    --operating-rps "$OPERATING_RPS" --k "$K" \
+    --operating-rps "$OPERATING_RPS" --k "$K" --section "$SECTION" \
     --out-curve curve.csv --out-config gordion.json
 
 cat <<'EOF'
