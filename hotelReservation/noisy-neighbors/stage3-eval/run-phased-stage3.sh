@@ -149,6 +149,29 @@ confine_aggressors() {
         done'" 2>&1 | sed 's/^/[phased]   /' >&2 || true
 }
 
+# Evidence that the pool (and, for hc arms, the Balancer) actually took
+# effect: per aggressor pod on the target, the pod cgroup's cpuset and one
+# thread's Cpus_allowed_list; plus the victim's affinity and the CPU% of
+# every container on the target node.
+snapshot_aggressors() {
+    local uids
+    uids=$(kubectl get pods -A -l gordion-aggr=true --field-selector "spec.nodeName=$MITIG_HOST" \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}={.metadata.uid}{"\n"}{end}' 2>/dev/null | tr '\n' ' ')
+    echo "pool=${AGGR_CPUSET:-none} host=$MITIG_HOST $(date '+%H:%M:%S')"
+    on_target "sudo sh -c '
+        for e in $uids; do
+            n=\${e%%=*}; u=\${e#*=}; u2=\$(echo \$u | tr - _)
+            d=\$(find /sys/fs/cgroup -maxdepth 4 -type d \( -name \"pod\$u\" -o -name \"*-pod\$u2.slice\" \) 2>/dev/null | head -1)
+            [ -n \"\$d\" ] || { echo \"\$n: no cgroup dir\"; continue; }
+            pid=\$(find \$d -name cgroup.procs -exec cat {} + 2>/dev/null | head -1)
+            aff=\$([ -n \"\$pid\" ] && awk \"/Cpus_allowed_list/{print \\\$2}\" /proc/\$pid/status 2>/dev/null)
+            echo \"\$n: cpuset=[\$(cat \$d/cpuset.cpus 2>/dev/null)] effective=[\$(cat \$d/cpuset.cpus.effective 2>/dev/null)] thread_affinity=[\$aff]\"
+        done
+        for p in \$(pgrep -x search); do echo \"victim pid \$p: \$(grep Cpus_allowed_list /proc/\$p/status)\"; done
+        echo \"-- docker stats (CPU%)\"
+        docker stats --no-stream --format \"{{.CPUPerc}}\t{{.Name}}\" 2>/dev/null | grep -v _POD_ | sort -rn | head -25 | cut -c1-90'"
+}
+
 preflight() {
     command -v kubectl >/dev/null || die "kubectl missing"
     on_target "test -x $MITIG_DIR/mitigation-controller && test -x $MITIG_DIR/run-mitigation.sh \
@@ -227,6 +250,7 @@ run_config() {
             orch_log "ARMED at $(date '+%H:%M:%S')"
             sleep "$P3_SNAPSHOT_S"
             kubectl get pods -A -o wide > "$stage_dir/pod_placement_p3.txt" 2>&1 || true
+            snapshot_aggressors > "$stage_dir/aggr_affinity_p3.txt" 2>&1 || true
         else
             orch_log "WARNING: stage3-eval exited before the ARM point"
         fi
