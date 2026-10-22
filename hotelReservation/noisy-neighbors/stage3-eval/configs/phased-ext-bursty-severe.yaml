@@ -17,7 +17,7 @@ experiment:
   target_node: node-4
 testbeds:
   hotelReservation:
-    loadgen: {rps: 2400, shape: exp}   # victim load -- fixed across all phases
+    loadgen: {rps: 3600, shape: exp}   # victim load -- fixed across all phases
   socialNetwork:
     loadgen: {rps: 5400, shape: exp, start_offset_s: 20}
     replicas: 2

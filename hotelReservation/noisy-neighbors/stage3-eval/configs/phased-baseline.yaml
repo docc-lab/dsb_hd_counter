@@ -22,7 +22,7 @@ experiment:
   target_node: node-4
 testbeds:
   hotelReservation:
-    loadgen: {rps: 2400, shape: exp}   # victim load -- fixed, no contention
+    loadgen: {rps: 3600, shape: exp}   # victim load -- fixed, no contention (operating point ~75% of the 1-P victim; at 2400 it was too idle to be hurt)
 victim:
   testbed: hotelReservation
   service: search
