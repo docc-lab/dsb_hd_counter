@@ -43,9 +43,11 @@ spec:
       containers:
         - name: hotel-reserv-search
           image: docclabgroup/search-online:v2.3.0
-          # No command override: the image CMD runs, and CPU_SET is empty, so
-          # the replica is unpinned (the image's ENV default would pin it to
-          # 0,1,2).
+          # No command override: the image CMD runs taskset -c $CPU_SET. CPU_SET
+          # must be a real CPU list: with it empty the windowed sampler opens
+          # perf counters on "CPU -1" and the service exits at start (every
+          # overflow replica of the 2026-10-22 sweep crash-looped). 0-3 exists
+          # on every node; one P per replica like the victim.
           ports:
             - {name: rpc,     containerPort: 8082}
             - {name: score,   containerPort: 7900}
@@ -62,7 +64,7 @@ spec:
             - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
           env:
             - {name: GOMAXPROCS,               value: "1"}
-            - {name: CPU_SET,                  value: ""}
+            - {name: CPU_SET,                  value: "0-3"}
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
             - {name: GORDION_CONFIG,           value: "/etc/gordion-conf/gordion.json"}

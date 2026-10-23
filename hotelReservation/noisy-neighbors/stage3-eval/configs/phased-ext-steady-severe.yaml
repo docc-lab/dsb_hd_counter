@@ -1,7 +1,7 @@
 # Stage 3 PHASED sweep — extrinsic steady, SEVERE (SN 5400 / SS 6300, fixed inter-arrival)
 #
 # Timeline (single 140 s run):
-#   p1  0-20 s   victim only @ 2400 rps (baseline)
+#   p1  0-20 s   victim only @ 3600 rps (baseline)
 #   p2 20-80 s   contention, mitigation DISARMED (controller senses + traces)
 #   p3 80-140 s  same contention, mitigation ARMED (orchestrator touches the
 #                arm file at t=+80 s; see run-phased-stage3.sh)

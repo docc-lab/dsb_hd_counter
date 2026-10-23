@@ -1,4 +1,4 @@
-# Stage 3 PHASED sweep — intrinsic bursty, SEVERE (victim 800 -> 2400 rps, Poisson)
+# Stage 3 PHASED sweep — intrinsic bursty, SEVERE (victim 800 -> 5600 rps, Poisson)
 #
 # Timeline (single 140 s run):
 #   p1  0-20 s   victim only @ 800 rps (baseline; intrinsic base rate)
@@ -18,7 +18,7 @@ experiment:
 testbeds:
   hotelReservation:
     # Intrinsic overload: baseline 800 rps all run; a second driver adds
-    # +1600 rps from t=+20 s (total 2400 rps in p2/p3).
+    # +4800 rps from t=+20 s (total 5600 rps in p2/p3, ~1.3x the 1-P knee).
     loadgen:
       rps: 800
       shape: exp

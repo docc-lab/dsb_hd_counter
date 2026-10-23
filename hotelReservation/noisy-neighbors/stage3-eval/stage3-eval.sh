@@ -353,11 +353,21 @@ deploy_victim() {
     # victim. Together with the image override above and apply_msr_pod_capabilities
     # below (mount + privileged + AppArmor + CAP_SYS_RAWIO), this restores the
     # full GORDION setup for whichever service is selected as the victim.
+    # PERF_EVENTS: the sampler's built-in default (14 events, no LLC-loads /
+    # LLC-load-misses / dTLB-loads) is NOT the set the GRU predictor was
+    # trained on (ml_training_deployment/gru_train.py, PERF_KEYS). Pin the
+    # trainer's 10-event set so run_data.json is usable as predictor training
+    # data and prediction-ON serving sees the features it was fit on. The
+    # Gordion scorer only needs cycles + ref-cycles, present in both sets.
+    # Override with STAGE3_PERF_EVENTS in the environment.
+    local perf_events="${STAGE3_PERF_EVENTS:-cycles,ref-cycles,instructions,LLC-loads,LLC-load-misses,branch-instructions,branch-misses,dTLB-loads,dTLB-load-misses,page-faults}"
     kubectl set env "deployment/$VICTIM_DEPLOYMENT" \
         "ENABLE_WINDOWED_SAMPLING=true" "GORDION_SCORE_SOURCE=${VICTIM_SCORE_SOURCE:-gordion}" \
         "GORDION_CONFIG=${VICTIM_GORDION_CONFIG:-/etc/gordion-conf/gordion.json}" \
+        "PERF_EVENTS=${perf_events}" \
         >/dev/null 2>&1 \
         || s3_log "WARNING: failed to set instrumentation env on $VICTIM_DEPLOYMENT"
+    s3_log "Victim PERF_EVENTS=${perf_events}"
 
     if declare -F apply_msr_pod_capabilities >/dev/null 2>&1; then
         apply_msr_pod_capabilities "$VICTIM_DEPLOYMENT" "$EXP_DIR" \
@@ -747,7 +757,7 @@ run_one_iteration() {
     # next run's pod roll (kubectl logs is lost on restart).
     capture_victim_score_log "$run_dir" "$started_ns"
 
-    capture_victim_run_data "$run_dir"
+    capture_victim_run_data "$run_dir" "$ended_ns"
 
     write_per_run_manifest "$run_id" "$run_dir" "$started_ns" "$ended_ns"
 
@@ -798,7 +808,7 @@ capture_victim_score_log() {
 }
 
 # ---------------------------------------------------------------------------
-# capture_victim_run_data <run_dir>
+# capture_victim_run_data <run_dir> [ended_epoch_ns]
 #
 # Retrieves the windowed sampler's full-run raw JSON from the victim pod
 # (/data/run_data_<svc>_iter1.json -- the same file data-collector.sh's
@@ -807,9 +817,15 @@ capture_victim_score_log() {
 # next run's rollout restart. Best-effort: never dies. The file covers the
 # pod's whole lifetime (since this run's deploy), not just the driver window
 # -- slice by started/ended_epoch_ns.txt when analyzing.
+#
+# A single cat right after the run ends loses up to 30 s of its tail (the
+# 2026-10-22 sweep's files stop ~20 s before ended_epoch_ns). When
+# ended_epoch_ns is given, re-read until the last sample's timestamp reaches
+# it (next flush), bounded by RUN_DATA_WAIT_S (default 45).
 # ---------------------------------------------------------------------------
 capture_victim_run_data() {
     local run_dir="$1"
+    local ended_ns="${2:-}"
     local out="$run_dir/run_data.json"
     local svc="$VICTIM_SERVICE"
     local pod
@@ -821,9 +837,24 @@ capture_victim_run_data() {
         s3_log "  WARNING: run_data capture skipped (no running victim pod found)"
         return 0
     fi
-    kubectl exec "$pod" -- cat "/data/run_data_${svc}_iter1.json" > "$out" 2>/dev/null || true
+    local deadline=$(( $(date +%s) + ${RUN_DATA_WAIT_S:-45} ))
+    local last_s="" ended_s=""
+    [[ -n "$ended_ns" ]] && ended_s=$(( ended_ns / 1000000000 ))
+    while :; do
+        kubectl exec "$pod" -- cat "/data/run_data_${svc}_iter1.json" > "$out" 2>/dev/null || true
+        [[ -n "$ended_s" && -s "$out" ]] || break
+        last_s=$(jq -r '.samples[-1].timestamp // empty | sub("\\.[0-9]+"; "") | fromdateiso8601' "$out" 2>/dev/null || true)
+        if [[ -n "$last_s" && "$last_s" -ge "$ended_s" ]]; then
+            break
+        fi
+        if [[ $(date +%s) -ge $deadline ]]; then
+            s3_log "  WARNING: run_data tail still $(( ended_s - ${last_s:-0} )) s short of run end after ${RUN_DATA_WAIT_S:-45} s (sampler flush not seen)"
+            break
+        fi
+        sleep 5
+    done
     if [[ -s "$out" ]]; then
-        s3_log "  Captured run_data.json ($(wc -c < "$out" | tr -d ' ') bytes) from $pod"
+        s3_log "  Captured run_data.json ($(wc -c < "$out" | tr -d ' ') bytes) from $pod${last_s:+; last sample $(( ended_s - last_s )) s before run end}"
     else
         rm -f "$out"
         s3_log "  WARNING: run_data capture empty (sampler not writing /data/run_data_${svc}_iter1.json?)"
