@@ -1,4 +1,4 @@
-# Stage 3 PHASED sweep — intrinsic steady, MODERATE (victim 800 -> 2200 rps, fixed)
+# Stage 3 PHASED sweep — intrinsic steady, MODERATE (victim 800 -> 4400 rps, fixed)
 #
 # Timeline (single 140 s run):
 #   p1  0-20 s   victim only @ 800 rps (baseline; intrinsic base rate)
@@ -18,7 +18,7 @@ experiment:
 testbeds:
   hotelReservation:
     # Intrinsic overload: baseline 800 rps all run; a second driver adds
-    # +1400 rps from t=+20 s (total 2200 rps in p2/p3).
+    # +3600 rps from t=+20 s (total 4400 rps in p2/p3, ~the 1-P knee).
     loadgen:
       rps: 800
       shape: exp
