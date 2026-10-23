@@ -31,7 +31,9 @@ import sys
 
 
 def ts_epoch(s):
-    s = re.sub(r"\.(\d{6})\d+", r".\1", s).replace("Z", "+00:00")
+    # Go prints 1-9 fractional digits (trailing zeros dropped); fromisoformat
+    # before 3.11 accepts exactly 3 or 6 -> normalise to 6.
+    s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s).replace("Z", "+00:00")
     return datetime.datetime.fromisoformat(s).timestamp()
 
 
