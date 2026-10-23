@@ -40,7 +40,9 @@ if [[ -n "$DEADLINE" ]]; then
 fi
 
 ok=0; failed=0; skipped=0
-while read -r pool cfg; do
+# plan on fd 3: the orchestrator (ssh, kubectl exec) reads stdin and would
+# swallow the rest of the plan after the first point.
+while read -r -u 3 pool cfg; do
     [[ -z "${pool:-}" || "$pool" == \#* ]] && continue
     name=$(basename "$cfg" .yaml)
     dest="data/$OUT/$name"
@@ -55,7 +57,7 @@ while read -r pool cfg; do
     log "=== $name  pool=$pool"
     # any leftover from an interrupted point would be filed under this name
     rm -rf data/stage3eval_* data/.*.orchestrator.eval.log 2>/dev/null
-    AGGR_CPUSET="$pool" ARM=none ./run-phased-stage3.sh "$cfg"
+    AGGR_CPUSET="$pool" ARM=none ./run-phased-stage3.sh "$cfg" </dev/null
     rc=$?
     mkdir -p "$dest"
     mv data/stage3eval_* "$dest"/ 2>/dev/null
@@ -70,7 +72,7 @@ while read -r pool cfg; do
         echo "$(date -Iseconds) FAIL $name rc=$rc" >> "data/$OUT/sweep.log"
         log "FAIL $name rc=$rc (continuing)"
     fi
-done < "$PLAN"
+done 3< "$PLAN"
 
 log "done: ok=$ok failed=$failed skipped=$skipped -> data/$OUT"
 python3 tools/run_data_phases.py "data/$OUT"/* 2>&1 | grep -v "^perf_events" >&2
