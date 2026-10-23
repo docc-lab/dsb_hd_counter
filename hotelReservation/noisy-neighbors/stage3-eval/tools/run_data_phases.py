@@ -17,13 +17,17 @@ import argparse
 import datetime
 import glob
 import json
+import re
 import os
 import statistics as st
 import sys
 
 
 def ts_epoch(s):
-    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    # Sampler timestamps carry nanoseconds; fromisoformat before 3.11 takes
+    # at most 6 fractional digits.
+    s = re.sub(r"\.(\d{6})\d+", r".\1", s).replace("Z", "+00:00")
+    return datetime.datetime.fromisoformat(s).timestamp()
 
 
 def run_dirs(paths):
