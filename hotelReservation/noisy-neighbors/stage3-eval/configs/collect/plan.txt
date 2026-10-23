@@ -1,0 +1,26 @@
+# <AGGR_CPUSET> <config>  -- run order for run-collect.sh
+76,78 configs/collect/col-base-3200.yaml
+76,78 configs/collect/col-ext-mid-steady.yaml
+76,78 configs/collect/col-ext-mid-bursty.yaml
+76,78 configs/collect/col-int-2000-off20.yaml
+76,78 configs/collect/col-ext-heavy-steady.yaml
+76,78 configs/collect/col-base-1500.yaml
+76,78 configs/collect/col-ext-sn-only.yaml
+76,78 configs/collect/col-ext-ss-only.yaml
+76,78 configs/collect/col-int-4200-off20.yaml
+76,78 configs/collect/col-ext-light-steady.yaml
+76,78 configs/collect/col-ext-light-bursty.yaml
+76,78 configs/collect/col-mixed-mid.yaml
+76,78 configs/collect/col-ext-heavy-bursty.yaml
+76,78 configs/collect/col-base-4000.yaml
+4,6,76,78 configs/collect/col-ext-mid-steady-pool4.yaml
+76,78 configs/collect/col-ext-mid-exp.yaml
+76,78 configs/collect/col-int-3000-off40.yaml
+76,78 configs/collect/col-ext-heavy-rep3.yaml
+76,78 configs/collect/col-ext-mid-v1500.yaml
+76,78 configs/collect/col-mixed-bursty.yaml
+4,6,76,78 configs/collect/col-ext-heavy-steady-pool4.yaml
+76,78 configs/collect/col-int-bursty-victim.yaml
+76,78 configs/collect/col-base-2500.yaml
+76,78 configs/collect/col-ext-mid-v4000.yaml
+4,6,76,78 configs/collect/col-ext-heavy-bursty-pool4.yaml
