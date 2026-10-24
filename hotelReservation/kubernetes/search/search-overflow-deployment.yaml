@@ -2,15 +2,26 @@
 #
 # The victim deployment (search) stays at replicas=1, pinned to the target
 # node. The mitigation controller's Eq.(1) scales THIS deployment between 0
-# and n_max (HORIZONTAL_DEPLOYMENT=search-overflow), and the hard node
-# anti-affinity below keeps its replicas off the target node, so scale-out
-# adds capacity elsewhere instead of more contention next to the victim.
+# and n_max (HORIZONTAL_DEPLOYMENT=search-overflow).
+#
+# Placement (changed 2026-10-24): replicas run ON the target node, pinned to
+# the victim's own cores (CPU_SET 4,6, whose sibling threads 76,78 carry the
+# aggressor pool). Replication adds capacity on the node the service is on;
+# it does not move the service away from the contention -- only migration
+# does that. The previous version kept the replicas OFF node-4 (hard node
+# anti-affinity), which on a 72-core node with a confined aggressor pool
+# made every replica uncontended and let scale-out look like it mitigated
+# extrinsic contention (it only took traffic away from the victim).
 #
 # Pods carry io.kompose.service=search so they register in Consul as
 # srv-search like the victim and the frontend load-balances across both.
 # The deployment's own selector adds overflow=true so it never adopts the
 # victim's pod. run-phased-stage3.sh sets the image to the config's
 # victim.image and resets replicas to 0 before every run.
+#
+# CPU_SET must be a real CPU list: with it empty the windowed sampler opens
+# perf counters on "CPU -1" and the service exits at start (every overflow
+# replica of the 2026-10-22 sweep crash-looped).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,22 +43,13 @@ spec:
       annotations:
         container.apparmor.security.beta.kubernetes.io/hotel-reserv-search: unconfined
     spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: NotIn
-                    values: [node-4]    # the stage-3 target node
+      nodeSelector:
+        kubernetes.io/hostname: node-4
+      tolerations:
+        - {key: dedicated, operator: Equal, value: special, effect: NoSchedule}
       containers:
         - name: hotel-reserv-search
           image: docclabgroup/search-online:v2.3.0
-          # No command override: the image CMD runs taskset -c $CPU_SET. CPU_SET
-          # must be a real CPU list: with it empty the windowed sampler opens
-          # perf counters on "CPU -1" and the service exits at start (every
-          # overflow replica of the 2026-10-22 sweep crash-looped). 0-3 exists
-          # on every node; one P per replica like the victim.
           ports:
             - {name: rpc,     containerPort: 8082}
             - {name: score,   containerPort: 7900}
@@ -62,9 +64,10 @@ spec:
           volumeMounts:
             - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
             - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
+          # No command override: the image CMD runs taskset -c $CPU_SET.
           env:
             - {name: GOMAXPROCS,               value: "1"}
-            - {name: CPU_SET,                  value: "0-3"}
+            - {name: CPU_SET,                  value: "4,6"}   # the victim's cores; siblings 76,78 = aggressor pool
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
             - {name: GORDION_CONFIG,           value: "/etc/gordion-conf/gordion.json"}

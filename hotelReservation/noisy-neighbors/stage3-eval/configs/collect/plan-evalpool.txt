@@ -1,0 +1,15 @@
+# Partial rerun 2026-10-24: the ext/mixed points with the EVAL pool (siblings 76,78 + HC Secondary 8-14) -> data/collect-smt-evalpool
+8,10,12,14,76,78 configs/collect/col-ext-mid-steady.yaml
+8,10,12,14,76,78 configs/collect/col-ext-mid-bursty.yaml
+8,10,12,14,76,78 configs/collect/col-ext-heavy-steady.yaml
+8,10,12,14,76,78 configs/collect/col-ext-sn-only.yaml
+8,10,12,14,76,78 configs/collect/col-ext-ss-only.yaml
+8,10,12,14,76,78 configs/collect/col-ext-light-steady.yaml
+8,10,12,14,76,78 configs/collect/col-ext-light-bursty.yaml
+8,10,12,14,76,78 configs/collect/col-mixed-mid.yaml
+8,10,12,14,76,78 configs/collect/col-ext-heavy-bursty.yaml
+8,10,12,14,76,78 configs/collect/col-ext-mid-exp.yaml
+8,10,12,14,76,78 configs/collect/col-ext-heavy-rep3.yaml
+8,10,12,14,76,78 configs/collect/col-ext-mid-v1500.yaml
+8,10,12,14,76,78 configs/collect/col-mixed-bursty.yaml
+8,10,12,14,76,78 configs/collect/col-ext-mid-v4000.yaml

@@ -1,0 +1,42 @@
+# Motivation experiment (2026-10-23): extrinsic BURSTY contention on the
+# victim's SMT sibling threads. Same phases as the phased-* configs
+# (p1 0-20 victim only, p2 20-80 contention disarmed, p3 80-140 armed at
+# t=+80 by run-phased-stage3.sh). Unlike phased-ext-bursty-* (which only
+# differ from steady by Poisson arrivals), the aggressor load here really
+# alternates: 10 s at peak, 10 s at a light base -> 3 bursts per phase
+# (20-30, 40-50, 60-70 | 80-90, 100-110, 120-130 s).
+#
+# Arms: ARM=none (reference), ARM=hc-bang (harvesting, bang-bang trigger),
+# ARM=horizontal-any (replication on the same trigger = unmatched mitigation).
+# Pool: run-phased-stage3.sh default AGGR_CPUSET=8,10,12,14,76,78.
+
+experiment:
+  name: motiv-ext-bursty
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 3600, shape: exp}   # victim load, fixed across phases (~75% of the 1-P victim)
+  socialNetwork:
+    loadgen: {rps: 7000, shape: {burst_s: 10, idle_s: 10, peak_rps: 7000, base_rps: 500}, start_offset_s: 20}
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 8000, shape: {burst_s: 10, idle_s: 10, peak_rps: 8000, base_rps: 600}, start_offset_s: 20}
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  cpu_set: "4,6"     # HC Primary; aggressors sit on siblings 76,78 (+ HC Secondary 8-14)
+  score_log: true
+aggressors:
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}
