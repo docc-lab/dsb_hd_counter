@@ -54,7 +54,12 @@ P3_SNAPSHOT_S="${P3_SNAPSHOT_S:-30}"
 # each), and a 10-core pool only cost the victim +25% latency, so the pool
 # is the victim's cores (4,6) plus HC's Secondary cores (8-14): 6 cores,
 # ~1.5x oversubscribed under severe load. Empty disables the confinement.
-AGGR_CPUSET="${AGGR_CPUSET-4,6,8,10,12,14}"
+# 2026-10-23, node-4 booted SMT ON: the pool is the victim's SIBLING threads
+# (76,78 = siblings of 4,6) plus HC's Secondary cores. Time-sharing the
+# victim's own cores only inflated total_time (run-queue wait); only SMT
+# siblings inflate processing_time, the score input the design is built on
+# (RUNBOOK sec 13/14). Same size (6) as before, so CAP_BASE_CORES/K_P hold.
+AGGR_CPUSET="${AGGR_CPUSET-8,10,12,14,76,78}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 
 orch_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [phased] $*" >&2; }
@@ -129,11 +134,17 @@ label_loop() {
 # container-level writes (HC's secondary∪victim set is a subset of the pool
 # and HC restores the container value it saved, not ours). Handles both the
 # cgroupfs (kubepods/<qos>/pod<uid>) and systemd (…-pod<uid_>.slice) layouts.
+# Pods the hc actuator currently holds (annotation mitigation/hc-cpuset-set-
+# by-node) are SKIPPED (2026-10-23): hc now widens the POD-level cpuset too
+# (the pool excludes the victim's cores, so the Balancer could not lend them
+# otherwise) and writes the saved pool back on Restore; re-applying the pool
+# underneath it would undo the harvesting every 10 s.
 confine_aggressors() {
     [[ -n "$AGGR_CPUSET" ]] || return 0
     local uids
-    uids=$(kubectl get pods -A -l gordion-aggr=true --field-selector "spec.nodeName=$MITIG_HOST" \
-        -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort -u | tr '\n' ' ')
+    uids=$(kubectl get pods -A -l gordion-aggr=true --field-selector "spec.nodeName=$MITIG_HOST" -o json 2>/dev/null \
+        | jq -r '.items[] | select((.metadata.annotations["mitigation/hc-cpuset-set-by-node"] // "") == "") | .metadata.uid' \
+        | sort -u | tr '\n' ' ')
     [[ -n "${uids// /}" ]] || return 0
     on_target "sudo sh -c '
         for u in $uids; do

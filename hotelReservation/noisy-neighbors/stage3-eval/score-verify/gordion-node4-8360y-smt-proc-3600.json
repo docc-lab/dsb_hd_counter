@@ -1,0 +1,121 @@
+{
+  "version": "gordion-v2-streamcal",
+  "k": 0.1304,
+  "smooth_window": 10,
+  "latency_section": "processing_time",
+  "baseline": {
+    "p50_kcyc": 108.476,
+    "p90_kcyc": 187.874,
+    "sigma50_kcyc": 14.767,
+    "sigma90_kcyc": 11.15,
+    "freq_mhz": 2805.5
+  },
+  "curve_csv": "/etc/gordion-conf/curve.csv",
+  "curve_columns": {
+    "rate": "target_rps",
+    "p50": "svc_p50_norm_kcyc",
+    "p90": "svc_p90_norm_kcyc"
+  },
+  "rate_signal": "arrival_rps_3s",
+  "failure": {
+    "slo_p90_ms": 0,
+    "stall_windows": 5
+  },
+  "ablations": {
+    "no_smoothing": false,
+    "no_ext": false,
+    "raw_rate_index": false,
+    "use_current_y50": false
+  },
+  "_provenance": {
+    "method": "calibrate_from_stream (baseline stats over the smoothed stream)",
+    "raw_window_medians": {
+      "p50_kcyc": 123.8,
+      "p90_kcyc": 179.1
+    },
+    "levels": [
+      {
+        "loadgen": 300.0,
+        "arrival": 180.3,
+        "d50": 92.9,
+        "d90": 173.5,
+        "wmean_d50": 92.1,
+        "wmean_d90": 184.1,
+        "n_windows": 1049
+      },
+      {
+        "loadgen": 600.0,
+        "arrival": 364.1,
+        "d50": 82.2,
+        "d90": 193.3,
+        "wmean_d50": 82.4,
+        "wmean_d90": 195.3,
+        "n_windows": 1048
+      },
+      {
+        "loadgen": 1200.0,
+        "arrival": 722.4,
+        "d50": 104.1,
+        "d90": 190.4,
+        "wmean_d50": 103.7,
+        "wmean_d90": 190.9,
+        "n_windows": 1048
+      },
+      {
+        "loadgen": 2400.0,
+        "arrival": 1440.9,
+        "d50": 115.5,
+        "d90": 206.8,
+        "wmean_d50": 115.8,
+        "wmean_d90": 206.4,
+        "n_windows": 1048
+      },
+      {
+        "loadgen": 3000.0,
+        "arrival": 1805.0,
+        "d50": 118.7,
+        "d90": 215.0,
+        "wmean_d50": 118.7,
+        "wmean_d90": 212.7,
+        "n_windows": 1048
+      },
+      {
+        "loadgen": 3600.0,
+        "arrival": 2159.5,
+        "d50": 108.5,
+        "d90": 187.9,
+        "wmean_d50": 108.9,
+        "wmean_d90": 190.3,
+        "n_windows": 1049
+      },
+      {
+        "loadgen": 4200.0,
+        "arrival": 2524.8,
+        "d50": 107.3,
+        "d90": 192.1,
+        "wmean_d50": 106.5,
+        "wmean_d90": 188.6,
+        "n_windows": 1048
+      },
+      {
+        "loadgen": 4800.0,
+        "arrival": 2884.7,
+        "d50": 105.0,
+        "d90": 196.8,
+        "wmean_d50": 103.9,
+        "wmean_d90": 191.7,
+        "n_windows": 1047
+      },
+      {
+        "loadgen": 5600.0,
+        "arrival": 2995.1,
+        "d50": 102.8,
+        "d90": 198.8,
+        "wmean_d50": 101.8,
+        "wmean_d90": 192.2,
+        "n_windows": 1049
+      }
+    ],
+    "baseline_source": "level loadgen=3600"
+  }
+}
