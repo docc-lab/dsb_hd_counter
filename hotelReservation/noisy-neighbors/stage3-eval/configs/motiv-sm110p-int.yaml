@@ -1,0 +1,40 @@
+# Motivation pass 2, scenario "intrinsic overload" (2026-11-01, sm110p July layout).
+# No aggressor load (SN/SS deployed, rps 0): the victim's OWN load steps up at
+# t=20 s (base 800 + extra from a second driver) past the 3-P victim's knee and
+# stays there through p2 (disarmed) and p3 (armed). Matched mitigation:
+# replication (rep{1,2,3}f x placements; trigger forced at ARM since the
+# processing_time score does not see run-queue overload); unmatched: hcf.
+# EXTRA_RPS is set from the calibration curve (knee) before the sweep.
+experiment:
+  name: motiv-sm110p-int
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen:
+      rps: 800
+      shape: exp
+      extra: {rps: 4000, shape: exp, start_offset_s: 20}   # base+extra past the knee from t=20 (set from calibration)
+  socialNetwork:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  cpu_set: "18,19,20"   # July's victim threads (siblings 2,3,4); HC Primary; aggressors unpinned over the node
+  score_log: true
+aggressors:
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

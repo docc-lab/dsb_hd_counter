@@ -184,6 +184,11 @@ snapshot_aggressors() {
         docker stats --no-stream --format \"{{.CPUPerc}}\t{{.Name}}\" 2>/dev/null | grep -v _POD_ | sort -rn | head -25 | cut -c1-90'"
 }
 
+# uid -> namespace name node for every pod, to join cpu_usage.csv's pod:<uid> rows.
+snapshot_pod_uids() {
+    kubectl get pods -A -o custom-columns='UID:.metadata.uid,NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase' --no-headers
+}
+
 preflight() {
     command -v kubectl >/dev/null || die "kubectl missing"
     on_target "test -x $MITIG_DIR/mitigation-controller && test -x $MITIG_DIR/run-mitigation.sh \
@@ -224,6 +229,17 @@ run_config() {
     on_target "pgrep -f '[m]itigation-controller' >/dev/null" \
         || die "controller not running; see $MITIG_HOST:$MITIG_DIR/$name.ctrl.log"
 
+    # Per-second CPU accounting on the target (per-CPU busy time, per-pod
+    # cgroup usage_usec) for the core-seconds comparison; kit-installed
+    # cpu-sampler.sh, collected into mitigation/cpu_usage.csv below.
+    # (pkill in its own ssh call: a command line that also names the sampler's
+    # path would match the pattern and kill the launching shell.)
+    on_target "sudo pkill -f '[c]pu-sampler' ; true"
+    on_target "test -x $MITIG_DIR/cpu-sampler.sh || exit 0
+        sudo rm -f $MITIG_DIR/$name.cpu.csv
+        sudo setsid nohup $MITIG_DIR/cpu-sampler.sh $MITIG_DIR/$name.cpu.csv 1 </dev/null >/dev/null 2>&1 &" \
+        || orch_log "WARNING: cpu-sampler not started"
+
     local started_after; started_after=$(date +%s)
     local eval_log="$S3_DIR/data/.${name}.orchestrator.eval.log"
     mkdir -p "$S3_DIR/data"
@@ -262,6 +278,7 @@ run_config() {
             orch_log "ARMED at $(date '+%H:%M:%S')"
             sleep "$P3_SNAPSHOT_S"
             kubectl get pods -A -o wide > "$stage_dir/pod_placement_p3.txt" 2>&1 || true
+            snapshot_pod_uids > "$stage_dir/pod_uids_p3.txt" 2>&1 || true
             snapshot_aggressors > "$stage_dir/aggr_affinity_p3.txt" 2>&1 || true
         else
             orch_log "WARNING: stage3-eval exited before the ARM point"
@@ -274,6 +291,9 @@ run_config() {
     local rc=$?
     kill "$label_pid" 2>/dev/null; wait "$label_pid" 2>/dev/null
     orch_log "stage3-eval.sh exited rc=$rc; stopping controller"
+    # Final uid map before the controller's shutdown Restore scales replicas away.
+    snapshot_pod_uids > "$stage_dir/pod_uids_end.txt" 2>&1 || true
+    on_target "sudo pkill -f '[c]pu-sampler' ; true"
     stop_controller
 
     if [[ -n "$run_dir" ]]; then
@@ -292,6 +312,8 @@ run_config() {
             "${SSH[@]}" "$MITIG_HOST" "cat $MITIG_DIR/$name.$ext" > "$mdir/$name.$ext" 2>/dev/null \
                 || orch_log "WARNING: could not fetch $name.$ext"
         done
+        "${SSH[@]}" "$MITIG_HOST" "cat $MITIG_DIR/$name.cpu.csv" > "$mdir/cpu_usage.csv" 2>/dev/null \
+            || rm -f "$mdir/cpu_usage.csv"
         if [[ "$ARM" == hc* ]]; then
             # The newest Balancer work dir (balancer.log, idleMaskChanges.log)
             # plus the Listener log tail.

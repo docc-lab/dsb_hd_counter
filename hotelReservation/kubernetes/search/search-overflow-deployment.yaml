@@ -5,8 +5,8 @@
 # and n_max (HORIZONTAL_DEPLOYMENT=search-overflow).
 #
 # Placement (changed 2026-10-24): replicas run ON the target node, pinned to
-# the victim's own cores (CPU_SET 4,6, whose sibling threads 76,78 carry the
-# aggressor pool). Replication adds capacity on the node the service is on;
+# the victim's own cores (CPU_SET 18,19,20 on the sm110p as in July, siblings
+# 2,3,4; was 4,6 / 76,78 on the 8360Y). Replication adds capacity on the node the service is on;
 # it does not move the service away from the contention -- only migration
 # does that. The previous version kept the replicas OFF node-4 (hard node
 # anti-affinity), which on a 72-core node with a confined aggressor pool
@@ -58,7 +58,7 @@ spec:
             requests:
               cpu: "1"
             limits:
-              cpu: "2"
+              cpu: "3"
           securityContext:
             privileged: true
           volumeMounts:
@@ -66,8 +66,8 @@ spec:
             - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
           # No command override: the image CMD runs taskset -c $CPU_SET.
           env:
-            - {name: GOMAXPROCS,               value: "1"}
-            - {name: CPU_SET,                  value: "4,6"}   # the victim's cores; siblings 76,78 = aggressor pool
+            - {name: GOMAXPROCS,               value: "3"}
+            - {name: CPU_SET,                  value: "18,19,20"}   # the victim's threads (sm110p, July layout); siblings 2,3,4
             - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
             - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
             - {name: GORDION_CONFIG,           value: "/etc/gordion-conf/gordion.json"}

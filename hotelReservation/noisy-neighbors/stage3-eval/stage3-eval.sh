@@ -859,6 +859,20 @@ capture_victim_run_data() {
         rm -f "$out"
         s3_log "  WARNING: run_data capture empty (sampler not writing /data/run_data_${svc}_iter1.json?)"
     fi
+
+    # Overflow replicas (horizontal arms) run the same windowed sampler; keep
+    # each one's dump as run_data-overflow-<pod>.json so per-instance latency
+    # and request counts are available for the replication cells
+    # (motivation pass 2). Best-effort: the controller may have scaled them
+    # away already.
+    local opod
+    for opod in $(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT,overflow=true"                   --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        if kubectl exec "$opod" -- cat "/data/run_data_${svc}_iter1.json" > "$run_dir/run_data-overflow-$opod.json" 2>/dev/null            && [[ -s "$run_dir/run_data-overflow-$opod.json" ]]; then
+            s3_log "  Captured run_data-overflow-$opod.json ($(wc -c < "$run_dir/run_data-overflow-$opod.json" | tr -d ' ') bytes)"
+        else
+            rm -f "$run_dir/run_data-overflow-$opod.json"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
