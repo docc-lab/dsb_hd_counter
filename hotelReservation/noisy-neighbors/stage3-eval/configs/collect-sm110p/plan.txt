@@ -1,0 +1,26 @@
+# <AGGR_CPUSET> <config>  -- run order for run-collect.sh (layout sm110p: victim 18,19,20)
+0-13,16-29 configs/collect-sm110p/col-base-3200.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-mid-steady.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-mid-bursty.yaml
+0-13,16-29 configs/collect-sm110p/col-int-2000-off20.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-heavy-steady.yaml
+0-13,16-29 configs/collect-sm110p/col-base-1500.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-sn-only.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-ss-only.yaml
+0-13,16-29 configs/collect-sm110p/col-int-4200-off20.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-light-steady.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-light-bursty.yaml
+0-13,16-29 configs/collect-sm110p/col-mixed-mid.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-heavy-bursty.yaml
+0-13,16-29 configs/collect-sm110p/col-base-4000.yaml
+2,3,4 configs/collect-sm110p/col-ext-mid-steady-pool4.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-mid-exp.yaml
+0-13,16-29 configs/collect-sm110p/col-int-3000-off40.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-heavy-rep3.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-mid-v1500.yaml
+0-13,16-29 configs/collect-sm110p/col-mixed-bursty.yaml
+2,3,4 configs/collect-sm110p/col-ext-heavy-steady-pool4.yaml
+0-13,16-29 configs/collect-sm110p/col-int-bursty-victim.yaml
+0-13,16-29 configs/collect-sm110p/col-base-2500.yaml
+0-13,16-29 configs/collect-sm110p/col-ext-mid-v4000.yaml
+2,3,4 configs/collect-sm110p/col-ext-heavy-bursty-pool4.yaml

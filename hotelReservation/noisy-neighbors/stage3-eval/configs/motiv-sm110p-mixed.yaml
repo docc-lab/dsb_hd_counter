@@ -15,7 +15,7 @@ testbeds:
     loadgen:
       rps: 800
       shape: exp
-      extra: {rps: 4000, shape: exp, start_offset_s: 20}   # set from calibration
+      extra: {rps: 10200, shape: exp, start_offset_s: 20}   # 11000 offered ~ 1.3x the 1-P victim (probe 2026-11-01: the 3-P victim used only 2.3 cores at 20k, chain max ~19.4k)
   socialNetwork:
     loadgen: {rps: 7000, shape: {burst_s: 10, idle_s: 10, peak_rps: 7000, base_rps: 500}, start_offset_s: 20}
     replicas: 2
@@ -26,7 +26,7 @@ victim:
   testbed: hotelReservation
   service: search
   image: docclabgroup/search-online:v2.3.0
-  cpu_set: "18,19,20"   # July's victim threads (siblings 2,3,4); HC Primary; aggressors unpinned over the node
+  cpu_set: "18"   # ONE thread, run with STAGE3_VICTIM_GOMAXPROCS=1: a 3-P victim cannot be overloaded through the chain (sibling 2)
   score_log: true
 aggressors:
   - {testbed: socialNetwork, service: compose-post,  role: bad}

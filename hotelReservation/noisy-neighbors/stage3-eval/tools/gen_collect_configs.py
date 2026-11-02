@@ -16,13 +16,29 @@ Design (2026-10-23, node-4 booted with SMT ON for this sweep):
   * bursty object shapes give several contention onsets per run.
 All runs use the 140 s phased layout with ARM=none (mitigation never fires),
 so p2 and p3 are one 120 s contention window.
+
+Layouts (--layout, default 8360y = the Clemson sweep above):
+  8360y   victim 4,6; pool = siblings 76,78, alt pool = 4,6,76,78 -> configs/collect/
+  sm110p  (Wisconsin, 2026-11-02, July layout, RUNBOOK sec 15) victim 18,19,20
+          GOMAXPROCS 3; pool = July's unpinned aggressors 0-13,16-29 (what the
+          eval arms run with; contention reaches the handler through the
+          siblings 2,3,4), alt pool = siblings only 2,3,4 (strongest, like the
+          old dataset B) -> configs/collect-sm110p/
 """
+import argparse
 import os
 import sys
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs", "collect")
-SIB = "76,78"          # siblings of the victim's cores
-SIB_OWN = "4,6,76,78"  # siblings + the victim's own cores
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAYOUTS = {
+    "8360y": dict(dir="collect", cpu_set="4,6", sib="76,78", sib_own="4,6,76,78",
+                  alt_note="pool = siblings + victim cores"),
+    "sm110p": dict(dir="collect-sm110p", cpu_set="18,19,20", sib="0-13,16-29", sib_own="2,3,4",
+                   alt_note="pool = the victim's siblings 2,3,4 only"),
+}
+# placeholders resolved per layout at write time
+SIB = "SIB"
+SIB_OWN = "SIB_OWN"
 
 SN_AGGR = [("socialNetwork", "compose-post"), ("socialNetwork", "post-storage"),
            ("socialNetwork", "social-graph"), ("socialNetwork", "user-timeline")]
@@ -48,7 +64,7 @@ def burst(burst_s, idle_s, peak, base):
     return {"burst_s": burst_s, "idle_s": idle_s, "peak_rps": peak, "base_rps": base}
 
 
-def config(name, note, hr, sn=None, ss=None, aggr=(), replicas=2):
+def config(name, note, hr, sn=None, ss=None, aggr=(), replicas=2, cpu_set="4,6"):
     tb = ["  hotelReservation:", "    loadgen: %s" % hr]
     if sn is not None:
         tb += ["  socialNetwork:", "    loadgen: %s" % sn, "    replicas: %d" % replicas]
@@ -71,7 +87,7 @@ def config(name, note, hr, sn=None, ss=None, aggr=(), replicas=2):
         "  testbed: hotelReservation",
         "  service: search",
         "  image: docclabgroup/search-online:v2.3.0",
-        '  cpu_set: "4,6"',
+        '  cpu_set: "%s"' % cpu_set,
         "  score_log: true",
         *ag, ""])
 
@@ -142,19 +158,28 @@ PLAN = [
 
 
 def main():
-    os.makedirs(OUT, exist_ok=True)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--layout", choices=sorted(LAYOUTS), default="8360y")
+    args = ap.parse_args()
+    L = LAYOUTS[args.layout]
+    pools = {SIB: L["sib"], SIB_OWN: L["sib_own"]}
+    out = os.path.join(HERE, "..", "configs", L["dir"])
+    os.makedirs(out, exist_ok=True)
     names = [p[0] for p in PLAN]
     assert len(names) == len(set(names)), "duplicate config names"
     plan_lines = []
     for name, pool, note, kw in PLAN:
-        path = os.path.join(OUT, name + ".yaml")
+        if pool == SIB_OWN:
+            note = note.replace("pool = siblings + victim cores", L["alt_note"])
+        path = os.path.join(out, name + ".yaml")
         with open(path, "w", newline="\n") as f:
-            f.write(config(name, note, **kw))
-        plan_lines.append("%s configs/collect/%s.yaml" % (pool, name))
-    with open(os.path.join(OUT, "plan.txt"), "w", newline="\n") as f:
-        f.write("# <AGGR_CPUSET> <config>  -- run order for run-collect.sh\n")
+            f.write(config(name, note, cpu_set=L["cpu_set"], **kw))
+        plan_lines.append("%s configs/%s/%s.yaml" % (pools[pool], L["dir"], name))
+    with open(os.path.join(out, "plan.txt"), "w", newline="\n") as f:
+        f.write("# <AGGR_CPUSET> <config>  -- run order for run-collect.sh (layout %s: victim %s)\n"
+                % (args.layout, L["cpu_set"]))
         f.write("\n".join(plan_lines) + "\n")
-    print("wrote %d configs + plan.txt to %s" % (len(PLAN), os.path.relpath(OUT)))
+    print("wrote %d configs + plan.txt to %s" % (len(PLAN), os.path.relpath(out)))
     print("estimated wall time at ~5.5 min/run: %.1f h" % (len(PLAN) * 5.5 / 60))
 
 
