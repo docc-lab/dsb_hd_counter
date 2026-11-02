@@ -5,6 +5,7 @@
 #include <thrift/transport/TServerSocket.h>
 
 #include "../utils.h"
+#include "../gordion/Gordion.h"
 #include "../utils_memcached.h"
 #include "../utils_mongodb.h"
 #include "../utils_thrift.h"
@@ -71,9 +72,9 @@ int main(int argc, char* argv[]) {
   mongoc_client_pool_push(mongodb_client_pool, mongodb_client);
   std::shared_ptr<TServerSocket> server_socket = get_server_socket(config_json, "0.0.0.0", port);
 
-  TThreadedServer server(std::make_shared<PostStorageServiceProcessor>(
+  TThreadedServer server(gordion::Attach(std::make_shared<PostStorageServiceProcessor>(
                              std::make_shared<PostStorageHandler>(
-                                 memcached_client_pool, mongodb_client_pool)),
+                                 memcached_client_pool, mongodb_client_pool)), "post-storage", {"StorePost", "ReadPost", "ReadPosts"}),
                          server_socket,
                          std::make_shared<TFramedTransportFactory>(),
                          std::make_shared<TBinaryProtocolFactory>());

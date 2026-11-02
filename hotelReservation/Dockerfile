@@ -10,6 +10,7 @@ COPY vendor/ vendor/
 
 COPY cmd/ cmd/
 COPY dialer/ dialer/
+COPY gordion/ gordion/
 COPY interceptor/ interceptor/
 COPY registry/ registry/
 COPY services/ services/

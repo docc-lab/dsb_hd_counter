@@ -1,6 +1,7 @@
 package dialer
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"fmt"
 	"time"
 
@@ -72,6 +73,10 @@ func Dial(name string, opts ...DialOption) (*grpc.ClientConn, error) {
 		}
 		dialopts = append(dialopts, opt)
 	}
+
+	// per-endpoint dictionary: caller send stamp, blocked-time accounting and the
+	// caller-side view of every callee endpoint (pass-through when not configured)
+	dialopts = append(dialopts, grpc.WithChainUnaryInterceptor(gordion.ClientInterceptor()))
 
 	conn, err := grpc.Dial(name, dialopts...)
 	if err != nil {

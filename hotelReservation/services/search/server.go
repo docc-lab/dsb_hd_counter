@@ -1,6 +1,7 @@
 package search
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"fmt"
 	"net"
 	"os"
@@ -119,6 +120,8 @@ func (s *Server) Run() error {
 		opts = append(opts, tlsopt)
 	}
 
+	// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+	opts = append(opts, gordion.ServerOptions("Search", []string{"Nearby"})...)
 	srv := grpc.NewServer(opts...)
 	pb.RegisterSearchServer(srv, s)
 

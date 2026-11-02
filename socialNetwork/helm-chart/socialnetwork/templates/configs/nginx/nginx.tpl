@@ -4,7 +4,7 @@ load_module modules/ngx_http_opentracing_module.so;
 
 # Checklist: Make sure that worker_processes == #cores you gave to
 # nginx process
-worker_processes  auto;
+worker_processes  {{ .Values.global.nginx.workerProcesses | default "auto" }};
 
 # error_log  logs/error.log;
 

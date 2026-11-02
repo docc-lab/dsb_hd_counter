@@ -1,6 +1,7 @@
 package reservation
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"context"
 	"fmt"
 	"net"
@@ -78,6 +79,8 @@ func (s *Server) Run() error {
 		opts = append(opts, tlsopt)
 	}
 
+	// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+	opts = append(opts, gordion.ServerOptions("Reservation", []string{"MakeReservation", "CheckAvailability"})...)
 	srv := grpc.NewServer(opts...)
 
 	pb.RegisterReservationServer(srv, s)

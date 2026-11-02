@@ -33,8 +33,21 @@ struct read_format {
 };
 
 
+// PERF_HOOKS=0 disables the per-request counters (3 perf_event_open + ioctl +
+// read + close per handler call): perf_start returns invalid handles and
+// perf_stop returns "disabled". Read once from the environment.
+static int perf_hooks_enabled(void) {
+    static int state = -1;
+    if (state < 0) {
+        const char *v = getenv("PERF_HOOKS");
+        state = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return state;
+}
+
 struct perf_handles perf_start() {
     struct perf_handles handles = { .leader_fd = -1, .instructions_fd = -1, .l1_misses_fd = -1 };
+    if (!perf_hooks_enabled()) return handles;
     int initialized = 0;
     if (!initialized) {
         struct perf_event_attr pe = {0};
@@ -88,6 +101,7 @@ struct perf_handles perf_start() {
 }
 
 const char* perf_stop(int leader_fd, int instructions_fd, int l1_misses_fd) {
+    if (leader_fd < 0) return "disabled";
     int initialized = 1;
     if (!initialized) return "not_initialized";
 

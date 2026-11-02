@@ -8,6 +8,7 @@
 #include <boost/log/trivial.hpp>
 
 #include <thrift/protocol/TBinaryProtocol.h>
+#include "gordion/Gordion.h"
 #include <thrift/transport/TSocket.h>
 #include <thrift/transport/TSSLSocket.h>
 #include <thrift/transport/TTransportUtils.h>
@@ -63,7 +64,7 @@ ThriftClient<TThriftClient>::ThriftClient(
   _socket = std::shared_ptr<TSocket>(new TSocket(addr, port));
   _socket->setKeepAlive(true);
   _transport = std::shared_ptr<TTransport>(new TFramedTransport(_socket));
-  _protocol = std::shared_ptr<TProtocol>(new TBinaryProtocol(_transport));
+  _protocol = std::make_shared<gordion::BlockedProtocol>(std::make_shared<TBinaryProtocol>(_transport));  // gordion: blocked-time accounting
   _client = new TThriftClient(_protocol);
   _connect_timestamp = 0;
   _keepalive_ms = 0;
@@ -99,7 +100,7 @@ ThriftClient<TThriftClient>::ThriftClient(
   }
   _socket->setKeepAlive(true);
   _transport = std::shared_ptr<TTransport>(new TFramedTransport(_socket));
-  _protocol = std::shared_ptr<TProtocol>(new TBinaryProtocol(_transport));
+  _protocol = std::make_shared<gordion::BlockedProtocol>(std::make_shared<TBinaryProtocol>(_transport));  // gordion: blocked-time accounting
   _client = new TThriftClient(_protocol);
   _connect_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
