@@ -14,7 +14,8 @@
 #                               the rest of the node + idle victim threads
 #   rep{1,2,3}:samecores        1-3 overflow replicas on the victim's threads 18-20
 #   rep{1,2,3}:othercores       ... on threads 21-29 of the same node
-#   rep{1,2,3}:othernode        ... on node-3
+#   rep{1,2,3}:othernode        ... on node-3 (CPU_SET 2,3,4 there)
+#   rep6:othernodewide          uncapped-ish (N_MAX=6) on node-3, 24-thread CPU_SET
 #
 # Per cell: copy the placement's overflow manifest over
 # kubernetes/search/search-overflow-deployment.yaml (hr_deploy re-applies that
@@ -75,11 +76,11 @@ for cell in $CELLS; do
     kubectl apply -f "$OVF" >/dev/null || { log "FATAL: overflow manifest apply failed"; exit 1; }
     kubectl scale deployment search-overflow --replicas=0 >/dev/null 2>&1
     log "=== $cell -> $dir   (arm=$arm overflow=${place:-samecores} pool=$AGGR_CPUSET)"
-    [[ "$place" == othernode ]] && other_sampler_start
+    [[ "$place" == othernode* ]] && other_sampler_start
     ARM="$arm" ./run-phased-stage3.sh "$CFG" 2>&1 </dev/null | tee "data/.motiv2-${arm}${place:+-$place}.orch.log"
     rc=${PIPESTATUS[0]}
     mkdir -p "$dir"
-    [[ "$place" == othernode ]] && other_sampler_stop "$dir"
+    [[ "$place" == othernode* ]] && other_sampler_stop "$dir"
     mv data/stage3eval_* "$dir"/ 2>/dev/null
     cp "data/.${name}.orchestrator.eval.log" "$dir/" 2>/dev/null
     mv "data/.motiv2-${arm}${place:+-$place}.orch.log" "$dir/" 2>/dev/null
