@@ -10,6 +10,7 @@
 #include "../logger.h"
 #include "../tracing.h"
 #include "../utils.h"
+#include "../gordion/Gordion.h"
 #include "../utils_redis.h"
 #include "../utils_thrift.h"
 #include "HomeTimelineHandler.h"
@@ -100,11 +101,11 @@ int main(int argc, char *argv[]) {
           Redis redis_primary_client_pool = init_redis_replica_client_pool(config_json, "redis-primary");
 
           TThreadedServer server(
-              std::make_shared<HomeTimelineServiceProcessor>(
+              gordion::Attach(std::make_shared<HomeTimelineServiceProcessor>(
                   std::make_shared<HomeTimelineHandler>(&redis_replica_client_pool,
                       &redis_primary_client_pool,
                       &post_storage_client_pool,
-                      &social_graph_client_pool)),
+                      &social_graph_client_pool)), "home-timeline", {"ReadHomeTimeline", "WriteHomeTimeline"}),
               server_socket, std::make_shared<TFramedTransportFactory>(),
               std::make_shared<TBinaryProtocolFactory>());
 
@@ -118,10 +119,10 @@ int main(int argc, char *argv[]) {
     RedisCluster redis_cluster_client_pool =
         init_redis_cluster_client_pool(config_json, "home-timeline");
     TThreadedServer server(
-        std::make_shared<HomeTimelineServiceProcessor>(
+        gordion::Attach(std::make_shared<HomeTimelineServiceProcessor>(
             std::make_shared<HomeTimelineHandler>(&redis_cluster_client_pool,
                                                   &post_storage_client_pool,
-                                                  &social_graph_client_pool)),
+                                                  &social_graph_client_pool)), "home-timeline", {"ReadHomeTimeline", "WriteHomeTimeline"}),
         server_socket, std::make_shared<TFramedTransportFactory>(),
         std::make_shared<TBinaryProtocolFactory>());
 
@@ -131,10 +132,10 @@ int main(int argc, char *argv[]) {
     Redis redis_client_pool =
         init_redis_client_pool(config_json, "home-timeline");
     TThreadedServer server(
-        std::make_shared<HomeTimelineServiceProcessor>(
+        gordion::Attach(std::make_shared<HomeTimelineServiceProcessor>(
             std::make_shared<HomeTimelineHandler>(&redis_client_pool,
                                                   &post_storage_client_pool,
-                                                  &social_graph_client_pool)),
+                                                  &social_graph_client_pool)), "home-timeline", {"ReadHomeTimeline", "WriteHomeTimeline"}),
         server_socket, std::make_shared<TFramedTransportFactory>(),
         std::make_shared<TBinaryProtocolFactory>());
 

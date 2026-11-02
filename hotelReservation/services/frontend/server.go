@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -109,8 +110,10 @@ func (s *Server) Run() error {
 
 	tlsconfig := tls.GetHttpsOpt()
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.Port),
-		Handler: mux,
+		Addr: fmt.Sprintf(":%d", s.Port),
+		// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+		Handler: gordion.HTTPHandler("frontend", mux, map[string]string{
+			"/hotels": "search", "/recommendations": "recommend", "/user": "user", "/reservation": "reserve"}),
 	}
 	if tlsconfig != nil {
 		log.Info().Msg("Serving https")

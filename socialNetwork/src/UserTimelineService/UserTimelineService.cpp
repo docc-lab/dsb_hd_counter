@@ -11,6 +11,7 @@
 #include "../logger.h"
 #include "../tracing.h"
 #include "../utils.h"
+#include "../gordion/Gordion.h"
 #include "../utils_mongodb.h"
 #include "../utils_redis.h"
 #include "../utils_thrift.h"
@@ -111,10 +112,10 @@ int main(int argc, char *argv[]) {
   if (redis_cluster_flag || redis_cluster_config_flag) {
     RedisCluster redis_client_pool =
         init_redis_cluster_client_pool(config_json, "user-timeline");
-    TThreadedServer server(std::make_shared<UserTimelineServiceProcessor>(
+    TThreadedServer server(gordion::Attach(std::make_shared<UserTimelineServiceProcessor>(
                                std::make_shared<UserTimelineHandler>(
                                    &redis_client_pool, mongodb_client_pool,
-                                   &post_storage_client_pool)),
+                                   &post_storage_client_pool)), "user-timeline", {"ReadUserTimeline", "WriteUserTimeline"}),
                            server_socket,
                            std::make_shared<TFramedTransportFactory>(),
                            std::make_shared<TBinaryProtocolFactory>());
@@ -124,10 +125,10 @@ int main(int argc, char *argv[]) {
   else if (redis_replica_config_flag) {
       Redis redis_replica_client_pool = init_redis_replica_client_pool(config_json, "redis-replica");
       Redis redis_primary_client_pool = init_redis_replica_client_pool(config_json, "redis-primary");
-      TThreadedServer server(std::make_shared<UserTimelineServiceProcessor>(
+      TThreadedServer server(gordion::Attach(std::make_shared<UserTimelineServiceProcessor>(
           std::make_shared<UserTimelineHandler>(
               &redis_replica_client_pool, &redis_primary_client_pool, mongodb_client_pool,
-              &post_storage_client_pool)),
+              &post_storage_client_pool)), "user-timeline", {"ReadUserTimeline", "WriteUserTimeline"}),
           server_socket,
           std::make_shared<TFramedTransportFactory>(),
           std::make_shared<TBinaryProtocolFactory>());
@@ -138,10 +139,10 @@ int main(int argc, char *argv[]) {
   else {
     Redis redis_client_pool =
         init_redis_client_pool(config_json, "user-timeline");
-    TThreadedServer server(std::make_shared<UserTimelineServiceProcessor>(
+    TThreadedServer server(gordion::Attach(std::make_shared<UserTimelineServiceProcessor>(
                                std::make_shared<UserTimelineHandler>(
                                    &redis_client_pool, mongodb_client_pool,
-                                   &post_storage_client_pool)),
+                                   &post_storage_client_pool)), "user-timeline", {"ReadUserTimeline", "WriteUserTimeline"}),
                            server_socket,
                            std::make_shared<TFramedTransportFactory>(),
                            std::make_shared<TBinaryProtocolFactory>());

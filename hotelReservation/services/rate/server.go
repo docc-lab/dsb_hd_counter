@@ -1,6 +1,7 @@
 package rate
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -87,6 +88,8 @@ func (s *Server) Run() error {
 		opts = append(opts, tlsopt)
 	}
 
+	// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+	opts = append(opts, gordion.ServerOptions("Rate", []string{"GetRates"})...)
 	srv := grpc.NewServer(opts...)
 
 	pb.RegisterRateServer(srv, s)

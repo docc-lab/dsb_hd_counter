@@ -1,6 +1,7 @@
 package recommendation
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"context"
 	"fmt"
 	"math"
@@ -80,6 +81,8 @@ func (s *Server) Run() error {
 		opts = append(opts, tlsopt)
 	}
 
+	// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+	opts = append(opts, gordion.ServerOptions("Recommendation", []string{"GetRecommendations"})...)
 	srv := grpc.NewServer(opts...)
 
 	pb.RegisterRecommendationServer(srv, s)

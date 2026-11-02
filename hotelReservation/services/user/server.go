@@ -1,6 +1,7 @@
 package user
 
 import (
+	"github.com/docc-lab/dsb_hd_counter/hotelReservation/gordion"
 	"crypto/sha256"
 	"fmt"
 	"net"
@@ -86,6 +87,8 @@ func (s *Server) Run() error {
 		opts = append(opts, tlsopt)
 	}
 
+	// per-endpoint dictionary recorder (pass-through unless GORDION_OUT is set)
+	opts = append(opts, gordion.ServerOptions("User", []string{"CheckUser"})...)
 	srv := grpc.NewServer(opts...)
 
 	pb.RegisterUserServer(srv, s)
