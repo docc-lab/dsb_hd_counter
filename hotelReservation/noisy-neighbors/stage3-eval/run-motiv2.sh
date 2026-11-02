@@ -29,6 +29,7 @@
 #   ./run-motiv2.sh                      # all 11 cells, ~65 min
 #   CELLS="none hc-bang" ./run-motiv2.sh
 #   OUT=data/motiv2-t2 ./run-motiv2.sh   # second trial
+#   STAGE3_VICTIM_GOMAXPROCS=1 OVF_PREFIX=overflow1p CFG=configs/motiv-sm110p-int.yaml ...   # 1-P victim scenarios
 #   DEADLINE="HH:MM" ./run-motiv2.sh     # stop before the reservation ends
 # ===========================================================================
 set -uo pipefail
@@ -40,9 +41,25 @@ OUT="${OUT:-data/motiv2}"
 # (14,15 and their siblings 30,31). Empty = fully unconfined.
 export AGGR_CPUSET="${AGGR_CPUSET-0-13,16-29}"
 OVF="$S3/../../kubernetes/search/search-overflow-deployment.yaml"
-CELLS="${CELLS:-none hc-bang rep1:samecores rep2:samecores rep3:samecores rep1:othercores rep2:othercores rep3:othercores rep1:othernode rep2:othernode rep3:othernode}"
+# OVF_PREFIX=overflow1p selects the 1-P / 1-thread replica manifests (overload scenarios).
+OVF_PREFIX="${OVF_PREFIX:-overflow}"
+CELLS="${CELLS:-none hc-bang hc-hold hc-iso rep1:samecores rep2:samecores rep3:samecores rep1:othercores rep2:othercores rep3:othercores rep1:othernode rep2:othernode rep3:othernode}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [motiv2] $*" >&2; }
+# Replicas placed on another node are outside the orchestrator's sampler
+# (node-4 only): run a second cpu-sampler there for othernode cells.
+OTHER_NODE="${OTHER_NODE:-node-3}"
+SAMPLER="${SAMPLER:-/local/simple-mitigation-1/deploy/stage3/cpu-sampler.sh}"
+other_sampler_start() {
+    ssh -o BatchMode=yes "$OTHER_NODE" "sudo pkill -f '[c]pu-sampler' ; true"
+    scp -q "$SAMPLER" "$OTHER_NODE:/tmp/cpu-sampler.sh" || return 0
+    ssh -o BatchMode=yes "$OTHER_NODE" "chmod +x /tmp/cpu-sampler.sh; sudo rm -f /tmp/motiv2.cpu.csv
+        sudo setsid nohup /tmp/cpu-sampler.sh /tmp/motiv2.cpu.csv 1 </dev/null >/dev/null 2>&1 &" || true
+}
+other_sampler_stop() {   # <cell dir>
+    ssh -o BatchMode=yes "$OTHER_NODE" "sudo pkill -f '[c]pu-sampler' ; true"
+    ssh -o BatchMode=yes "$OTHER_NODE" "cat /tmp/motiv2.cpu.csv" > "$1/cpu_usage-$OTHER_NODE.csv" 2>/dev/null || rm -f "$1/cpu_usage-$OTHER_NODE.csv"
+}
 
 name=$(yq -r '.experiment.name' "$CFG")
 ls -d data/stage3eval_* >/dev/null 2>&1 && { log "FATAL: data/stage3eval_* exists; move it out first"; exit 1; }
@@ -54,13 +71,15 @@ for cell in $CELLS; do
     if [[ -n "${DEADLINE:-}" ]] && (( $(date +%s) + 330 > $(date -d "$DEADLINE" +%s) )); then
         log "deadline $DEADLINE: stopping before $cell"; exit 0
     fi
-    cp "motiv2/overflow-${place:-samecores}.yaml" "$OVF"
+    cp "motiv2/${OVF_PREFIX}-${place:-samecores}.yaml" "$OVF"
     kubectl apply -f "$OVF" >/dev/null || { log "FATAL: overflow manifest apply failed"; exit 1; }
     kubectl scale deployment search-overflow --replicas=0 >/dev/null 2>&1
     log "=== $cell -> $dir   (arm=$arm overflow=${place:-samecores} pool=$AGGR_CPUSET)"
+    [[ "$place" == othernode ]] && other_sampler_start
     ARM="$arm" ./run-phased-stage3.sh "$CFG" 2>&1 </dev/null | tee "data/.motiv2-${arm}${place:+-$place}.orch.log"
     rc=${PIPESTATUS[0]}
     mkdir -p "$dir"
+    [[ "$place" == othernode ]] && other_sampler_stop "$dir"
     mv data/stage3eval_* "$dir"/ 2>/dev/null
     cp "data/.${name}.orchestrator.eval.log" "$dir/" 2>/dev/null
     mv "data/.motiv2-${arm}${place:+-$place}.orch.log" "$dir/" 2>/dev/null

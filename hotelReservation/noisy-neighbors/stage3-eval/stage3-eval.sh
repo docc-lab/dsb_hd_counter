@@ -368,6 +368,15 @@ deploy_victim() {
         >/dev/null 2>&1 \
         || s3_log "WARNING: failed to set instrumentation env on $VICTIM_DEPLOYMENT"
     s3_log "Victim PERF_EVENTS=${perf_events}"
+    # STAGE3_VICTIM_GOMAXPROCS: override the manifest's GOMAXPROCS (e.g. 1 for
+    # the overload scenarios, where a 3-P victim cannot be saturated through
+    # the frontend chain). Empty = keep the manifest value.
+    if [[ -n "${STAGE3_VICTIM_GOMAXPROCS:-}" ]]; then
+        kubectl set env "deployment/$VICTIM_DEPLOYMENT" -c "$container_name" \
+            "GOMAXPROCS=${STAGE3_VICTIM_GOMAXPROCS}" >/dev/null 2>&1 \
+            || s3_log "WARNING: failed to set GOMAXPROCS on $VICTIM_DEPLOYMENT"
+        s3_log "Victim GOMAXPROCS=${STAGE3_VICTIM_GOMAXPROCS} (override)"
+    fi
 
     if declare -F apply_msr_pod_capabilities >/dev/null 2>&1; then
         apply_msr_pod_capabilities "$VICTIM_DEPLOYMENT" "$EXP_DIR" \

@@ -1,4 +1,4 @@
-# <AGGR_CPUSET> <config>  -- run order for run-collect.sh
+# <AGGR_CPUSET> <config>  -- run order for run-collect.sh (layout 8360y: victim 4,6)
 76,78 configs/collect/col-base-3200.yaml
 76,78 configs/collect/col-ext-mid-steady.yaml
 76,78 configs/collect/col-ext-mid-bursty.yaml

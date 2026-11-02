@@ -149,9 +149,9 @@ def pod_class(ns, name):
     return "other"
 
 
-def cpu_usage(mdir, t0, spans, target_node):
+def cpu_usage(mdir, t0, spans, target_node, path=None):
     """-> (cores by pod class, busy fraction by CPU group) over the spans."""
-    p = os.path.join(mdir, "cpu_usage.csv")
+    p = path or os.path.join(mdir, "cpu_usage.csv")
     if not os.path.isfile(p):
         return {}, {}
     uids = load_uids(mdir)
@@ -243,6 +243,10 @@ def analyse_cell(cell_dir, args):
     hr = parse_wrk2_blocks(os.path.join(run, "wrk2", "hotelReservation.txt"))
     if hr:
         r.update(e2e_rps=hr[0]["rps"], e2e_p50=hr[0]["p50"], e2e_p90=hr[0]["p90"], e2e_p99=hr[0]["p99"])
+    # overload scenarios: the extra driver (from t=20 s) carries most of the traffic
+    hx = parse_wrk2_blocks(os.path.join(run, "wrk2", "hotelReservation-extra.txt"))
+    if hx:
+        r.update(e2ex_rps=hx[0]["rps"], e2ex_p50=hx[0]["p50"], e2ex_p90=hx[0]["p90"], e2ex_p99=hx[0]["p99"])
     # neighbours
     for tb, tag in (("socialNetwork", "sn"), ("sockshop", "ss")):
         rr, ll, _, _ = aggr_ratio(parse_wrk2_blocks(os.path.join(run, "wrk2", tb + ".txt")), t0, armed_rel)
@@ -252,6 +256,12 @@ def analyse_cell(cell_dir, args):
     r.update(c_victim=cores3.get("victim", float("nan")), c_overflow=sum(v for k, v in cores3.items() if k.startswith("overflow")),
              c_aggr=cores3.get("aggressor", float("nan")), c_other=cores3.get("other", float("nan")))
     r["c_overflow_offnode"] = sum(v for k, v in cores3.items() if k.startswith("overflow@"))
+    # replicas on another node: run-motiv2.sh leaves that node's sampler file in the cell dir
+    for f in glob.glob(os.path.join(cell_dir, "cpu_usage-*.csv")):
+        node = os.path.basename(f)[len("cpu_usage-"):-4]
+        c_other, _ = cpu_usage(mdir, t0, p3b, node, path=f)
+        r["c_overflow_offnode"] += sum(v for k, v in c_other.items() if k.startswith("overflow"))
+        r["c_other_node_total"] = sum(c_other.values())
     for g, v in busy3.items():
         r["busy_" + g.split()[0]] = v
     if args.phase_cores:
@@ -316,7 +326,8 @@ def main():
     print("\n== absolute p1 -> armed bursts (victim instance): proc p90 us, total p90 ms")
     for r in rows:
         print(f"{r['cell']:22s} proc90 {fmt(r['v_proc90_p1'], 1)} -> {fmt(r['v_proc90_p3'], 1)} us   tot90 {fmt(r['v_tot90_p1'], 1)} -> {fmt(r['v_tot90_p3'], 1)} ms   "
-              f"svc tot90 {fmt(r['s_tot90_p3'], 1)} ms   replicas seen {r['replicas_seen']}  actions {r['n_actions']} (first {fmt(r['first_action_s'], 1)} s after ARM, max n {r['max_n']})")
+              f"svc tot90 {fmt(r['s_tot90_p3'], 1)} ms   replicas seen {r['replicas_seen']}  actions {r['n_actions']} (first {fmt(r['first_action_s'], 1)} s after ARM, max n {r['max_n']})"
+              + (f"   extra driver e2e p50/p90/p99 {fmt(r['e2ex_p50'], 1)}/{fmt(r['e2ex_p90'], 1)}/{fmt(r['e2ex_p99'], 1)} ms at {fmt(r['e2ex_rps'], 0)} rps" if 'e2ex_rps' in r else ""))
     print("\n== cores in the armed bursts (mean cores = cgroup cpu time / wall) and CPU-group busy fraction")
     print(f"{'cell':22s} {'victim':>6s} {'overflow':>8s} {'ovf@other':>9s} {'aggr':>6s} | {'busy vic':>8s} {'sibl':>6s} {'rest':>6s} {'21-29':>6s} | {'SN rps':>6s} {'SS rps':>6s} {'SS p50':>6s}")
     for r in rows:

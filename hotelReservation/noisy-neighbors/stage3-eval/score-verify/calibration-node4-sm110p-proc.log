@@ -1,0 +1,47 @@
+[calibration-sweep 21:21:56] victim pod: search-66fb8d77f5-5lh84 (on node-4)
+[calibration-sweep 21:21:58] level 300 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_300.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_300.ndjson
+[calibration-sweep 21:24:24] level 600 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_600.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1200 samples into rate_600.ndjson
+[calibration-sweep 21:26:49] level 1200 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_1200.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_1200.ndjson
+[calibration-sweep 21:29:14] level 2400 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_2400.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1198 samples into rate_2400.ndjson
+[calibration-sweep 21:31:39] level 3000 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_3000.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_3000.ndjson
+[calibration-sweep 21:34:04] level 3600 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_3600.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_3600.ndjson
+[calibration-sweep 21:36:29] level 4200 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_4200.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_4200.ndjson
+[calibration-sweep 21:38:54] level 4800 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_4800.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_4800.ndjson
+[calibration-sweep 21:41:19] level 5600 rps: starting wrk2 (155s total: 20s warmup + 120s recording)
+recording Samples from localhost:7901 -> rate_5600.ndjson (duration: 120s; 0 = until Ctrl-C)
+recorded 1199 samples into rate_5600.ndjson
+[calibration-sweep 21:43:44] running calibrate_from_stream.py
+level loadgen=300: arrival_mean=180 d50=64.3 d90=84.5 kcyc (smoothed-median; wmean 64/85; raw p50 median 67.8) over 1048 windows
+level loadgen=600: arrival_mean=361 d50=62.2 d90=82.7 kcyc (smoothed-median; wmean 62/83; raw p50 median 65.9) over 1050 windows
+level loadgen=1200: arrival_mean=724 d50=60.3 d90=81.5 kcyc (smoothed-median; wmean 60/82; raw p50 median 64.1) over 1049 windows
+level loadgen=2400: arrival_mean=1444 d50=59.5 d90=80.4 kcyc (smoothed-median; wmean 59/80; raw p50 median 62.8) over 1047 windows
+level loadgen=3000: arrival_mean=1803 d50=59.0 d90=80.6 kcyc (smoothed-median; wmean 59/81; raw p50 median 62.0) over 1049 windows
+level loadgen=3600: arrival_mean=2169 d50=58.4 d90=80.6 kcyc (smoothed-median; wmean 58/81; raw p50 median 61.1) over 1049 windows
+level loadgen=4200: arrival_mean=2519 d50=58.3 d90=81.0 kcyc (smoothed-median; wmean 58/81; raw p50 median 60.5) over 1048 windows
+level loadgen=4800: arrival_mean=2878 d50=58.2 d90=81.6 kcyc (smoothed-median; wmean 58/82; raw p50 median 60.1) over 1048 windows
+level loadgen=5600: arrival_mean=3359 d50=58.1 d90=82.0 kcyc (smoothed-median; wmean 58/82; raw p50 median 59.6) over 1049 windows
+wrote curve.csv (9 levels)
+wrote gordion.json: baseline p50=58.362 p90=80.563 kcyc, sigma50=1.674 sigma90=0.828, f=2400.0 MHz (baseline from level loadgen=3600, 1049 windows)
+
+Review the level table above (arrival_mean must scale with rate; sigma
+in the tens of kcyc). If sane, apply:
+
+  kubectl create configmap gordion-search --from-file=gordion.json --from-file=curve.csv \
+      --dry-run=client -o yaml | kubectl apply -f -
+  kubectl rollout restart deployment/search
