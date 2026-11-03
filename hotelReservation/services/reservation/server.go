@@ -141,7 +141,9 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 
 		// first check memc
 		memc_key := hotelId + "_" + inDate.String()[0:10] + "_" + outdate
+		endBlock := gordion.Block(ctx)
 		item, err := s.MemcClient.Get(memc_key)
+		endBlock()
 		if err == nil {
 			// memcached hit
 			count, _ = strconv.Atoi(string(item.Value))
@@ -154,11 +156,13 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 			var reserve []reservation
 
 			filter := bson.D{{"hotelId", hotelId}, {"inDate", indate}, {"outDate", outdate}}
+			endBlock := gordion.Block(ctx)
 			curr, err := resCollection.Find(context.TODO(), filter)
 			if err != nil {
 				log.Error().Msgf("Failed get reservation data: ", err)
 			}
 			curr.All(context.TODO(), &reserve)
+			endBlock()
 			if err != nil {
 				log.Error().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error: %s", hotelId, indate, outdate, err.Error())
 			}
@@ -176,7 +180,9 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 		// check capacity
 		// check memc capacity
 		memc_cap_key := hotelId + "_cap"
+		endBlock = gordion.Block(ctx)
 		item, err = s.MemcClient.Get(memc_cap_key)
+		endBlock()
 		hotel_cap := 0
 		if err == nil {
 			// memcached hit
@@ -185,14 +191,18 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 		} else if err == memcache.ErrCacheMiss {
 			// memcached miss
 			var num number
+			endBlock := gordion.Block(ctx)
 			err = numCollection.FindOne(context.TODO(), &bson.D{{"hotelId", hotelId}}).Decode(&num)
+			endBlock()
 			if err != nil {
 				log.Error().Msgf("Tried to find hotelId [%v], but got error: %s", hotelId, err.Error())
 			}
 			hotel_cap = int(num.Number)
 
 			// write to memcache
+			endBlock = gordion.Block(ctx)
 			s.MemcClient.Set(&memcache.Item{Key: memc_cap_key, Value: []byte(strconv.Itoa(hotel_cap))})
+			endBlock()
 		} else {
 			log.Error().Msgf("Tried to get memc_cap_key [%v], but got memcached error = %s", memc_cap_key, err)
 		}
@@ -204,9 +214,11 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	}
 
 	// only update reservation number cache after check succeeds
+	endBlock := gordion.Block(ctx)
 	for key, val := range memc_date_num_map {
 		s.MemcClient.Set(&memcache.Item{Key: key, Value: []byte(strconv.Itoa(val))})
 	}
+	endBlock()
 
 	inDate, _ = time.Parse(
 		time.RFC3339,
@@ -217,6 +229,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	for inDate.Before(outDate) {
 		inDate = inDate.AddDate(0, 0, 1)
 		outdate := inDate.String()[0:10]
+		endBlock := gordion.Block(ctx)
 		_, err := resCollection.InsertOne(
 			context.TODO(),
 			reservation{
@@ -227,6 +240,7 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 				Number:       int(req.RoomNumber),
 			},
 		)
+		endBlock()
 		if err != nil {
 			log.Error().Msgf("Tried to insert hotel [hotelId %v], but got error: %s", hotelId, err.Error())
 		}
@@ -265,7 +279,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 
 	capMemSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_capacity_get_multi_number")
 	capMemSpan.SetTag("span.kind", "client")
+	endBlock := gordion.Block(ctx)
 	cacheMemRes, err := s.MemcClient.GetMulti(hotelMemKeys)
+	endBlock()
 	capMemSpan.Finish()
 
 	numCollection := s.MongoClient.Database("reservation-db").Collection("number")
@@ -295,11 +311,13 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		var nums []number
 		capMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number")
 		capMongoSpan.SetTag("span.kind", "client")
+		endBlock := gordion.Block(ctx)
 		curr, err := numCollection.Find(context.TODO(), bson.D{{"$in", queryMissKeys}})
 		if err != nil {
 			log.Error().Msgf("Failed get reservation number data: ", err)
 		}
 		curr.All(context.TODO(), &nums)
+		endBlock()
 		if err != nil {
 			log.Error().Msgf("Failed get reservation number data: ", err)
 		}
@@ -346,7 +364,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 	ch := make(chan taskRes)
 	reserveMemSpan.SetTag("span.kind", "client")
 	// check capacity in memcached and mongodb
+	endBlock = gordion.Block(ctx)
 	itemsMap, err := s.MemcClient.GetMulti(reqCommand)
+	endBlock()
 		reserveMemSpan.Finish()
 		if err != nil && err != memcache.ErrCacheMiss {
 			log.Error().Msgf("Tried to get memc_key [%v], but got memcached error = %s; treating as cache miss", reqCommand, err)
@@ -412,11 +432,13 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 
 						reserveMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number"+comm)
 						reserveMongoSpan.SetTag("span.kind", "client")
+						endBlock := gordion.Block(ctx)
 						curr, err := resCollection.Find(context.TODO(), filter)
 						if err != nil {
 							log.Error().Msgf("Failed get reservation data: ", err)
 						}
 						curr.All(context.TODO(), &reserve)
+						endBlock()
 						if err != nil {
 							log.Error().Msgf("Failed get reservation data: ", err)
 						}

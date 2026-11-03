@@ -18,6 +18,7 @@
 #include "../../gen-cpp/UserTimelineService.h"
 #include "../../gen-cpp/social_network_types.h"
 #include "../ClientPool.h"
+#include "../gordion/Gordion.h"
 #include "../ThriftClient.h"
 #include "../logger.h"
 #include "../tracing.h"
@@ -392,10 +393,15 @@ void ComposePostHandler::ComposePost(
 
   // try
   // {
-  post.post_id = unique_id_future.get();
-  post.creator = creator_future.get();
-  post.media = media_future.get();
-  auto text_return = text_future.get();
+  // the four helpers run on std::async threads (their Thrift calls cannot be charged to this request there):
+  // the waits are the request's blocked time (gordion::Blocked), like a downstream call made on this thread
+  {
+    gordion::Blocked blk;
+    post.post_id = unique_id_future.get();
+    post.creator = creator_future.get();
+    post.media = media_future.get();
+  }
+  auto text_return = [&]() { gordion::Blocked blk; return text_future.get(); }();
   post.text = text_return.text;
   post.urls = text_return.urls;
   post.user_mentions = text_return.user_mentions;
@@ -429,9 +435,12 @@ void ComposePostHandler::ComposePost(
 
   // try
   // {
-  post_future.get();
-  user_timeline_future.get();
-  home_timeline_future.get();
+  {
+    gordion::Blocked blk;  // post upload on another thread; the two deferred helpers run here, their Thrift calls nest
+    post_future.get();
+    user_timeline_future.get();
+    home_timeline_future.get();
+  }
   // }
   // catch (...)
   // {
