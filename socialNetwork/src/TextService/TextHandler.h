@@ -10,6 +10,7 @@
 #include "../../gen-cpp/UrlShortenService.h"
 #include "../../gen-cpp/UserMentionService.h"
 #include "../ClientPool.h"
+#include "../gordion/Gordion.h"
 #include "../ThriftClient.h"
 #include "../logger.h"
 #include "../tracing.h"
@@ -133,7 +134,10 @@ void TextHandler::ComposeText(
 
   std::vector<Url> target_urls;
   try {
-    target_urls = shortened_urls_future.get();
+    {
+      gordion::Blocked blk;  // the RPC ran on a std::async thread: the wait is this request's blocked time
+      target_urls = shortened_urls_future.get();
+    }
   } catch (...) {
     LOG(error) << "Failed to get shortened urls from url-shorten-service";
     throw;
@@ -141,7 +145,10 @@ void TextHandler::ComposeText(
 
   std::vector<UserMention> user_mentions;
   try {
-    user_mentions = user_mention_future.get();
+    {
+      gordion::Blocked blk;  // the RPC ran on a std::async thread: the wait is this request's blocked time
+      user_mentions = user_mention_future.get();
+    }
   } catch (...) {
     LOG(error) << "Failed to upload user mentions to user-mention-service";
     throw;

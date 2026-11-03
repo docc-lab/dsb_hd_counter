@@ -29,6 +29,8 @@ WLGEN_CPUS=${WLGEN_CPUS:-1,6,7}
 WINDOW_MS=${WINDOW_MS:-100}
 RAW=${RAW:-1}
 DISABLE=${DISABLE:-0}
+GATE=${GATE:-1}            # Phase D G-A: admission gate in the recorder (GORDION_GATE); 0 = off
+GATE_CAP=${GATE_CAP:-}
 PERF_HOOKS=${PERF_HOOKS:-0}
 STRESSOR=${STRESSOR:-none}
 JAEGER_SAMPLE_RATIO=${JAEGER_SAMPLE_RATIO:-0}
@@ -67,7 +69,10 @@ deploy_svc() {
   local hd; hd=$(hostdir $node)
   ssh -o BatchMode=yes $node "sudo mkdir -p $hd && sudo chmod 777 $hd" >/dev/null
   local cmd="[\"$svc\"]"
-  local gomax=""
+  # an unpinned service must not keep the GOMAXPROCS of an earlier turn as the pinned SUT (strategic merge keeps env
+  # entries by name): with the Phase D gate, GOMAXPROCS=4 on a 72-core node caps its handlers at 3 (reservation collapsed
+  # at 5000 req/s while the frontend was the SUT, 2026-11-02 d-b-explore)
+  local gomax=",{\"name\":\"GOMAXPROCS\",\"\$patch\":\"delete\"}"
   if [ "$pin" = "1" ]; then
     cmd="[\"sh\",\"-c\",\"exec taskset -c $CPUSET $svc\"]"
     gomax=",{\"name\":\"GOMAXPROCS\",\"value\":\"$(python3 -c "import sys;cs='$CPUSET';n=0
@@ -81,7 +86,7 @@ print(n)")\"}"
     \"volumes\":[{\"name\":\"gordion\",\"hostPath\":{\"path\":\"$hd\",\"type\":\"DirectoryOrCreate\"}}],
     \"containers\":[{\"name\":\"$(container $svc)\",\"image\":\"$REGISTRY/hr-gordion:$TAG\",\"imagePullPolicy\":\"Always\",\"command\":$cmd,
       \"env\":[{\"name\":\"GORDION_OUT\",\"value\":\"/data/$run-$svc.jsonl\"},{\"name\":\"GORDION_CLIENT_OUT\",\"value\":\"/data/$run-$svc-client.jsonl\"},
-              {\"name\":\"GORDION_WINDOW_MS\",\"value\":\"$WINDOW_MS\"},{\"name\":\"GORDION_RAW\",\"value\":\"$RAW\"},{\"name\":\"GORDION_DISABLE\",\"value\":\"$DISABLE\"},
+              {\"name\":\"GORDION_WINDOW_MS\",\"value\":\"$WINDOW_MS\"},{\"name\":\"GORDION_RAW\",\"value\":\"$RAW\"},{\"name\":\"GORDION_DISABLE\",\"value\":\"$DISABLE\"},{\"name\":\"GORDION_GATE\",\"value\":\"$GATE\"},{\"name\":\"GORDION_GATE_CAP\",\"value\":\"$GATE_CAP\"},
               {\"name\":\"PERF_HOOKS\",\"value\":\"$PERF_HOOKS\"},{\"name\":\"JAEGER_SAMPLE_RATIO\",\"value\":\"$JAEGER_SAMPLE_RATIO\"}$gomax],
       \"volumeMounts\":[{\"name\":\"gordion\",\"mountPath\":\"/data\"}]}]}}}}" >/dev/null
   # no CFS quota on any service (pinning does the isolation)
@@ -152,6 +157,7 @@ cmd_collect() {
 {"run":"$run","testbed":"hotelreservation","sut":"$SUT","node":"$NODE","cpuset":"$CPUSET","tag":"$TAG","window_ms":$WINDOW_MS,"raw":"$RAW","disable":"$DISABLE",
  "perf_hooks":"$PERF_HOOKS","jaeger_sample_ratio":"$JAEGER_SAMPLE_RATIO","wlgen_node":"$WLGEN_NODE","wlgen_cpus":"$WLGEN_CPUS",
  "stressor":"$STRESSOR","aggressors":"$AGGR","cpufreq":"$cpufreq","sched_idle_fillers":"${idle:-0}",
+ "gate":"$GATE","gate_cap":"$GATE_CAP","nominal_mhz":"${NOMINAL_MHZ:-}",
  "placement":"$(kubectl get pods -o wide | grep -E '^(frontend|search|geo|rate|profile|recommendation|user|reservation)-' | awk '{printf "%s=%s ", $1, $7}')",
  "collected":"$(date -Is)"}
 EOF

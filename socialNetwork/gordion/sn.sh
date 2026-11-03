@@ -34,7 +34,8 @@ DB_NODE=${DB_NODE:-node-3}
 OTHER_NODES=${OTHER_NODES:-node-1,node-2}
 HRGEN=${HRGEN:-/local/hr/hotelReservation/hrgen}
 CPP_SERVICES="compose-post-service home-timeline-service media-service post-storage-service social-graph-service text-service unique-id-service url-shorten-service user-mention-service user-service user-timeline-service"
-INSTRUMENTED="home-timeline-service user-timeline-service post-storage-service"
+# Phase F: text-service and compose-post-service carry a recorder too (image g4); INSTRUMENTED lists the services that get one
+INSTRUMENTED=${INSTRUMENTED:-"home-timeline-service user-timeline-service post-storage-service text-service compose-post-service"}
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
@@ -153,7 +154,7 @@ cmd_deploy() {
   for i in $(seq 1 60); do
     curl -s -o /dev/null -m 3 "http://$ip:8080/wrk2-api/home-timeline/read?user_id=1&start=0&stop=10" && break; sleep 2
   done
-  kubectl -n $NS get pods -o wide | grep -E "^(home-timeline-service|user-timeline-service|post-storage-service|compose-post-service|nginx-thrift)-" | awk '{print $1, $7}' | tr '\n' ';' >&2; echo >&2
+  kubectl -n $NS get pods -o wide | grep -E "^(home-timeline-service|user-timeline-service|post-storage-service|compose-post-service|text-service|nginx-thrift)-" | awk '{print $1, $7}' | tr '\n' ';' >&2; echo >&2
   echo $ip
 }
 

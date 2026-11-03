@@ -5,6 +5,7 @@
 #include <thrift/transport/TServerSocket.h>
 
 #include "../utils.h"
+#include "../gordion/Gordion.h"
 #include "../utils_thrift.h"
 #include "ComposePostHandler.h"
 
@@ -99,11 +100,12 @@ int main(int argc, char *argv[]) {
 
   std::shared_ptr<TServerSocket> server_socket = get_server_socket(config_json, "0.0.0.0", port);
   TThreadedServer server(
-      std::make_shared<ComposePostServiceProcessor>(
+      gordion::Attach(std::make_shared<ComposePostServiceProcessor>(
           std::make_shared<ComposePostHandler>(
               &post_storage_client_pool, &user_timeline_client_pool,
               &user_client_pool, &unique_id_client_pool, &media_client_pool,
-              &text_client_pool, &home_timeline_client_pool)),
+              &text_client_pool, &home_timeline_client_pool)), "compose-post",
+          {"ComposePost"}),
       server_socket,
       std::make_shared<TFramedTransportFactory>(),
       std::make_shared<TBinaryProtocolFactory>());

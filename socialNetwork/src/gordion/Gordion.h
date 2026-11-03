@@ -6,7 +6,8 @@
 //     proc->setEventHandler(gordion::Init("home-timeline", {"ReadHomeTimeline", "WriteHomeTimeline"}));
 // and wrap every outgoing Thrift client protocol with gordion::BlockedProtocol (ThriftClient.h) so
 // that the time a request spends blocked on a downstream Thrift call is accounted as "blocked"
-// (processing = total - blocked). Redis/Mongo/memcached calls are not Thrift and count as processing.
+// (processing = total - blocked). Redis/Mongo/memcached calls are not Thrift: they count as processing
+// unless the handler wraps them in a gordion::Blocked scope (post-storage does, Phase E).
 //
 // Timing model (one TThreadedServer thread per connection, requests sequential per thread):
 //     tap     = getContext (the frame has been read from the socket; the admission queue is before this)
@@ -451,6 +452,25 @@ class BlockedProtocol : public apache::thrift::protocol::TProtocolDecorator {
     }
     return n;
   }
+};
+
+// Blocking call made on behalf of the current request that is not a Thrift call (MongoDB, memcached, Redis, a
+// future's wait): `{ gordion::Blocked b; <call>; }`. The interval is charged to the request's blocked time exactly
+// like a downstream Thrift call (same depth counter, so nesting with BlockedProtocol is safe); processing = total -
+// blocked then excludes the datastore wait. The Go equivalent is gordion.Block(ctx).
+struct Blocked {
+  ReqState *st;
+  Blocked() : st(cur()) {
+    if (st && !st->done && st->depth++ == 0) st->pauseStart = nowNs();
+  }
+  ~Blocked() {
+    if (st && !st->done && st->depth > 0 && --st->depth == 0 && st->pauseStart > 0) {
+      st->blocked += nowNs() - st->pauseStart;
+      st->pauseStart = 0;
+    }
+  }
+  Blocked(const Blocked &) = delete;
+  Blocked &operator=(const Blocked &) = delete;
 };
 
 }  // namespace gordion

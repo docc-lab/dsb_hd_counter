@@ -23,8 +23,25 @@
 //	 "n":<completions>,"e":<errors>,"drop":<dropped completions>,
 //	 "cpu":<process user+sys CPU ns spent in the window (linux)>,
 //	 "mhz":<mean current frequency of the process's cores, sysfs cpufreq (linux, if available)>,
-//	 "all":[n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90],
-//	 "ep":{"Ep000":[a,n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90],...}}
+//	 "all":[n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90,g50,g90],
+//	 "gate":<admission gate capacity (G-A), absent when the gate is off>,
+//	 "sched":[p50,p90,count] <runtime scheduler latency of the window (G-B, ns): time goroutines
+//	          spent runnable before running, from runtime/metrics "/sched/latencies:seconds">,
+//	 "ep":{"Ep000":[a,n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90,g50,g90],...}}
+//
+// g = admission-gate wait (Phase D, G-A): with GORDION_GATE on (default) the
+// wrapper acquires a semaphore of capacity GOMAXPROCS-1 (GORDION_GATE_CAP
+// overrides) between the arrival/queue timestamp and the handler. With one P
+// always free of handlers the transport reader runs promptly, so the request
+// is timestamped at the tap before it waits, and the wait is charged to the
+// request (and to its endpoint) as g instead of sitting invisibly in the
+// kernel socket. g is part of p, pp and f (total, processing, full) because
+// the timer starts at the arrival; q (tap -> handler goroutine running) is
+// reported separately and no longer includes the gate wait. A handler gives
+// its slot back while it is blocked on a gordion-instrumented downstream call
+// (PauseBegin/PauseEnd) and re-acquires it afterwards (that wait counts in g
+// too): the gate bounds the handlers that are running, not the requests in
+// flight. Blocking on uninstrumented I/O (databases, caches) holds the slot.
 //
 // x = "pre" wait: from the caller's send stamp (gRPC metadata, see Stamp) to
 // the server's first in-process timestamp; 0 if the caller sent no stamp.
@@ -47,15 +64,21 @@
 //	                   caller, which includes the callee's socket queue and the
 //	                   network); unset = client-side recording disabled
 //	GORDION_RAW        "1" additionally emits every sample: "raw":{"Ep000":[total_ns,...],...},
-//	                   "rawp":{...} (processing ns), "rawq":{...} (queue ns), "rawx":{...} (pre ns)
-//	                   and "rawf":{...} (full ns, stamped requests only), for offline analysis
+//	                   "rawp":{...} (processing ns), "rawq":{...} (queue ns), "rawx":{...} (pre ns),
+//	                   "rawf":{...} (full ns, stamped requests only) and "rawg":{...} (gate ns),
+//	                   for offline analysis
+//	GORDION_GATE       "0" disables the admission gate (G-A); default on for server recorders
+//	GORDION_GATE_CAP   gate capacity (default GOMAXPROCS-1, read when the first request arrives)
 package gordion
 
 import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"os"
+	"runtime"
+	"runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,6 +149,9 @@ type reqState struct {
 	depth       int32 // atomic: number of outstanding downstream calls
 	pauseStart  int64 // atomic: unix ns when depth went 0->1
 	pausedTotal int64 // atomic: accumulated blocked ns
+	rec         *Recorder
+	gateHeld    int32 // 1 while the request holds a gate slot (released while blocked downstream)
+	gateNs      int64 // total time waited at the gate (Begin + every re-acquire after a downstream call)
 }
 
 var statePool = sync.Pool{New: func() any { return &reqState{} }}
@@ -146,6 +172,7 @@ type completion struct {
 	blockNs int64
 	queueNs int64
 	preNs   int64
+	gateNs  int64
 }
 
 // noPre marks a request whose caller sent no stamp. A stamped request keeps its
@@ -187,6 +214,11 @@ type Recorder struct {
 	lastCPU  int64 // process CPU ns at the previous flush (0 = none yet)
 	disabled bool
 	raw      bool
+
+	gateOnce sync.Once
+	gate     chan struct{} // admission gate (G-A): buffered channel used as a semaphore; nil = off
+	gateCap  int
+	sched    *schedLat // runtime scheduler latency (G-B); nil = unavailable
 
 	arrivals []int64 // atomic, per method, reset every window
 	dropped  int64   // atomic
@@ -354,12 +386,116 @@ func (r *Recorder) Begin(ctx context.Context, m int) (context.Context, Token) {
 	atomic.StoreInt32(&st.depth, 0)
 	atomic.StoreInt64(&st.pauseStart, 0)
 	atomic.StoreInt64(&st.pausedTotal, 0)
+	st.rec = r
+	atomic.StoreInt32(&st.gateHeld, 0)
+	atomic.StoreInt64(&st.gateNs, 0)
 	ctx = context.WithValue(ctx, ctxKey{}, st)
 	pre := int64(noPre)
 	if sent := sentOf(ctx); sent > 0 {
 		pre = start - sent
 	}
+	// G-A: admission gate. Initialised on the first request so that GOMAXPROCS reflects
+	// the service's own CPU pinning (bigsvc sets it from BIGSVC_CPUSET after start-up).
+	r.gateOnce.Do(r.initGate)
+	st.acquireGate(ctx)
 	return ctx, Token{start: start, queue: queue, pre: pre, method: int32(m), st: st}
+}
+
+// acquireGate takes a gate slot for the request (blocking; a cancelled ctx lets
+// the handler run ungated so the error path is the caller's) and charges the
+// wait to the request.
+func (st *reqState) acquireGate(ctx context.Context) {
+	r := st.rec
+	if r == nil || r.gate == nil || atomic.LoadInt32(&st.gateHeld) == 1 {
+		return
+	}
+	t0 := time.Now().UnixNano()
+	select {
+	case r.gate <- struct{}{}:
+		atomic.StoreInt32(&st.gateHeld, 1)
+	case <-ctx.Done():
+	}
+	atomic.AddInt64(&st.gateNs, time.Now().UnixNano()-t0)
+}
+
+// releaseGate gives the slot back (while blocked downstream, and at End).
+func (st *reqState) releaseGate() {
+	if st.rec != nil && st.rec.gate != nil && atomic.CompareAndSwapInt32(&st.gateHeld, 1, 0) {
+		<-st.rec.gate
+	}
+}
+
+// initGate sizes the admission gate: GOMAXPROCS-1 slots (at least 1), or
+// GORDION_GATE_CAP; GORDION_GATE=0 turns it off. Client recorders never gate.
+func (r *Recorder) initGate() {
+	if r.disabled || strings.HasSuffix(r.service, "@client") || os.Getenv("GORDION_GATE") == "0" {
+		return
+	}
+	n := runtime.GOMAXPROCS(0) - 1
+	if v := os.Getenv("GORDION_GATE_CAP"); v != "" {
+		if c, err := strconv.Atoi(v); err == nil {
+			n = c
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	r.gate = make(chan struct{}, n)
+	r.gateCap = n
+}
+
+// schedLat reads the Go runtime's scheduler-latency histogram (time goroutines
+// spend runnable before running) and reports per-window percentiles (G-B).
+type schedLat struct {
+	s    []metrics.Sample
+	prev []uint64
+}
+
+func newSchedLat() *schedLat {
+	s := []metrics.Sample{{Name: "/sched/latencies:seconds"}}
+	metrics.Read(s)
+	if s[0].Value.Kind() != metrics.KindFloat64Histogram {
+		return nil
+	}
+	h := s[0].Value.Float64Histogram()
+	return &schedLat{s: s, prev: append([]uint64(nil), h.Counts...)}
+}
+
+// delta returns the p50 and p90 (ns, upper edge of the histogram bucket) and the
+// number of scheduling waits since the previous call.
+func (l *schedLat) delta() (p50, p90 int64, n uint64) {
+	metrics.Read(l.s)
+	h := l.s[0].Value.Float64Histogram()
+	if len(h.Counts) != len(l.prev) {
+		l.prev = append(l.prev[:0], h.Counts...)
+		return 0, 0, 0
+	}
+	d := make([]uint64, len(h.Counts))
+	var total uint64
+	for i, c := range h.Counts {
+		d[i] = c - l.prev[i]
+		total += d[i]
+		l.prev[i] = c
+	}
+	if total == 0 {
+		return 0, 0, 0
+	}
+	q := func(p float64) int64 {
+		target := uint64(math.Ceil(p * float64(total)))
+		var acc uint64
+		for i, c := range d {
+			acc += c
+			if acc >= target {
+				hi, lo := h.Buckets[i+1], h.Buckets[i]
+				if math.IsInf(hi, 1) {
+					return int64(lo * 1e9)
+				}
+				return int64(hi * 1e9)
+			}
+		}
+		return 0
+	}
+	return q(.5), q(.9), total
 }
 
 // End stops the timer and enqueues the completion. Never blocks; if the
@@ -369,10 +505,13 @@ func (r *Recorder) End(tok Token, isErr bool) {
 		return
 	}
 	total := time.Now().UnixNano() - tok.start
+	tok.st.releaseGate()
 	blocked := atomic.LoadInt64(&tok.st.pausedTotal)
+	gateNs := atomic.LoadInt64(&tok.st.gateNs)
+	tok.st.rec = nil
 	statePool.Put(tok.st)
 	select {
-	case r.ch <- completion{method: tok.method, err: isErr, totalNs: total, blockNs: blocked, queueNs: tok.queue, preNs: tok.pre}:
+	case r.ch <- completion{method: tok.method, err: isErr, totalNs: total, blockNs: blocked, queueNs: tok.queue, preNs: tok.pre, gateNs: gateNs}:
 	default:
 		atomic.AddInt64(&r.dropped, 1)
 	}
@@ -387,8 +526,20 @@ func PauseBegin(ctx context.Context) bool {
 	}
 	if atomic.AddInt32(&st.depth, 1) == 1 {
 		atomic.StoreInt64(&st.pauseStart, time.Now().UnixNano())
+		st.releaseGate() // blocked downstream: the slot goes to a handler that can run
 	}
 	return true
+}
+
+// Block marks a blocking call (database, cache, any uninstrumented I/O) made on
+// behalf of the request in ctx: `end := gordion.Block(ctx); ...; end()`. The time
+// is excluded from Lat_e like a gordion-wrapped downstream call and the gate slot
+// is released meanwhile.
+func Block(ctx context.Context) func() {
+	if !PauseBegin(ctx) {
+		return func() {}
+	}
+	return func() { PauseEnd(ctx) }
 }
 
 // PauseEnd marks the end of a downstream call started with PauseBegin.
@@ -403,6 +554,7 @@ func PauseEnd(ctx context.Context) {
 			atomic.AddInt64(&st.pausedTotal, time.Now().UnixNano()-ps)
 			atomic.StoreInt64(&st.pauseStart, 0)
 		}
+		st.acquireGate(ctx) // back from downstream: wait for a slot again (charged as gate wait, not as blocked time)
 	}
 }
 
@@ -412,6 +564,7 @@ type bucket struct {
 	queue []int64
 	pre   []int64 // only requests whose caller sent a stamp
 	full  []int64 // pre + total - blocked, same requests as pre: Lat_e incl. the admission wait
+	gate  []int64 // admission-gate wait (G-A), every request (0 when the gate is off)
 	errs  int
 }
 
@@ -420,6 +573,7 @@ func (r *Recorder) add(buckets []bucket, c completion) {
 	b.total = append(b.total, c.totalNs)
 	b.proc = append(b.proc, c.totalNs-c.blockNs)
 	b.queue = append(b.queue, c.queueNs)
+	b.gate = append(b.gate, c.gateNs)
 	if c.preNs != noPre {
 		b.pre = append(b.pre, c.preNs)
 		b.full = append(b.full, c.preNs+c.totalNs-c.blockNs)
@@ -458,6 +612,7 @@ func (r *Recorder) loop() {
 				buckets[i].queue = buckets[i].queue[:0]
 				buckets[i].pre = buckets[i].pre[:0]
 				buckets[i].full = buckets[i].full[:0]
+				buckets[i].gate = buckets[i].gate[:0]
 				buckets[i].errs = 0
 			}
 		case <-r.stopCh:
@@ -488,15 +643,17 @@ func sortI64(s []int64) {
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 }
 
-// writeStats appends n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90
+// writeStats appends n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90,g50,g90
 // (no brackets); x = pre-arrival wait from the caller's stamp (0 when none
-// sent), ns = stamped completions, f = full latency (pre + total) of those.
-func writeStats(sb *strings.Builder, total, proc, queue, pre, full []int64) {
+// sent), ns = stamped completions, f = full latency (pre + total) of those,
+// g = admission-gate wait.
+func writeStats(sb *strings.Builder, total, proc, queue, pre, full, gate []int64) {
 	sortI64(total)
 	sortI64(proc)
 	sortI64(queue)
 	sortI64(pre)
 	sortI64(full)
+	sortI64(gate)
 	var sum int64
 	for _, v := range total {
 		sum += v
@@ -509,7 +666,7 @@ func writeStats(sb *strings.Builder, total, proc, queue, pre, full []int64) {
 		mx = total[n-1]
 	}
 	sb.WriteString(strconv.FormatInt(n, 10))
-	for _, v := range []int64{pct(total, .5), pct(total, .9), pct(total, .99), mean, mx, pct(proc, .5), pct(proc, .9), pct(queue, .5), pct(queue, .9), pct(pre, .5), pct(pre, .9), int64(len(full)), pct(full, .5), pct(full, .9)} {
+	for _, v := range []int64{pct(total, .5), pct(total, .9), pct(total, .99), mean, mx, pct(proc, .5), pct(proc, .9), pct(queue, .5), pct(queue, .9), pct(pre, .5), pct(pre, .9), int64(len(full)), pct(full, .5), pct(full, .9), pct(gate, .5), pct(gate, .9)} {
 		sb.WriteByte(',')
 		sb.WriteString(strconv.FormatInt(v, 10))
 	}
@@ -533,6 +690,8 @@ func writeRaw(sb *strings.Builder, key string, methods []string, buckets []bucke
 			vals = buckets[i].pre
 		case 4:
 			vals = buckets[i].full
+		case 5:
+			vals = buckets[i].gate
 		}
 		if len(vals) == 0 {
 			continue
@@ -556,7 +715,7 @@ func writeRaw(sb *strings.Builder, key string, methods []string, buckets []bucke
 }
 
 func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
-	var allTotal, allProc, allQueue, allPre, allFull []int64
+	var allTotal, allProc, allQueue, allPre, allFull, allGate []int64
 	var arrivals, errs int64
 	for i := range buckets {
 		allTotal = append(allTotal, buckets[i].total...)
@@ -564,6 +723,7 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		allQueue = append(allQueue, buckets[i].queue...)
 		allPre = append(allPre, buckets[i].pre...)
 		allFull = append(allFull, buckets[i].full...)
+		allGate = append(allGate, buckets[i].gate...)
 		errs += int64(buckets[i].errs)
 	}
 	arr := make([]int64, len(buckets))
@@ -608,8 +768,26 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		sb.WriteString(`,"mhz":`)
 		sb.WriteString(strconv.FormatInt(int64(mhz), 10))
 	}
+	if r.gate != nil {
+		sb.WriteString(`,"gate":`)
+		sb.WriteString(strconv.Itoa(r.gateCap))
+	}
+	if r.sched == nil && !strings.HasSuffix(r.service, "@client") {
+		r.sched = newSchedLat()
+	}
+	if r.sched != nil {
+		// G-B: scheduler latency of every goroutine of the process during this window (ns)
+		p50, p90, n := r.sched.delta()
+		sb.WriteString(`,"sched":[`)
+		sb.WriteString(strconv.FormatInt(p50, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(p90, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatUint(n, 10))
+		sb.WriteByte(']')
+	}
 	sb.WriteString(`,"all":[`)
-	writeStats(&sb, allTotal, allProc, allQueue, allPre, allFull)
+	writeStats(&sb, allTotal, allProc, allQueue, allPre, allFull, allGate)
 	if r.raw {
 		// unsorted per-endpoint samples (writeStats sorts in place afterwards)
 		writeRaw(&sb, `"raw"`, r.methods, buckets, 0)
@@ -617,6 +795,7 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		writeRaw(&sb, `"rawq"`, r.methods, buckets, 2)
 		writeRaw(&sb, `"rawx"`, r.methods, buckets, 3)
 		writeRaw(&sb, `"rawf"`, r.methods, buckets, 4)
+		writeRaw(&sb, `"rawg"`, r.methods, buckets, 5)
 	}
 	sb.WriteString(`],"ep":{`)
 	first := true
@@ -633,7 +812,7 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		sb.WriteString(`":[`)
 		sb.WriteString(strconv.FormatInt(arr[i], 10))
 		sb.WriteByte(',')
-		writeStats(&sb, buckets[i].total, buckets[i].proc, buckets[i].queue, buckets[i].pre, buckets[i].full)
+		writeStats(&sb, buckets[i].total, buckets[i].proc, buckets[i].queue, buckets[i].pre, buckets[i].full, buckets[i].gate)
 		sb.WriteByte(']')
 	}
 	sb.WriteString("}}\n")

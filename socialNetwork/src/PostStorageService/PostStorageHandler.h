@@ -12,6 +12,7 @@
 #include <string>
 
 #include "../../gen-cpp/PostStorageService.h"
+#include "../gordion/Gordion.h"
 #include "../logger.h"
 #include "../tracing.h"
 
@@ -57,8 +58,11 @@ void PostStorageHandler::StorePost(
       "store_post_server", {opentracing::ChildOf(parent_span->get())});
   opentracing::Tracer::Global()->Inject(span->context(), writer);
 
-  mongoc_client_t *mongodb_client =
-      mongoc_client_pool_pop(_mongodb_client_pool);
+  mongoc_client_t *mongodb_client;
+  {
+    gordion::Blocked blk;
+    mongodb_client = mongoc_client_pool_pop(_mongodb_client_pool);
+  }
   if (!mongodb_client) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_MONGODB_ERROR;
@@ -139,8 +143,12 @@ void PostStorageHandler::StorePost(
   auto insert_span = opentracing::Tracer::Global()->StartSpan(
       "post_storage_mongo_insert_client",
       {opentracing::ChildOf(&span->context())});
-  bool inserted = mongoc_collection_insert_one(collection, new_doc, nullptr,
-                                               nullptr, &error);
+  bool inserted;
+  {
+    gordion::Blocked blk;
+    inserted = mongoc_collection_insert_one(collection, new_doc, nullptr,
+                                            nullptr, &error);
+  }
   insert_span->Finish();
 
   if (!inserted) {
@@ -176,8 +184,12 @@ void PostStorageHandler::ReadPost(
   std::string post_id_str = std::to_string(post_id);
 
   memcached_return_t memcached_rc;
-  memcached_st *memcached_client =
-      memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+  memcached_st *memcached_client;
+  {
+    gordion::Blocked blk;
+    memcached_client =
+        memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+  }
   if (!memcached_client) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_MEMCACHED_ERROR;
@@ -189,9 +201,13 @@ void PostStorageHandler::ReadPost(
   uint32_t memcached_flags;
   auto get_span = opentracing::Tracer::Global()->StartSpan(
       "post_storage_mmc_get_client", {opentracing::ChildOf(&span->context())});
-  char *post_mmc =
-      memcached_get(memcached_client, post_id_str.c_str(), post_id_str.length(),
-                    &post_mmc_size, &memcached_flags, &memcached_rc);
+  char *post_mmc;
+  {
+    gordion::Blocked blk;
+    post_mmc =
+        memcached_get(memcached_client, post_id_str.c_str(), post_id_str.length(),
+                      &post_mmc_size, &memcached_flags, &memcached_rc);
+  }
   if (!post_mmc && memcached_rc != MEMCACHED_NOTFOUND) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_MEMCACHED_ERROR;
@@ -234,8 +250,11 @@ void PostStorageHandler::ReadPost(
     free(post_mmc);
   } else {
     // If not cached in memcached
-    mongoc_client_t *mongodb_client =
-        mongoc_client_pool_pop(_mongodb_client_pool);
+    mongoc_client_t *mongodb_client;
+    {
+      gordion::Blocked blk;
+      mongodb_client = mongoc_client_pool_pop(_mongodb_client_pool);
+    }
     if (!mongodb_client) {
       ServiceException se;
       se.errorCode = ErrorCode::SE_MONGODB_ERROR;
@@ -261,7 +280,11 @@ void PostStorageHandler::ReadPost(
     mongoc_cursor_t *cursor =
         mongoc_collection_find_with_opts(collection, query, nullptr, nullptr);
     const bson_t *doc;
-    bool found = mongoc_cursor_next(cursor, &doc);
+    bool found;
+    {
+      gordion::Blocked blk;
+      found = mongoc_cursor_next(cursor, &doc);
+    }
     find_span->Finish();
     if (!found) {
       bson_error_t error;
@@ -322,8 +345,11 @@ void PostStorageHandler::ReadPost(
       mongoc_client_pool_push(_mongodb_client_pool, mongodb_client);
 
       // upload post to memcached
-      memcached_client =
-          memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+      {
+        gordion::Blocked blk;
+        memcached_client =
+            memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+      }
       if (!memcached_client) {
         ServiceException se;
         se.errorCode = ErrorCode::SE_MEMCACHED_ERROR;
@@ -334,10 +360,13 @@ void PostStorageHandler::ReadPost(
           "post_storage_mmc_set_client",
           {opentracing::ChildOf(&span->context())});
 
-      memcached_rc = memcached_set(
-          memcached_client, post_id_str.c_str(), post_id_str.length(),
-          post_json_char, std::strlen(post_json_char), static_cast<time_t>(0),
-          static_cast<uint32_t>(0));
+      {
+        gordion::Blocked blk;
+        memcached_rc = memcached_set(
+            memcached_client, post_id_str.c_str(), post_id_str.length(),
+            post_json_char, std::strlen(post_json_char), static_cast<time_t>(0),
+            static_cast<uint32_t>(0));
+      }
       if (memcached_rc != MEMCACHED_SUCCESS) {
         LOG(warning) << "Failed to set post to Memcached: "
                      << memcached_strerror(memcached_client, memcached_rc);
@@ -378,8 +407,12 @@ void PostStorageHandler::ReadPosts(
   }
   std::map<int64_t, Post> return_map;
   memcached_return_t memcached_rc;
-  auto memcached_client =
-      memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+  memcached_st *memcached_client;
+  {
+    gordion::Blocked blk;
+    memcached_client =
+        memcached_pool_pop(_memcached_client_pool, true, &memcached_rc);
+  }
   if (!memcached_client) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_MEMCACHED_ERROR;
@@ -399,8 +432,11 @@ void PostStorageHandler::ReadPosts(
     key_sizes[idx] = key_str.length();
     idx++;
   }
-  memcached_rc =
-      memcached_mget(memcached_client, keys, key_sizes, post_ids.size());
+  {
+    gordion::Blocked blk;
+    memcached_rc =
+        memcached_mget(memcached_client, keys, key_sizes, post_ids.size());
+  }
   if (memcached_rc != MEMCACHED_SUCCESS) {
     LOG(error) << "Cannot get post_ids of request " << req_id << ": "
                << memcached_strerror(memcached_client, memcached_rc);
@@ -420,9 +456,12 @@ void PostStorageHandler::ReadPosts(
       "post_storage_mmc_mget_client", {opentracing::ChildOf(&span->context())});
 
   while (true) {
-    return_value =
-        memcached_fetch(memcached_client, return_key, &return_key_length,
-                        &return_value_length, &flags, &memcached_rc);
+    {
+      gordion::Blocked blk;
+      return_value =
+          memcached_fetch(memcached_client, return_key, &return_key_length,
+                          &return_value_length, &flags, &memcached_rc);
+    }
     if (return_value == nullptr) {
       LOG(debug) << "Memcached mget finished";
       break;
@@ -483,8 +522,11 @@ void PostStorageHandler::ReadPosts(
 
   // Find the rest in MongoDB
   if (!post_ids_not_cached.empty()) {
-    mongoc_client_t *mongodb_client =
-        mongoc_client_pool_pop(_mongodb_client_pool);
+    mongoc_client_t *mongodb_client;
+    {
+      gordion::Blocked blk;
+      mongodb_client = mongoc_client_pool_pop(_mongodb_client_pool);
+    }
     if (!mongodb_client) {
       ServiceException se;
       se.errorCode = ErrorCode::SE_MONGODB_ERROR;
@@ -523,7 +565,11 @@ void PostStorageHandler::ReadPosts(
     auto find_span = opentracing::Tracer::Global()->StartSpan(
         "mongo_find_client", {opentracing::ChildOf(&span->context())});
     while (true) {
-      bool found = mongoc_cursor_next(cursor, &doc);
+      bool found;
+      {
+        gordion::Blocked blk;
+        found = mongoc_cursor_next(cursor, &doc);
+      }
       if (!found) {
         break;
       }
@@ -604,6 +650,7 @@ void PostStorageHandler::ReadPosts(
 
   if (return_map.size() != post_ids.size()) {
     try {
+      gordion::Blocked blk;
       for (auto &it : set_futures) {
         it.get();
       }
@@ -622,6 +669,7 @@ void PostStorageHandler::ReadPosts(
   }
 
   try {
+    gordion::Blocked blk;
     for (auto &it : set_futures) {
       it.get();
     }

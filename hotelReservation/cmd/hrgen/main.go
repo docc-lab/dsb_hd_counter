@@ -68,6 +68,7 @@ var (
 	fConns      = flag.Int("conns", 4096, "max idle keep-alive connections to the frontend")
 	fCostsFile  = flag.String("costs", "", "costs.json from the idle runs; its c_e are copied into the run event as cpu_ms")
 	fK          = flag.Int("k", 4, "cores of the service under test (written to the run event)")
+	fFixed      = flag.Bool("fixed-params", false, "HR: one request content per endpoint (dates 10->12, lat 38.0 lon -122.1, require=dis), same in every run")
 )
 
 type step struct {
@@ -275,6 +276,16 @@ func build(r *rand.Rand, i int) (string, string, string) {
 }
 
 func buildHR(r *rand.Rand, i int) (string, string) {
+	if *fFixed {
+		// Phase F: fixed request content (the floor must not move with the query); the other two endpoints keep
+		// their random user/hotel (they are not single-endpoint SUTs)
+		switch Endpoints[i] {
+		case "search":
+			return "GET", "/hotels?inDate=" + dateStr(10) + "&outDate=" + dateStr(12) + "&lat=38.0&lon=-122.1"
+		case "recommend":
+			return "GET", "/recommendations?require=dis&lat=38.0&lon=-122.1"
+		}
+	}
 	switch Endpoints[i] {
 	case "search":
 		in := 9 + r.Intn(15)
