@@ -1,0 +1,50 @@
+# c6320 variant (Clemson "icelake-perf1", 2026-11-10, 2x E5-2683 v3, SMT on, 2.0 GHz pinned): victim threads 4,6 (siblings 32,34). 4-thread victim 4,6,8,10 (8,10 = the harvestable pair shared with the burner).
+# Motivation pass 3 add-on (2026-11-09): the intrinsic config with a 4-THREAD victim (18-21) for the
+# hc-grow arm (victim harvests 20,21 from the Secondary) and its 4-core exclusive reference. Run with
+# STAGE3_VICTIM_GOMAXPROCS=4 and the search limit raised to 4 (queue-grow.sh edits the manifest).
+# Motivation pass 3, intrinsic steady overload (2026-11-08): the SAME 2-P victim
+# as the extrinsic config (threads 18,19, HC Primary pool 18,19), overloaded
+# through the frontend chain (reservation x3, rate/profile/geo/recommendation x2,
+# frontend x3 in the manifests; the 512-connection driver still caps near 18k). No aggressor load; the
+# SN/SS co-tenants are deploy-only. The HC Secondary is the hc-secondary-burner pod
+# (run-motiv3.sh BURNER=1), present in every arm.
+#
+# Run with ARM_OFFSET_S=2: the mitigation is enabled from the start of the run, so
+# the quiet phase (0-20 s) shows what HC harvests from an idle victim (~1.7 cores
+# to the burner) and the overload (20-140 s) shows it handing everything back
+# while the p50 stays at the overload level; forced replicas (rep*f) exist before
+# the overload begins, so this is a capacity comparison at equal budget.
+
+experiment:
+  name: motiv3-c6320-int4
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen:
+      rps: 800
+      shape: exp
+      extra: {rps: 7200, shape: exp, start_offset_s: 20}   # 8000 offered ~ 1.2x the c6320 2-P knee (probe 2026-11-10: e2e p50 10 ms at 6k, 32 ms at 8k, 4 s at 10k; victim 1.6 cores)
+  socialNetwork:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  cpu_set: "4,6,8,10"   # 4-P victim (GOMAXPROCS 4, limit 4): threads 20,21 are the HARVESTABLE pair shared with the burner (hc-grow) or exclusive (none on this config = 4-core upper bound)
+  score_log: true
+aggressors:
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

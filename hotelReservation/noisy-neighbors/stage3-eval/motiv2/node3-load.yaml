@@ -1,0 +1,65 @@
+# node-3 load dial for the motivation pass 3: a busy-loop process pinned to each
+# of the SMT siblings (2-13) of the replica threads (18-29) on node-3, at a duty
+# cycle DUTY (percent of a 20 ms period). run-motiv3.sh sets it per cell:
+#   quiet      -> replicas 0 (no pod)
+#   medium     -> DUTY=50
+#   contended  -> DUTY=100
+# Steady load, not synchronised with node-4's bursts: the replica node's condition
+# is a controlled, independent variable. Not labelled gordion-aggr: the controller
+# and HC never touch it. No CPU limit (the pod must be able to burn its threads);
+# the pin is done by the process itself (sched_setaffinity), the cluster has no
+# static CPU manager.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node3-load
+  labels: {app: node3-load}
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: node3-load}
+  template:
+    metadata:
+      labels: {app: node3-load}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-3
+      tolerations:
+        - {key: dedicated, operator: Equal, value: special, effect: NoSchedule}
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: load
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DUTY, value: "100"}
+            - {name: CPUS, value: "2,3,4,5,6,7,8,9,10,11,12,13"}
+            - {name: WORKERS, value: ""}      # empty: one worker per CPU, each pinned to its CPU
+          resources:
+            requests: {cpu: "100m"}
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os, time, multiprocessing as mp
+              duty = float(os.environ.get("DUTY", "100"))
+              cpus = [int(c) for c in os.environ["CPUS"].split(",") if c]
+              workers = os.environ.get("WORKERS", "")
+              period = 0.02
+              def work(aff):
+                  os.sched_setaffinity(0, aff)
+                  if duty >= 100:
+                      while True:
+                          pass
+                  on = period * duty / 100.0
+                  while True:
+                      t = time.perf_counter()
+                      while time.perf_counter() - t < on:
+                          pass
+                      time.sleep(period - on)
+              affs = [{c} for c in cpus] if not workers else [set(cpus)] * int(workers)
+              ps = [mp.Process(target=work, args=(a,), daemon=True) for a in affs]
+              for p in ps:
+                  p.start()
+              print("load: duty", duty, "workers", len(ps), "cpus", cpus, flush=True)
+              for p in ps:
+                  p.join()

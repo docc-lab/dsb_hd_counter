@@ -16,9 +16,11 @@ bar; one SLO line (--slo, default 1.5x of the quiet p1 mean) at its absolute
 value; the MIXED scenario and the cores-vs-SLO scatter are not plotted.
 
 Figures (png + pdf):
-  motiv2_bars      A (extrinsic bursts) and B (intrinsic steady): per cell the quiet (p1) and the
-                   under-contention-with-mitigation (p3 window) latency, over the cores consumed meanwhile;
-                   rep6 cells from data/motiv2-uncap are appended when present
+  motiv2_bars      A (extrinsic bursts, sweeps motiv2 / -t2 / -t3) and B (intrinsic steady, motiv2-int / -int-t2):
+                   per cell the quiet (p1) and the under-contention-with-mitigation (p3 window) latency, over the
+                   cores consumed meanwhile; rep6 cells from data/motiv2-uncap* are appended when present
+  motiv2_nrep      replica-count iteration on node-3 (rep3 narrow pin, rep4/5/6/8 wide pin; motiv2-uncap*, -nrep*):
+                   handler p90 and cores taken vs the controller's replica cap, with none / hc-hold for reference
   motiv2_ts_ext    one column per cell, two rows: handler p90; cores consumed by victim + replicas (+ the
                    victim cores HC lends to the aggressors, from the balancer log)
   motiv2_ts_int    one column per cell, two rows: service total p90; cores consumed by victim + replicas
@@ -46,8 +48,10 @@ import motiv2_report as R  # noqa: E402
 
 C_NONE, C_HC, C_REP, C_BOTH = "#777777", "#0077BB", "#EE7733", "#009988"
 C_VIC, C_SIB, C_QUIET, C_P2 = "#000000", "#CC3311", "#d9d9d9", "#9e9e9e"
-PLACE_LABEL = {"samecores": "same cores", "othercores": "other cores", "othernode": "other node"}
-TICK_LABEL = {"samecores": "same\ncores", "othercores": "other\ncores", "othernode": "other\nnode"}
+PLACE_LABEL = {"samecores": "same cores", "othercores": "other cores", "othernode": "other node",
+               "othernodewide": "other node (wide)"}
+TICK_LABEL = {"samecores": "same\ncores", "othercores": "other\ncores", "othernode": "other\nnode",
+              "othernodewide": "other\nnode\n(wide)"}
 P1 = [(2, 20)]
 BURST_P2 = [(20, 30), (40, 50), (60, 70)]
 BURST_P3 = [(80, 90), (100, 110), (120, 130)]
@@ -112,7 +116,7 @@ def phase_lat(cell_dir, p2, p3):
 
 
 # ----------------------------------------------------------------------------- bars
-def _two_bars(ax, cells, trials, key, unit, slo, log=False):
+def _two_bars(ax, cells, trials, key, unit, slo, log=False, labels=None):
     """Per cell: quiet (p1, light grey) and mitigated (p3 window, mitigation colour;
     mean over trials, min-max error bar, p3/p1 ratio written above)."""
     w = 0.38
@@ -139,7 +143,7 @@ def _two_bars(ax, cells, trials, key, unit, slo, log=False):
     else:
         ax.set_ylim(0, top * 1.12)
     ax.set_xticks(x)
-    ax.set_xticklabels([label(c) for c in cells], fontsize=8)
+    ax.set_xticklabels(labels or [label(c) for c in cells], fontsize=8)
 
 
 HC_PRIMARY_CORES = 3   # HC_VICTIM_CPULIST=18,19,20: the physical cores HC reserves for the victim
@@ -178,7 +182,7 @@ def hc_lent(root, sweep, cell, spans):
     return v[sel].mean() if sel.any() else float("nan")
 
 
-def _cores_panel(ax, cells, reps, root=None, sweeps=(), spans=()):
+def _cores_panel(ax, cells, reps, root=None, sweeps=(), spans=(), labels=None):
     """Stacked cores per cell: victim consumed; replicas consumed (node-4 / node-3);
     for the HC cells the cores HC reserves for the victim but leaves idle
     (HC_PRIMARY_CORES - lent to the aggressors - used by the victim)."""
@@ -219,12 +223,12 @@ def _cores_panel(ax, cells, reps, root=None, sweeps=(), spans=()):
         ax.bar(x[i], on, 0.6, bottom=v + idle + o, color=C_REP, hatch="//", edgecolor="white")
         if hi > lo:
             ax.errorbar(x[i], m, yerr=[[m - lo], [hi - m]], fmt="none", ecolor="k", lw=0.9, capsize=2.5, zorder=4)
-        if idle > 0:
+        if idle > 0.25:   # too thin to carry text otherwise
             ax.text(x[i], v + idle / 2, "lent\n%.1f" % np.nanmean(t[:, 4]), ha="center", va="center", fontsize=6.5, color="white")
         ax.text(x[i], hi + 0.04, "%.2f\n(%.1fx)" % (m, m / ref_tot), ha="center", va="bottom", fontsize=7)
         top = max(top, hi)
     ax.set_xticks(x)
-    ax.set_xticklabels([label(c) for c in cells], fontsize=8)
+    ax.set_xticklabels(labels or [label(c) for c in cells], fontsize=8)
     ax.set_ylim(0, max(3.4, top * 1.25))
 
 
@@ -241,35 +245,42 @@ def _reports(root, sweeps):
     return {sw: read_report(root, sw) for sw in sweeps if os.path.isfile(os.path.join(root, sw, "report.csv"))}
 
 
+SWEEPS_A = ("motiv2", "motiv2-t2", "motiv2-t3")            # extrinsic sweep A, three trials
+SWEEPS_UNCAP = ("motiv2-uncap", "motiv2-uncap-t2")           # rep6 (N_MAX 6) on node-4 other cores / node-3 wide
+SWEEPS_NREP = ("motiv2-nrep", "motiv2-nrep-t2")              # rep4 / rep5 / rep8 on node-3 wide
+
+
 def fig_bars(root, out, slo=1.5):
-    # hc-iso (hc-hold + HC's internal idle-core target) is excluded (user, 2026-11-02)
-    cells_a = ["none", "hc-bang", "hc-hold"] + ["rep%d-%s" % (k, p) for k in (1, 2, 3)
-                                                          for p in ("samecores", "othercores", "othernode")]
-    # uncapped replication cells (N_MAX=6, data/motiv2-uncap), if they have been run
-    cells_a += [c for c in ("rep6-othercores", "rep6-othernodewide") if os.path.isdir(os.path.join(root, "motiv2-uncap", c))]
-    cells_i = ["none", "hc-hold", "rep1f-othercores", "rep1f-othernode", "rep2f-othercores", "rep2f-othernode",
-               "rep3f-othercores", "rep3f-othernode", "rep3f-samecores"]
-    sweeps_a = ("motiv2", "motiv2-t2", "motiv2-uncap")
+    # hc-iso (hc-hold + HC's internal idle-core target) is excluded (user, 2026-11-02);
+    # same-core and same-node-other-core replication are dropped (user, 2026-11-08: they
+    # are shown not to work; keep only other-node replication at growing replica caps)
+    cells_a = ["none", "hc-bang", "hc-hold", "rep1-othernode", "rep2-othernode", "rep3-othernode",
+               "rep4-othernodewide", "rep5-othernodewide", "rep6-othernodewide", "rep8-othernodewide"]
+    cells_i = ["none", "hc-hold", "rep1f-othernode", "rep2f-othernode", "rep3f-othernode"]
+    sweeps_a = SWEEPS_A + SWEEPS_UNCAP + SWEEPS_NREP
+    cells_a = [c for c in cells_a if any(os.path.isdir(os.path.join(root, s, c)) for s in sweeps_a)]
     trials_a = _trials(root, sweeps_a, cells_a, BURST_P2, BURST_P3)
     sweeps_i = ("motiv2-int", "motiv2-int-t2")
     trials_i = _trials(root, sweeps_i, cells_i, STEADY_P2, STEADY_P3)
     rep_a, rep_i = _reports(root, sweeps_a), _reports(root, sweeps_i)
+    n_a = sum("none" in t for t in trials_a)
 
-    fig, axes = plt.subplots(2, 2, figsize=(17, 7.8), sharex="col",
-                             gridspec_kw=dict(height_ratios=[2.3, 1.2], width_ratios=[len(cells_a), 9]))
-    _two_bars(axes[0, 0], cells_a, trials_a, "h", "us", slo)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 7.8), sharex="col",
+                             gridspec_kw=dict(height_ratios=[2.3, 1.2], width_ratios=[len(cells_a), len(cells_i) + 0.5]))
+    _two_bars(axes[0, 0], cells_a, trials_a, "h", "us", slo, labels=[nrep_label(c, rep_a) for c in cells_a])
     ylabel2(axes[0, 0], "handler p90 (us)", "victim instance, mitigation-enabled bursts; ratio = vs quiet")
     title2(axes[0, 0], "A. Extrinsic bursts",
-           "3-P victim on threads 18-20, SN/SS aggressor bursts 10 s on / 10 s off; mean of 2 trials, error bar = min-max")
-    _cores_panel(axes[1, 0], cells_a, rep_a, root, sweeps_a, BURST_P3)
+           "3-P victim on threads 18-20, SN/SS aggressor bursts 10 s on / 10 s off; replicas on node-3; %d trials (rep4-8: 2), error bar = min-max"
+           % n_a)
+    _cores_panel(axes[1, 0], cells_a, rep_a, root, sweeps_a, BURST_P3, labels=[nrep_label(c, rep_a) for c in cells_a])
     ylabel2(axes[1, 0], "cores taken", "consumed + reserved idle, mitigation-enabled window; mean, min-max; (x) = vs none")
-    _two_bars(axes[0, 1], cells_i, trials_i, "t50", "ms", slo, log=True)
+    _two_bars(axes[0, 1], cells_i, trials_i, "t50", "ms", slo, log=True, labels=[nrep_label(c, rep_i) for c in cells_i])
     ylabel2(axes[0, 1], "service total p50 (ms, log)", "pooled over victim + replicas; ratio = vs quiet")
     title2(axes[0, 1], "B. Intrinsic steady",
-           "1-P victim on thread 18, 11000 rps offered from t = 20 s, no aggressors; %d trial%s"
+           "1-P victim on thread 18, 11000 rps offered from t = 20 s, no aggressors; replicas on node-3; %d trial%s"
            % (len(trials_i), "s, error bar = min-max" if len(trials_i) > 1 else ""))
     ylabel2(axes[1, 1], "", "")
-    _cores_panel(axes[1, 1], cells_i, rep_i, root, sweeps_i, STEADY_P3)
+    _cores_panel(axes[1, 1], cells_i, rep_i, root, sweeps_i, STEADY_P3, labels=[nrep_label(c, rep_i) for c in cells_i])
     fig.legend(handles=[Patch(facecolor=C_QUIET, edgecolor="#777777", label="quiet (p1, 0-20 s)"),
                         Patch(color=C_NONE, label="under contention: no mitigation"),
                         Patch(color=C_HC, label="under contention: harvesting (HC)"),
@@ -277,13 +288,69 @@ def fig_bars(root, out, slo=1.5):
                         Line2D([], [], color="k", ls="--", label="SLO"),
                         Patch(color="#444444", label="cores: victim"),
                         Patch(color=C_HC, alpha=0.55, label="cores: reserved for the victim by HC, idle (3 - lent - used)"),
-                        Patch(facecolor=C_REP, label="cores: replicas on node-4"),
                         Patch(facecolor=C_REP, hatch="//", edgecolor="white", label="cores: replicas on node-3")],
-               loc="lower center", ncol=5, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, -0.03))
+               loc="lower center", ncol=4, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, -0.03))
     suptitle2(fig, "Latency and cores taken per mitigation",
-              "sm110p, SMT on, 2.4 GHz, July layout; per cell: quiet (p1) vs under contention with the mitigation enabled (p3)")
+              "sm110p, SMT on, 2.4 GHz, July layout; per cell: quiet (p1) vs under contention with the mitigation enabled (p3); "
+              "replication = controller cap N (replicas reached under the bar)")
     fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     save(fig, out, "motiv2_bars")
+
+
+def nrep_label(cell, reps):
+    """Tick label: 'none' / 'hc-hold' / 'rep N\\nreached M' for replication cells (replicas
+    actually running at the end of the run, min-max over trials, from the reports)."""
+    arm, place = split_cell(cell)
+    if not arm.startswith("rep"):
+        return arm
+    seen = sorted({int(r[cell]["replicas_seen"]) for r in reps.values() if cell in r})
+    if not seen:
+        return arm
+    reached = "%d" % seen[0] if len(seen) == 1 else "%d-%d" % (seen[0], seen[-1])
+    return "%s\nreached %s" % (arm.replace("f", ""), reached)
+
+
+def fig_nrep(root, out, slo=1.5):
+    """Replica-count iteration: handler p90 and cores taken as the replication controller's
+    cap (N_MAX) grows; all replicas on node-3 (rep3: 3-thread pin 2,3,4; rep4-rep8: 24-thread
+    wide pin), with none / hc-hold from sweep A for reference."""
+    cells = ["none", "hc-hold", "rep3-othernode", "rep4-othernodewide", "rep5-othernodewide",
+             "rep6-othernodewide", "rep8-othernodewide"]
+    sweeps = SWEEPS_A + SWEEPS_UNCAP + SWEEPS_NREP
+    cells = [c for c in cells if any(os.path.isdir(os.path.join(root, s, c)) for s in sweeps)]
+    trials = _trials(root, sweeps, cells, BURST_P2, BURST_P3)
+    reps = _reports(root, sweeps)
+
+    def tick(c):
+        arm, place = split_cell(c)
+        if not arm.startswith("rep"):
+            return arm
+        seen = sorted({int(r[c]["replicas_seen"]) for r in reps.values() if c in r})
+        reached = "%d" % seen[0] if len(seen) == 1 else "%d-%d" % (seen[0], seen[-1])
+        return "cap %s\nreached %s\n%s" % (arm[3:], reached, "3-thread pin" if place == "othernode" else "wide pin")
+
+    labels = [tick(c) for c in cells]
+    fig, axes = plt.subplots(2, 1, figsize=(8.5, 7.4), sharex=True, gridspec_kw=dict(height_ratios=[2.3, 1.3]))
+    _two_bars(axes[0], cells, trials, "h", "us", slo, labels=labels)
+    ylabel2(axes[0], "handler p90 (us)", "victim instance, mitigation-enabled bursts; ratio = vs quiet")
+    title2(axes[0], "Replication with a growing replica cap",
+           "replicas on node-3; cap = controller N_MAX, reached = replicas running at the end; %d-%d trials per cell, error bar = min-max"
+           % (min(sum(c in t for t in trials) for c in cells), max(sum(c in t for t in trials) for c in cells)))
+    _cores_panel(axes[1], cells, reps, root, sweeps, BURST_P3, labels=labels)
+    ylabel2(axes[1], "cores taken", "consumed + reserved idle, mitigation-enabled window; mean, min-max; (x) = vs none")
+    fig.legend(handles=[Patch(facecolor=C_QUIET, edgecolor="#777777", label="quiet (p1, 0-20 s)"),
+                        Patch(color=C_NONE, label="under contention: no mitigation"),
+                        Patch(color=C_HC, label="under contention: harvesting (HC)"),
+                        Patch(color=C_REP, label="under contention: replication"),
+                        Line2D([], [], color="k", ls="--", label="SLO"),
+                        Patch(color="#444444", label="cores: victim"),
+                        Patch(color=C_HC, alpha=0.55, label="cores: reserved for the victim by HC, idle"),
+                        Patch(facecolor=C_REP, hatch="//", edgecolor="white", label="cores: replicas on node-3")],
+               loc="lower center", ncol=4, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, -0.03))
+    suptitle2(fig, "Does adding replicas reach the handler SLO?",
+              "sm110p, SMT on, 2.4 GHz, July layout; 3-P victim on threads 18-20, SN/SS aggressor bursts 10 s on / 10 s off")
+    fig.tight_layout(rect=(0, 0.07, 1, 0.93))
+    save(fig, out, "motiv2_nrep")
 
 
 # ----------------------------------------------------------------------------- time series
@@ -493,7 +560,7 @@ def _ts_grid(data, title, lat_key, lat_label, lat_ylim, lat_log, shade, cores_yl
     save(fig, out, name)
 
 
-def fig_ts_ext(root, out, cells=("none", "hc-hold", "rep3-othercores", "rep3-othernode", "rep6-othernodewide")):
+def fig_ts_ext(root, out, cells=("none", "hc-hold", "rep3-othernode", "rep6-othernodewide")):
     data = _ts_cells(root, "motiv2-t2", cells)
     _ts_grid(data, ("Extrinsic bursts: handler latency and cores over time",
                     "3-P victim on threads 18-20, SN/SS aggressor bursts 10 s on / 10 s off (shaded), mitigation enabled at 80 s; sweep A trial 2"),
@@ -506,7 +573,7 @@ def _shade_int(ax, arm):
     ax.axvline(arm, color="k", ls="--", lw=0.8)
 
 
-def fig_ts_int(root, out, cells=("none", "hc-hold", "rep1f-othercores", "rep1f-othernode")):
+def fig_ts_int(root, out, cells=("none", "hc-hold", "rep1f-othernode")):
     data = _ts_cells(root, "motiv2-int", cells)
     _ts_grid(data, ("Intrinsic steady: service latency and cores over time",
                     "1-P victim on thread 18, 800 rps + 10200 rps extra from t = 20 s (shaded), no aggressors, mitigation enabled at 80 s"),
@@ -549,10 +616,11 @@ def main():
     ap.add_argument("--root", required=True, help="dir holding motiv2/ motiv2-t2/ motiv2-int/ (motiv2-mixed/)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--slo", type=float, default=1.5, help="SLO line as a multiple of the quiet (p1) mean")
-    ap.add_argument("--only", default="", help="comma list of figure names (bars,ts_ext,ts_int,ts_mixed)")
+    ap.add_argument("--only", default="", help="comma list of figure names (bars,nrep,ts_ext,ts_int,ts_mixed)")
     a = ap.parse_args()
-    figs = dict(bars=lambda r, o: fig_bars(r, o, a.slo), ts_ext=fig_ts_ext, ts_int=fig_ts_int, ts_mixed=fig_ts_mixed)
-    for k in (a.only.split(",") if a.only else ("bars", "ts_ext", "ts_int")):
+    figs = dict(bars=lambda r, o: fig_bars(r, o, a.slo), nrep=lambda r, o: fig_nrep(r, o, a.slo),
+                ts_ext=fig_ts_ext, ts_int=fig_ts_int, ts_mixed=fig_ts_mixed)
+    for k in (a.only.split(",") if a.only else ("bars", "ts_ext", "ts_int")):   # nrep is folded into bars panel A
         figs[k](a.root, a.out)
 
 

@@ -747,6 +747,11 @@ run_one_iteration() {
     # Start ONE wrk2 driver per in-scope testbed (background).
     start_testbed_drivers "$run_id" "$run_dir"
 
+    # Overflow replicas that are scaled IN during the run take their windowed
+    # sampler dump with them; capture it while the pod is Terminating (the
+    # overflow manifest gives it a preStop hold for that).
+    start_overflow_watcher "$run_dir"
+
     # Block for the measurement window. wrk2 drivers run in background.
     s3_log "  Drivers active; sleeping ${EXPERIMENT_DURATION_S}s for measurement window"
     sleep "$EXPERIMENT_DURATION_S"
@@ -766,11 +771,54 @@ run_one_iteration() {
     # next run's pod roll (kubectl logs is lost on restart).
     capture_victim_score_log "$run_dir" "$started_ns"
 
+    stop_overflow_watcher
     capture_victim_run_data "$run_dir" "$ended_ns"
 
     write_per_run_manifest "$run_id" "$run_dir" "$started_ns" "$ended_ns"
 
     s3_log "  Run $run_id complete ($(( (ended_ns - started_ns) / 1000000 )) ms)"
+}
+
+# ---------------------------------------------------------------------------
+# start_overflow_watcher <run_dir> / stop_overflow_watcher
+#
+# Background loop (2 s): every search-overflow pod that has a
+# deletionTimestamp (scaled in by the controller) and no capture yet gets its
+# /data/run_data_<svc>_iter1.json copied to <run_dir>/run_data-overflow-<pod>.json.
+# Needs the overflow manifest's terminationGracePeriodSeconds / preStop hold so
+# the container is still there to exec into. Pods alive at the end are
+# (re)captured by capture_victim_run_data's final loop.
+# ---------------------------------------------------------------------------
+OVERFLOW_WATCHER_PID=""
+start_overflow_watcher() {
+    local run_dir="$1"
+    local svc="${VICTIM_SERVICE}"
+    (
+        declare -A done_pods=()
+        echo "[overflow-watcher] started for $VICTIM_DEPLOYMENT ($(date -u +%T))" >> "$run_dir/orchestrator.log"
+        while true; do
+            local opod
+            # (kubectl's jsonpath has no existence filter: select Terminating pods with jq)
+            for opod in $(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT,overflow=true" -o json 2>/dev/null                     | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name' 2>/dev/null); do
+                [[ -n "${done_pods[$opod]:-}" ]] && continue
+                if kubectl exec "$opod" -- cat "/data/run_data_${svc}_iter1.json" > "$run_dir/run_data-overflow-$opod.json" 2>/dev/null                         && [[ -s "$run_dir/run_data-overflow-$opod.json" ]]; then
+                    done_pods[$opod]=1
+                    echo "[overflow-watcher] captured $opod at scale-in ($(wc -c < "$run_dir/run_data-overflow-$opod.json" | tr -d ' ') bytes)" >> "$run_dir/orchestrator.log"
+                else
+                    rm -f "$run_dir/run_data-overflow-$opod.json"
+                fi
+            done
+            sleep 2
+        done
+    ) &
+    OVERFLOW_WATCHER_PID=$!
+}
+stop_overflow_watcher() {
+    if [[ -n "$OVERFLOW_WATCHER_PID" ]]; then
+        kill "$OVERFLOW_WATCHER_PID" 2>/dev/null || true
+        wait "$OVERFLOW_WATCHER_PID" 2>/dev/null || true
+        OVERFLOW_WATCHER_PID=""
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -838,10 +886,12 @@ capture_victim_run_data() {
     local out="$run_dir/run_data.json"
     local svc="$VICTIM_SERVICE"
     local pod
-    # overflow!=true: search-overflow replicas share the victim's label.
-    pod=$(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT,overflow!=true" \
-          --field-selector=status.phase=Running \
-          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    # overflow!=true: search-overflow replicas share the victim's label. Newest non-terminating Running pod:
+    # pods of superseded ReplicaSets can linger in Running/Terminating for a while and items[0] picked one of
+    # them (empty /data) on the c6320 (2026-11-10), losing the cell's run_data.json.
+    pod=$(kubectl get pods -l "io.kompose.service=$VICTIM_DEPLOYMENT,overflow!=true" -o json 2>/dev/null \
+          | jq -r '[.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)]
+                   | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty' 2>/dev/null)
     if [[ -z "$pod" ]]; then
         s3_log "  WARNING: run_data capture skipped (no running victim pod found)"
         return 0
@@ -851,7 +901,13 @@ capture_victim_run_data() {
     [[ -n "$ended_ns" ]] && ended_s=$(( ended_ns / 1000000000 ))
     while :; do
         kubectl exec "$pod" -- cat "/data/run_data_${svc}_iter1.json" > "$out" 2>/dev/null || true
-        [[ -n "$ended_s" && -s "$out" ]] || break
+        if [[ ! -s "$out" ]]; then
+            # an empty read (transient exec failure, or the first 30 s flush not yet written) used to end the
+            # capture at once and lose the whole file (c6320 2026-11-10): retry until the deadline instead
+            if [[ $(date +%s) -ge $deadline ]]; then break; fi
+            sleep 5; continue
+        fi
+        [[ -n "$ended_s" ]] || break
         last_s=$(jq -r '.samples[-1].timestamp // empty | sub("\\.[0-9]+"; "") | fromdateiso8601' "$out" 2>/dev/null || true)
         if [[ -n "$last_s" && "$last_s" -ge "$ended_s" ]]; then
             break

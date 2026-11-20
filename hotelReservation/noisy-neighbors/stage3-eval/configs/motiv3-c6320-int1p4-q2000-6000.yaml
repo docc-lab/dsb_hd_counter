@@ -1,0 +1,49 @@
+# Common-quiet-load variant (2026-11-11): quiet phase 2000 rps (as the extrinsic scenario) + 4000 extra from t = 20 s = 6000 offered.
+# 1-P intrinsic variant for hc-grow1 (2026-11-10): victim threads 4 (own) + 6 (shared with the burner), GOMAXPROCS 2.
+# c6320 variant (Clemson "icelake-perf1", 2026-11-10, 2x E5-2683 v3, SMT on, 2.0 GHz pinned): victim threads 4,6 (siblings 32,34).
+# Motivation pass 3, intrinsic steady overload (2026-11-08): the SAME 2-P victim
+# as the extrinsic config (threads 18,19, HC Primary pool 18,19), overloaded
+# through the frontend chain (reservation x3, rate/profile/geo/recommendation x2,
+# frontend x3 in the manifests; the 512-connection driver still caps near 18k). No aggressor load; the
+# SN/SS co-tenants are deploy-only. The HC Secondary is the hc-secondary-burner pod
+# (run-motiv3.sh BURNER=1), present in every arm.
+#
+# Run with ARM_OFFSET_S=2: the mitigation is enabled from the start of the run, so
+# the quiet phase (0-20 s) shows what HC harvests from an idle victim (~1.7 cores
+# to the burner) and the overload (20-140 s) shows it handing everything back
+# while the p50 stays at the overload level; forced replicas (rep*f) exist before
+# the overload begins, so this is a capacity comparison at equal budget.
+
+experiment:
+  name: motiv3-c6320-int1p4-q2000-6000
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen:
+      rps: 2000
+      shape: exp
+      extra: {rps: 4000, shape: exp, start_offset_s: 20}   # 6000 offered; quiet phase 2000 rps = the extrinsic victim load (user 2026-11-11: same quiet load in both scenarios)
+  socialNetwork:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 0}    # deploy-only co-tenants, no load
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  cpu_set: "4,6,8,10"   # hc-grow3: thread 4 own + 6,8,10 shared with the burner (GOMAXPROCS 4, search limit 3 -> 4)
+  score_log: true
+aggressors:
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

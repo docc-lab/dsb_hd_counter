@@ -49,6 +49,10 @@ P3B = [(80, 90), (100, 110), (120, 130)]
 CPU_GROUPS = {"victim 18-20": [18, 19, 20], "siblings 2-4": [2, 3, 4],
               "replica 21-29": list(range(21, 30)), "rest": [0, 1] + list(range(5, 14)) + [16, 17],
               "daemons 14,15": [14, 15]}
+if os.environ.get("MOTIV_LAYOUT") == "c6320":   # Clemson c6320 (2026-11-10): SMT on, socket 0 = even ids, sibling N+28
+    CPU_GROUPS = {"victim 18-20": [4, 6], "siblings 2-4": [32, 34],
+                  "replica 21-29": [8, 10, 12, 14, 16, 18, 20, 22], "rest": [0, 2] + list(range(28, 32)) + list(range(36, 52, 2)),
+                  "daemons 14,15": [24, 26]}
 
 
 def ts_epoch(s):
@@ -66,7 +70,7 @@ def wmean(vals, wts):
 
 
 def load_run(path):
-    """-> list of (t_rel_s, request_count, proc_p50, proc_p90, tot_p50, tot_p90) in ms/us."""
+    """-> list of (t_epoch_s, request_count, proc_p50, proc_p90, tot_p50, tot_p90, proc_p99, tot_p99) in us/ms."""
     j = json.load(open(path))
     out = []
     for s in j.get("samples", []):
@@ -76,17 +80,20 @@ def load_run(path):
             continue
         pt, tt = tw.get("processing_time") or {}, tw.get("total_time") or {}
         out.append((ts_epoch(s["timestamp"]), n, pt.get("p50_ns", 0) / 1e3, pt.get("p90_ns", 0) / 1e3,
-                    tt.get("p50_ns", 0) / 1e6, tt.get("p90_ns", 0) / 1e6))
+                    tt.get("p50_ns", 0) / 1e6, tt.get("p90_ns", 0) / 1e6,
+                    pt.get("p99_ns", 0) / 1e3, tt.get("p99_ns", 0) / 1e6))
     return out
 
 
 def lat_stats(rows, t0, spans):
     sel = [r for r in rows if in_any(r[0] - t0, spans)]
     if not sel:
-        return dict(n=0, proc50=float("nan"), proc90=float("nan"), tot50=float("nan"), tot90=float("nan"))
+        return dict(n=0, proc50=float("nan"), proc90=float("nan"), tot50=float("nan"), tot90=float("nan"),
+                    proc99=float("nan"), tot99=float("nan"))
     w = [r[1] for r in sel]
     return dict(n=sum(w), proc50=wmean([r[2] for r in sel], w), proc90=wmean([r[3] for r in sel], w),
-                tot50=wmean([r[4] for r in sel], w), tot90=wmean([r[5] for r in sel], w))
+                tot50=wmean([r[4] for r in sel], w), tot90=wmean([r[5] for r in sel], w),
+                proc99=wmean([r[6] for r in sel], w), tot99=wmean([r[7] for r in sel], w))
 
 
 def parse_wrk2_blocks(path):
@@ -294,15 +301,20 @@ def main():
     ap.add_argument("--slo-total", type=float, default=1.5, help="SLO: service total p90 armed/p1 <= this")
     ap.add_argument("--phase-cores", action="store_true")
     ap.add_argument("--burst-s", type=float, default=10.0, help="aggressor burst length (window = [start, start+burst))")
-    ap.add_argument("--period", type=float, default=20.0, help="burst period (bursts start at 20, 20+period, ...)")
+    ap.add_argument("--period", type=float, default=20.0, help="burst period (bursts start at --burst-start, +period, ...)")
+    ap.add_argument("--burst-start", type=float, default=20.0, help="first aggressor burst (s); pass 3: 30")
+    ap.add_argument("--p1-end", type=float, default=20.0, help="end of the quiet phase p1 (s); pass 3: 30")
+    ap.add_argument("--duration", type=float, default=140.0, help="run length (s); pass 3: 260")
     ap.add_argument("--steady", action="store_true", help="steady contention: p2 = 30-80 s, armed = ARM+10 .. 140 s")
     ap.add_argument("--csv")
     args = ap.parse_args()
-    global P2B, P3B
+    global P1, P2B, P3B
+    P1 = [(2, args.p1_end)]
     if args.steady:
-        P2B, P3B = [(30, 80)], [(args.arm + 10, 140)]
+        P2B, P3B = [(args.p1_end + 10, args.arm)], [(args.arm + 10, args.duration)]
     else:
-        starts = [20 + i * args.period for i in range(int(120 / args.period) + 1) if 20 + i * args.period < 140]
+        starts = [args.burst_start + i * args.period for i in range(int(args.duration / args.period) + 1)
+                  if args.burst_start + i * args.period < args.duration]
         P2B = [(t, t + args.burst_s) for t in starts if t < args.arm]
         P3B = [(t, t + args.burst_s) for t in starts if t >= args.arm]
 

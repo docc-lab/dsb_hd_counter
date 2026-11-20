@@ -1,0 +1,89 @@
+# c6320 variant (2026-11-10): node-3 replicas on one hyperthread per core = even ids 4-26 of socket 0; siblings 32-54 carry the load dial.
+# GENERATED VARIANT for the motivation pass 3 (stage3-eval/run-motiv3.sh copies
+# one of motiv2/overflow-*.yaml over kubernetes/search/search-overflow-deployment.yaml
+# before each run; hr_deploy re-applies that file every run).
+# Placement: node-3 reserved for replicas (tainted, no DSB or aggressor-side pods),
+# CPU_SET = threads 18-29 = one hyperthread of each core 2-13; their siblings 2-13
+# carry the node-3 load dial (motiv2/node3-load.yaml: quiet / medium / contended).
+# Node-3 runs SMT on, 2.4 GHz pinned, like node-4. Up to four 3-P replicas get their
+# own threads; six 2-P replicas (rep6f) get their own threads too. Replicas are 2-P,
+# like the victim. Pods carry io.kompose.service=search so they register in Consul
+# as srv-search like the victim and the frontend round-robins across all of them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    io.kompose.service: search
+    overflow: "true"
+  name: search-overflow
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      io.kompose.service: search
+      overflow: "true"
+  template:
+    metadata:
+      labels:
+        io.kompose.service: search
+        overflow: "true"
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/hotel-reserv-search: unconfined
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-3
+      tolerations:
+        - {key: dedicated, operator: Equal, value: special, effect: NoSchedule}
+      # The sampler flushes its run file every 30 s (no SIGTERM handler), so a
+      # scaled-in pod is held 32 s in preStop (no requests reach it any more) to get
+      # one flush after its last request; /data is a per-pod host-path dir on
+      # node-3 (/tmp/overflow-data/<pod>) so the file survives the pod and
+      # run-motiv3.sh fetches every replica's data after the run.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: hotel-reserv-search
+          image: docclabgroup/search-online:v2.3.0
+          lifecycle:
+            preStop:
+              exec: {command: ["sleep", "32"]}
+          ports:
+            - {name: rpc,     containerPort: 8082}
+            - {name: score,   containerPort: 7900}
+            - {name: instrum, containerPort: 7901}
+          resources:
+            requests:
+              cpu: "1"
+            limits:
+              cpu: "2"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: cpu-devices,  mountPath: /dev/cpu, readOnly: true}
+            - {name: gordion-conf, mountPath: /etc/gordion-conf, readOnly: true}
+            - {name: overflow-data, mountPath: /data, subPathExpr: $(POD_NAME)}
+          # No command override: the image CMD runs taskset -c $CPU_SET.
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: GOMAXPROCS,               value: "2"}   # 2-P replicas, like the 2-P victim
+            # c6320 (Haswell, 4 programmable counters per thread, NMI watchdog off): the image default 14-event
+            # set does not open (dTLB-load-misses: EINVAL -> CrashLoopBackOff); same reduced set as the victim
+            - {name: PERF_EVENTS,              value: "cycles,ref-cycles,instructions,LLC-loads,LLC-load-misses,branch-instructions,branch-misses,page-faults"}
+            - {name: CPU_SET,                  value: "4,6,8,10,12,14,16,18,20,22,24,26"}   # node-3, one HT per core 2-13
+            - {name: ENABLE_WINDOWED_SAMPLING, value: "true"}
+            - {name: GORDION_SCORE_SOURCE,     value: "onnx"}
+            - {name: GORDION_CONFIG,           value: "/etc/gordion-conf/gordion.json"}
+      volumes:
+        - name: cpu-devices
+          hostPath:
+            path: /dev/cpu
+            type: Directory
+        - name: overflow-data
+          hostPath:
+            path: /tmp/overflow-data
+            type: DirectoryOrCreate
+        - name: gordion-conf
+          configMap:
+            name: gordion-search
+            optional: true
+      restartPolicy: Always

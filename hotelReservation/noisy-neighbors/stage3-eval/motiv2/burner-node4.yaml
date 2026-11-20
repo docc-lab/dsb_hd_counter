@@ -1,0 +1,64 @@
+# HC Secondary tenant for the intrinsic scenario of the motivation pass 3: a
+# best-effort batch job on node-4 that wants more CPU than it owns. Eight busy
+# workers pinned to threads 8,9,10,11 (HC_SECONDARY_CPULIST of arms/hc-int.env; their
+# siblings 24-27 are unused, so it never touches the victim on 18-20 / siblings 2-4).
+# Labelled gordion-aggr=true so that (a) the orchestrator treats it like an aggressor
+# pod (cpuset.cpus = the pool, superset of 8-11) and (b) the hc actuator registers it
+# as HC's Secondary: with HC on, the Balancer widens the workers' affinity to the
+# victim's idle threads and the harvest becomes visible as CPU this pod consumes
+# on 18-20. Present in EVERY intrinsic arm (none, hc-int, rep*f) so the baseline is
+# identical; run-motiv3.sh BURNER=1 applies it before a cell.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hc-secondary-burner
+  labels: {app: hc-secondary-burner, gordion-aggr: "true"}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: hc-secondary-burner}
+  template:
+    metadata:
+      labels: {app: hc-secondary-burner, gordion-aggr: "true"}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-4
+      tolerations:
+        - {key: dedicated, operator: Equal, value: special, effect: NoSchedule}
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: burner
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DUTY, value: "100"}
+            - {name: CPUS, value: "8,9,10,11"}
+            - {name: WORKERS, value: "8"}     # 8 workers on 4 threads: always wants more than it owns
+          resources:
+            requests: {cpu: "100m"}
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os, time, multiprocessing as mp
+              duty = float(os.environ.get("DUTY", "100"))
+              cpus = [int(c) for c in os.environ["CPUS"].split(",") if c]
+              workers = os.environ.get("WORKERS", "")
+              period = 0.02
+              def work(aff):
+                  os.sched_setaffinity(0, aff)
+                  if duty >= 100:
+                      while True:
+                          pass
+                  on = period * duty / 100.0
+                  while True:
+                      t = time.perf_counter()
+                      while time.perf_counter() - t < on:
+                          pass
+                      time.sleep(period - on)
+              affs = [{c} for c in cpus] if not workers else [set(cpus)] * int(workers)
+              ps = [mp.Process(target=work, args=(a,), daemon=True) for a in affs]
+              for p in ps:
+                  p.start()
+              print("load: duty", duty, "workers", len(ps), "cpus", cpus, flush=True)
+              for p in ps:
+                  p.join()
