@@ -20,6 +20,7 @@
 #include "../utils.h"
 #include "../utils_thrift.h"
 #include "UniqueIdHandler.h"
+#include "../gordion/Gordion.h"
 
 using apache::thrift::protocol::TBinaryProtocolFactory;
 using apache::thrift::server::TThreadedServer;
@@ -49,10 +50,15 @@ int main(int argc, char *argv[]) {
   LOG(info) << "machine_id = " << machine_id;
 
   std::mutex thread_lock;
-  std::shared_ptr<TServerSocket> server_socket = get_server_socket(config_json, "0.0.0.0", port);
+  // Phase J2: the receive-timestamp server socket (SO_TIMESTAMPNS on accepted connections; Lat starts at the segment's
+  // arrival) unless SSL is configured, in which case the stock socket
+  std::shared_ptr<TServerSocket> server_socket =
+      config_json["ssl"]["enabled"] ? get_server_socket(config_json, "0.0.0.0", port)
+                                    : std::static_pointer_cast<TServerSocket>(std::make_shared<gordion::TServerSocketTS>("0.0.0.0", port));
+  // Addendum F: gordion recorder on the processor (thread = request; no downstream call)
   TThreadedServer server(
-      std::make_shared<UniqueIdServiceProcessor>(
-          std::make_shared<UniqueIdHandler>(&thread_lock, machine_id)),
+      gordion::Attach(std::make_shared<UniqueIdServiceProcessor>(
+          std::make_shared<UniqueIdHandler>(&thread_lock, machine_id)), "unique-id", {"ComposeUniqueId"}),
       server_socket,
       std::make_shared<TFramedTransportFactory>(),
       std::make_shared<TBinaryProtocolFactory>());

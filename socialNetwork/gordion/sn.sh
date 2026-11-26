@@ -126,8 +126,12 @@ deploy_svc() {
   local cmd="[\"$bin\"]"
   [ "$pin" = "1" ] && cmd="[\"taskset\",\"-c\",\"$CPUSET\",\"$bin\"]"
   local cname; cname=$(kubectl -n $NS get deployment $svc -o jsonpath='{.spec.template.spec.containers[0].name}')
+  # HOSTPID=1 (Phase G (v)): the SUT pod shares the host PID namespace so the recorder's rawt thread ids are the
+  # host tids the scheduler probe sees (inside a container PID namespace gettid() returns namespace ids)
+  local hp=""; [ "${HOSTPID:-0}" = "1" ] && [ "$pin" = "1" ] && hp="\"hostPID\":true,"
   kubectl -n $NS patch deployment $svc -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"gordion/run\":\"$run\"}},\"spec\":{
-    \"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},
+    \"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},$hp
+    \"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"}],
     \"volumes\":[{\"name\":\"gordion\",\"hostPath\":{\"path\":\"$hd\",\"type\":\"DirectoryOrCreate\"}}],
     \"containers\":[{\"name\":\"$cname\",\"command\":$cmd,\"args\":[],
       \"env\":[{\"name\":\"GORDION_OUT\",\"value\":\"/data/$run-$svc.jsonl\"},{\"name\":\"GORDION_WINDOW_MS\",\"value\":\"$WINDOW_MS\"},
@@ -184,10 +188,11 @@ cmd_collect() {
   local c0=${CPUSET%%[-,]*}
   local mhz; mhz=$(ssh -o BatchMode=yes $NODE "grep MHz /proc/cpuinfo | sed -n '$((c0 + 1))p' | awk '{print \$4}'" 2>/dev/null || echo 0)
   local idle; idle=$(ssh -o BatchMode=yes $NODE "pgrep -c -f 'chrt --idle' 2>/dev/null || true")
+  local gov; gov=$(ssh -o BatchMode=yes $NODE "cat /sys/devices/system/cpu/cpu$c0/cpufreq/scaling_governor 2>/dev/null || echo none")
   cat > $RESULTS/$run/meta.json <<EOF
 {"run":"$run","testbed":"socialnetwork","sut":"$SUT","node":"$NODE","cpuset":"$CPUSET","tag":"$TAG","window_ms":$WINDOW_MS,"raw":"$RAW","disable":"$DISABLE",
- "wlgen_node":"$WLGEN_NODE","wlgen_cpus":"$WLGEN_CPUS","stressor":"$STRESSOR","cpufreq":"none (hardware P-states; /proc/cpuinfo core $c0 = $mhz MHz at collect)","sched_idle_fillers":"${idle:-0}",
- "nominal_mhz":2400,
+ "wlgen_node":"$WLGEN_NODE","wlgen_cpus":"$WLGEN_CPUS","stressor":"$STRESSOR","cpufreq":"$gov (/proc/cpuinfo core $c0 = $mhz MHz at collect)","sched_idle_fillers":"${idle:-0}",
+ "nominal_mhz":${NOMINAL_MHZ:-2400},"host":"$(hostname -f)","cpu_model":"$(ssh -o BatchMode=yes $NODE "lscpu | sed -n 's/^Model name: *//p'" 2>/dev/null)",
  "placement":"$(kubectl -n $NS get pods -o wide | grep -E '^(home-timeline-service|user-timeline-service|post-storage-service|compose-post-service|social-graph-service|nginx-thrift)-' | awk '{printf "%s=%s ", $1, $7}')",
  "collected":"$(date -Is)"}
 EOF

@@ -19,6 +19,8 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 )
@@ -69,8 +71,31 @@ func ServerOptions(protoService string, methods []string) []grpc.ServerOption {
 	for i, m := range methods {
 		idx["/"+protoService+"/"+m] = int32(i)
 	}
+	var raw atomic.Value // map[string]int32 by raw full method name (-1: not recorded), copied on write
+	var rawMu sync.Mutex
+	lookup := func(full string) (int32, bool) {
+		if c, _ := raw.Load().(map[string]int32); c != nil {
+			if m, ok := c[full]; ok {
+				return m, m >= 0
+			}
+		}
+		rawMu.Lock()
+		defer rawMu.Unlock()
+		m, ok := idx[tapKeyOf(full)]
+		if !ok {
+			m = -1
+		}
+		old, _ := raw.Load().(map[string]int32)
+		c := make(map[string]int32, len(old)+1)
+		for k, v := range old {
+			c[k] = v
+		}
+		c[full] = m
+		raw.Store(c)
+		return m, ok
+	}
 	si := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		m, ok := idx[tapKeyOf(info.FullMethod)]
+		m, ok := lookup(info.FullMethod)
 		if !ok {
 			return handler(ctx, req)
 		}

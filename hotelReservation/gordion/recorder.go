@@ -27,6 +27,9 @@
 //	 "gate":<admission gate capacity (G-A), absent when the gate is off>,
 //	 "sched":[p50,p90,count] <runtime scheduler latency of the window (G-B, ns): time goroutines
 //	          spent runnable before running, from runtime/metrics "/sched/latencies:seconds">,
+//	 "rt":[gc_cpu_ns,gc_stw_pause_ns,mutex_wait_ns] <Phase G: GC CPU time (/cpu/classes/gc/total),
+//	          stop-the-world GC pause time (/sched/pauses/total/gc) and goroutine mutex wait
+//	          (/sync/mutex/wait/total) of the process during this window, ns; 0 where the Go version lacks the metric>,
 //	 "ep":{"Ep000":[a,n,p50,p90,p99,mean,max,pp50,pp90,q50,q90,x50,x90,ns,f50,f90,g50,g90],...}}
 //
 // g = admission-gate wait (Phase D, G-A): with GORDION_GATE on (default) the
@@ -69,6 +72,31 @@
 //	                   for offline analysis
 //	GORDION_GATE       "0" disables the admission gate (G-A); default on for server recorders
 //	GORDION_GATE_CAP   gate capacity (default GOMAXPROCS-1, read when the first request arrives)
+//
+// Phase K5 (RESULTS-K 5, the overhead ladder): the recorder's parts can be switched while the service runs, so each one
+// can be measured alone against the same process.
+//
+//	GORDION_INTERCEPT  per-request work: "full" (default) = count,slot,time; or a comma list of count (arrivals and
+//	                   completions per endpoint, "nc" = completions counted without timers), slot (the busy-handler
+//	                   integral, "slot" = handler-ns between Begin and End in the window), time (the latency timers,
+//	                   percentiles and the admission gate; implies count); "off" = none (a map lookup and an atomic
+//	                   load per request remain)
+//	GORDION_READS      per-window reads: comma list of cpu (getrusage), mhz (sysfs cpufreq), q (runtime/metrics
+//	                   scheduler latencies and mutex wait), g (GC CPU and stop-the-world pauses); default all four;
+//	                   "none" = no reads
+//	GORDION_CTL        a file polled once per second; a line "intercept=<list> reads=<list>" replaces both settings
+//	                   (every change is logged as an {"event":"ctl"} line). With both off the window ticker stops.
+//
+// K5 follow-up (RESULTS-K 5.8): the timer path in production mode records no per-request completion. A timed request
+// adds one relaxed atomic increment to a cumulative log-bucket histogram (8 sub-buckets per octave, about ±4.5 %); the
+// collector reads its per-window delta each tick and writes "lat":[n, p50, p90, p99] (ns, timed requests only). Only
+// 1 in GORDION_SAMPLE requests is timed (default 8; 1 = every request), decided at the transport tap so a timed
+// request still starts at its arrival. Untimed requests allocate nothing and take no lock (count and slot only).
+//
+//	GORDION_DIAG       "1" keeps the full per-request stream instead (every request timed, its completion sent to the
+//	                   collector, per-window sorted percentiles in "all"/"ep", the caller's send stamp); GORDION_RAW=1
+//	                   implies it
+//	GORDION_SAMPLE     time 1 in N requests in production mode (default 8); the control file's "sample=N" changes it
 package gordion
 
 import (
@@ -76,6 +104,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/bits"
 	"os"
 	"runtime"
 	"runtime/metrics"
@@ -107,9 +136,31 @@ type tapEntry struct {
 }
 
 var (
-	tapMu  sync.RWMutex
-	tapMap = map[string]tapEntry{} // "/ProtoService/Method" -> recorder, index
+	tapMu    sync.RWMutex
+	tapMap   = map[string]tapEntry{} // "/ProtoService/Method" -> recorder, index
+	tapCache atomic.Value            // map[string]tapEntry keyed by the raw full method name (rec nil: not recorded)
 )
+
+// tapLookup resolves a raw gRPC full method name without a lock or an allocation once the name has been seen: the
+// cache is copied on write (a miss takes tapMu once per distinct name).
+func tapLookup(full string) (tapEntry, bool) {
+	if m, _ := tapCache.Load().(map[string]tapEntry); m != nil {
+		if e, ok := m[full]; ok {
+			return e, e.rec != nil
+		}
+	}
+	tapMu.Lock()
+	defer tapMu.Unlock()
+	e := tapMap[tapKeyOf(full)]
+	old, _ := tapCache.Load().(map[string]tapEntry)
+	m := make(map[string]tapEntry, len(old)+1)
+	for k, v := range old {
+		m[k] = v
+	}
+	m[full] = e
+	tapCache.Store(m)
+	return e, e.rec != nil
+}
 
 // TapOption is the server option that routes transport-level arrivals to the
 // recorders registered through GetRecorder; pass it to grpc.NewServer.
@@ -133,13 +184,15 @@ func tapKeyOf(full string) string {
 // before the handler goroutine exists: it counts the arrival and stamps the
 // arrival time so Begin can include the scheduling wait.
 func tapHandle(ctx context.Context, info *tap.Info) (context.Context, error) {
-	tapMu.RLock()
-	e, ok := tapMap[tapKeyOf(info.FullMethodName)]
-	tapMu.RUnlock()
-	if !ok {
+	e, ok := tapLookup(info.FullMethodName)
+	if !ok || atomic.LoadInt32(&e.rec.mode)&iTime == 0 {
 		return ctx, nil
 	}
-	atomic.AddInt64(&e.rec.arrivals[e.m], 1)
+	if e.rec.diag {
+		atomic.AddInt64(&e.rec.arrivals[e.m], 1)
+	} else if !e.rec.sample() { // production: Begin counts the arrival; only the timed requests carry a stamp
+		return ctx, nil
+	}
 	return context.WithValue(ctx, arrivalKey{}, &arrival{t: time.Now().UnixNano(), rec: e.rec, m: e.m}), nil
 }
 
@@ -158,6 +211,8 @@ var statePool = sync.Pool{New: func() any { return &reqState{} }}
 
 // Token identifies an in-flight request between Begin and End.
 type Token struct {
+	lite   int32 // K5: the interceptor parts in force when the request began (iCount | iSlot | iTime)
+	timed  bool  // production mode: this request is one of the sampled ones (its latency goes to the histogram)
 	start  int64
 	queue  int64
 	pre    int64 // ns from the client's send stamp to start (may be negative across hosts); noPre if the caller sent none
@@ -214,14 +269,31 @@ type Recorder struct {
 	lastCPU  int64 // process CPU ns at the previous flush (0 = none yet)
 	disabled bool
 	raw      bool
+	diag     bool          // GORDION_DIAG (or GORDION_RAW): the full per-request stream
+	tapped   bool          // registered with the transport tap (gRPC): the tap decides which requests are timed
+	sampleN  uint32        // atomic: time 1 in sampleN requests in production mode
+	seq      uint32        // atomic: request sequence for the 1-in-N choice
+	hist     [histN]uint64 // atomic: cumulative timed-request latency histogram (production mode)
+	histPrev [histN]uint64 // the collector's previous reading
 
 	gateOnce sync.Once
 	gate     chan struct{} // admission gate (G-A): buffered channel used as a semaphore; nil = off
 	gateCap  int
-	sched    *schedLat // runtime scheduler latency (G-B); nil = unavailable
+	sched    *schedLat   // runtime scheduler latency (G-B); nil = unavailable
+	rt       *rtCounters // Phase G: GC CPU / STW pause / mutex wait per window; nil = unavailable
 
 	arrivals []int64 // atomic, per method, reset every window
 	dropped  int64   // atomic
+
+	// K5: switches and the counters they feed
+	mode     int32   // atomic: iCount | iSlot | iTime
+	reads    int32   // atomic: rCPU | rMHz | rQ | rG
+	ctlPath  string  // GORDION_CTL
+	ctlLast  string  // last content applied
+	slotAcc  int64   // atomic: busy-handler integral, sum of -begin and +end (ns)
+	inflight int64   // atomic: handlers between Begin and End
+	ncomp    []int64 // atomic, per method: completions counted without timers (count mode), reset every window
+	nerr     []int64 // atomic, per method: their errors
 	ch       chan completion
 	out      *bufio.Writer
 	outFile  *os.File
@@ -254,6 +326,8 @@ func GetRecorder(serviceName string, protoService string, methods []string) (*Re
 		for i, m := range methods {
 			tapMap["/"+protoService+"/"+m] = tapEntry{rec: r, m: int32(i)}
 		}
+		r.tapped = true
+		tapCache.Store(map[string]tapEntry{}) // names cached as unrecorded may belong to this recorder now
 		tapMu.Unlock()
 	}
 	return r, nil
@@ -269,6 +343,10 @@ func newRecorderOut(serviceName string, methods []string, dest string, disabled 
 		methods:  methods,
 		windowNs: int64(100 * time.Millisecond),
 		arrivals: make([]int64, len(methods)),
+		ncomp:    make([]int64, len(methods)),
+		nerr:     make([]int64, len(methods)),
+		mode:     iCount | iSlot | iTime,
+		reads:    rCPU | rMHz | rQ | rG,
 		ch:       make(chan completion, 1<<16),
 		stopCh:   make(chan struct{}),
 	}
@@ -277,6 +355,20 @@ func newRecorderOut(serviceName string, methods []string, dest string, disabled 
 		return r, nil
 	}
 	r.raw = os.Getenv("GORDION_RAW") == "1"
+	r.diag = r.raw || os.Getenv("GORDION_DIAG") == "1"
+	r.sampleN = 8
+	if v := os.Getenv("GORDION_SAMPLE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			r.sampleN = uint32(n)
+		}
+	}
+	if v, ok := os.LookupEnv("GORDION_INTERCEPT"); ok {
+		r.mode = parseIntercept(v)
+	}
+	if v, ok := os.LookupEnv("GORDION_READS"); ok {
+		r.reads = parseReads(v)
+	}
+	r.ctlPath = os.Getenv("GORDION_CTL")
 	if v := os.Getenv("GORDION_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
 		if err != nil || ms <= 0 {
@@ -374,7 +466,28 @@ func (r *Recorder) Begin(ctx context.Context, m int) (context.Context, Token) {
 	if r.disabled {
 		return ctx, Token{method: -1}
 	}
+	md := atomic.LoadInt32(&r.mode)
+	if md == 0 {
+		return ctx, Token{method: -1}
+	}
+	if md&iTime == 0 { // K5: counting and/or the slot integral only, no timers
+		if md&iCount != 0 {
+			atomic.AddInt64(&r.arrivals[m], 1)
+		}
+		if md&iSlot != 0 {
+			atomic.AddInt64(&r.inflight, 1)
+			atomic.AddInt64(&r.slotAcc, -time.Now().UnixNano())
+		}
+		return ctx, Token{method: int32(m), lite: md}
+	}
+	if !r.diag {
+		return r.beginProd(ctx, m, md)
+	}
 	now := time.Now().UnixNano()
+	if md&iSlot != 0 {
+		atomic.AddInt64(&r.inflight, 1)
+		atomic.AddInt64(&r.slotAcc, -now)
+	}
 	start, queue := now, int64(0)
 	if a, ok := ctx.Value(arrivalKey{}).(*arrival); ok && a.rec == r && int(a.m) == m {
 		start = a.t
@@ -398,7 +511,130 @@ func (r *Recorder) Begin(ctx context.Context, m int) (context.Context, Token) {
 	// the service's own CPU pinning (bigsvc sets it from BIGSVC_CPUSET after start-up).
 	r.gateOnce.Do(r.initGate)
 	st.acquireGate(ctx)
-	return ctx, Token{start: start, queue: queue, pre: pre, method: int32(m), st: st}
+	return ctx, Token{start: start, queue: queue, pre: pre, method: int32(m), st: st, lite: md}
+}
+
+// sample reports whether this request is one of the 1-in-N timed ones (production mode).
+func (r *Recorder) sample() bool {
+	n := atomic.LoadUint32(&r.sampleN)
+	return n <= 1 || atomic.AddUint32(&r.seq, 1)%n == 0
+}
+
+// beginProd is Begin in production mode: every request is counted (and enters the slot integral); a timed one gets a
+// request state (for the time blocked downstream) and its start, from the tap's stamp when the tap chose it. With the
+// admission gate on, every request needs the state, timed or not.
+func (r *Recorder) beginProd(ctx context.Context, m int, md int32) (context.Context, Token) {
+	atomic.AddInt64(&r.arrivals[m], 1)
+	var now int64
+	if md&iSlot != 0 {
+		now = time.Now().UnixNano()
+		atomic.AddInt64(&r.inflight, 1)
+		atomic.AddInt64(&r.slotAcc, -now)
+	}
+	timed, start := false, int64(0)
+	if a, ok := ctx.Value(arrivalKey{}).(*arrival); ok && a.rec == r && int(a.m) == m {
+		timed, start = true, a.t
+	} else if !r.tapped && r.sample() {
+		timed = true
+	}
+	r.gateOnce.Do(r.initGate)
+	if !timed && r.gate == nil {
+		return ctx, Token{method: int32(m), lite: md}
+	}
+	if timed && start == 0 {
+		if now == 0 {
+			now = time.Now().UnixNano()
+		}
+		start = now
+	}
+	st := statePool.Get().(*reqState)
+	atomic.StoreInt32(&st.depth, 0)
+	atomic.StoreInt64(&st.pauseStart, 0)
+	atomic.StoreInt64(&st.pausedTotal, 0)
+	st.rec = r
+	atomic.StoreInt32(&st.gateHeld, 0)
+	atomic.StoreInt64(&st.gateNs, 0)
+	ctx = context.WithValue(ctx, ctxKey{}, st)
+	st.acquireGate(ctx)
+	return ctx, Token{start: start, method: int32(m), st: st, lite: md, timed: timed}
+}
+
+// endProd is End in production mode: the completion is counted, a timed request's latency (arrival to End, less the
+// time blocked downstream) goes to the histogram with one atomic add.
+func (r *Recorder) endProd(tok Token, isErr bool) {
+	t1 := time.Now().UnixNano()
+	if tok.lite&iSlot != 0 {
+		atomic.AddInt64(&r.slotAcc, t1)
+		atomic.AddInt64(&r.inflight, -1)
+	}
+	atomic.AddInt64(&r.ncomp[tok.method], 1)
+	if isErr {
+		atomic.AddInt64(&r.nerr[tok.method], 1)
+	}
+	if tok.st == nil {
+		return
+	}
+	tok.st.releaseGate()
+	if tok.timed {
+		lat := t1 - tok.start - atomic.LoadInt64(&tok.st.pausedTotal)
+		atomic.AddUint64(&r.hist[histIdx(lat)], 1)
+	}
+	tok.st.rec = nil
+	statePool.Put(tok.st)
+}
+
+// the production histogram: 8 sub-buckets per octave of nanoseconds, values below 8 ns exact
+const (
+	histBits = 3
+	histN    = 64 << histBits
+)
+
+func histIdx(v int64) int {
+	if v < 1<<histBits {
+		if v < 0 {
+			return 0
+		}
+		return int(v)
+	}
+	e := bits.Len64(uint64(v)) - 1
+	sub := (uint64(v) >> uint(e-histBits)) & (1<<histBits - 1)
+	return (e-histBits+1)<<histBits | int(sub)
+}
+
+// histMid is the middle of bucket i in ns.
+func histMid(i int) int64 {
+	if i < 1<<histBits {
+		return int64(i)
+	}
+	e := i>>histBits + histBits - 1
+	sub := int64(i & (1<<histBits - 1))
+	return (1<<histBits+sub)<<uint(e-histBits) + (int64(1)<<uint(e-histBits))/2
+}
+
+// histWindow returns the timed requests since the previous call and their p50, p90 and p99 (ns).
+func (r *Recorder) histWindow() (n uint64, p50, p90, p99 int64) {
+	var d [histN]uint64
+	for i := range d {
+		c := atomic.LoadUint64(&r.hist[i])
+		d[i] = c - r.histPrev[i]
+		r.histPrev[i] = c
+		n += d[i]
+	}
+	if n == 0 {
+		return 0, 0, 0, 0
+	}
+	q := [3]uint64{(n + 1) / 2, (n*9 + 9) / 10, (n*99 + 99) / 100}
+	var out [3]int64
+	var acc uint64
+	k := 0
+	for i := 0; i < histN && k < 3; i++ {
+		acc += d[i]
+		for k < 3 && acc >= q[k] {
+			out[k] = histMid(i)
+			k++
+		}
+	}
+	return n, out[0], out[1], out[2]
 }
 
 // acquireGate takes a gate slot for the request (blocking; a cancelled ctx lets
@@ -504,7 +740,29 @@ func (r *Recorder) End(tok Token, isErr bool) {
 	if tok.method < 0 {
 		return
 	}
-	total := time.Now().UnixNano() - tok.start
+	if tok.lite&iTime == 0 { // K5: counting and/or the slot integral only
+		if tok.lite&iSlot != 0 {
+			atomic.AddInt64(&r.slotAcc, time.Now().UnixNano())
+			atomic.AddInt64(&r.inflight, -1)
+		}
+		if tok.lite&iCount != 0 {
+			atomic.AddInt64(&r.ncomp[tok.method], 1)
+			if isErr {
+				atomic.AddInt64(&r.nerr[tok.method], 1)
+			}
+		}
+		return
+	}
+	if !r.diag {
+		r.endProd(tok, isErr)
+		return
+	}
+	t1 := time.Now().UnixNano()
+	total := t1 - tok.start
+	if tok.lite&iSlot != 0 {
+		atomic.AddInt64(&r.slotAcc, t1)
+		atomic.AddInt64(&r.inflight, -1)
+	}
 	tok.st.releaseGate()
 	blocked := atomic.LoadInt64(&tok.st.pausedTotal)
 	gateNs := atomic.LoadInt64(&tok.st.gateNs)
@@ -588,11 +846,31 @@ func (r *Recorder) loop() {
 	buckets := make([]bucket, k)
 	ticker := time.NewTicker(time.Duration(r.windowNs))
 	defer ticker.Stop()
+	ctlTick := time.NewTicker(time.Second)
+	defer ctlTick.Stop()
+	running := true
+	if atomic.LoadInt32(&r.mode) == 0 && atomic.LoadInt32(&r.reads) == 0 {
+		ticker.Stop()
+		running = false
+	}
 	winStart := time.Now()
 	for {
 		select {
 		case c := <-r.ch:
 			r.add(buckets, c)
+		case <-ctlTick.C:
+			if r.ctlPath != "" {
+				r.pollCtl()
+			}
+			on := atomic.LoadInt32(&r.mode) != 0 || atomic.LoadInt32(&r.reads) != 0
+			if on && !running {
+				ticker.Reset(time.Duration(r.windowNs))
+				winStart = time.Now()
+				running = true
+			} else if !on && running {
+				ticker.Stop()
+				running = false
+			}
 		case <-ticker.C:
 			// drain whatever is already queued so the window is as complete as possible
 		drain:
@@ -732,8 +1010,23 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		arrivals += arr[i]
 	}
 	dropped := atomic.SwapInt64(&r.dropped, 0)
-	if arrivals == 0 && len(allTotal) == 0 && dropped == 0 {
-		// idle window: emit a heartbeat roughly once per second only
+	md, rd := atomic.LoadInt32(&r.mode), atomic.LoadInt32(&r.reads)
+	var nc, ec int64
+	ncs := make([]int64, len(buckets))
+	for i := range buckets {
+		ncs[i] = atomic.SwapInt64(&r.ncomp[i], 0)
+		nc += ncs[i]
+		ec += atomic.SwapInt64(&r.nerr[i], 0)
+	}
+	var slotNs int64 = -1
+	if md&iSlot != 0 {
+		n := atomic.LoadInt64(&r.inflight)
+		t := time.Now().UnixNano()
+		slotNs = atomic.SwapInt64(&r.slotAcc, -n*t) + n*t
+	}
+	if md != 0 && arrivals == 0 && len(allTotal) == 0 && dropped == 0 && nc == 0 && slotNs <= 0 {
+		// idle window: emit a heartbeat roughly once per second only (K5: with the interceptor off, every window
+		// carries the reads)
 		if (winStart.UnixNano()/r.windowNs)%(int64(time.Second)/r.windowNs) != 0 {
 			return
 		}
@@ -755,7 +1048,32 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 	sb.WriteString(strconv.FormatInt(errs, 10))
 	sb.WriteString(`,"drop":`)
 	sb.WriteString(strconv.FormatInt(dropped, 10))
-	if cpu := processCPUNs(); cpu >= 0 {
+	if md&iTime != 0 && !r.diag {
+		n, p50, p90, p99 := r.histWindow()
+		sb.WriteString(`,"lat":[`)
+		sb.WriteString(strconv.FormatUint(n, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(p50, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(p90, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(p99, 10))
+		sb.WriteString(`],"sample":`)
+		sb.WriteString(strconv.FormatUint(uint64(atomic.LoadUint32(&r.sampleN)), 10))
+	}
+	if (md&iTime == 0 || !r.diag) && md&iCount != 0 {
+		sb.WriteString(`,"nc":`)
+		sb.WriteString(strconv.FormatInt(nc, 10))
+		sb.WriteString(`,"ec":`)
+		sb.WriteString(strconv.FormatInt(ec, 10))
+	}
+	if slotNs >= 0 {
+		sb.WriteString(`,"slot":`)
+		sb.WriteString(strconv.FormatInt(slotNs, 10))
+	}
+	if rd&rCPU == 0 {
+		// K5: the cpu read is off
+	} else if cpu := processCPUNs(); cpu >= 0 {
 		// process CPU time (user+sys, ns) consumed during this window
 		if r.lastCPU > 0 {
 			sb.WriteString(`,"cpu":`)
@@ -763,7 +1081,9 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		}
 		r.lastCPU = cpu
 	}
-	if mhz := cpuFreqMHz(); mhz > 0 {
+	if rd&rMHz == 0 {
+		// K5: the frequency read is off
+	} else if mhz := cpuFreqMHz(); mhz > 0 {
 		// mean current frequency of the process's cores at the end of the window (sysfs cpufreq)
 		sb.WriteString(`,"mhz":`)
 		sb.WriteString(strconv.FormatInt(int64(mhz), 10))
@@ -772,10 +1092,25 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 		sb.WriteString(`,"gate":`)
 		sb.WriteString(strconv.Itoa(r.gateCap))
 	}
-	if r.sched == nil && !strings.HasSuffix(r.service, "@client") {
+	if r.sched == nil && rd&rQ != 0 && !strings.HasSuffix(r.service, "@client") {
 		r.sched = newSchedLat()
 	}
-	if r.sched != nil {
+	if r.rt == nil && rd&(rQ|rG) != 0 && !strings.HasSuffix(r.service, "@client") {
+		r.rt = newRTCounters()
+	}
+	if r.rt != nil && rd&(rQ|rG) != 0 {
+		// Phase G: G (GC CPU, STW pauses) and the Go half of Q (mutex wait), ns in this window (K5: each half only when
+		// its read is on; the other reads 0)
+		gc, stw, mw := r.rt.delta(rd&rG != 0, rd&rQ != 0)
+		sb.WriteString(`,"rt":[`)
+		sb.WriteString(strconv.FormatInt(gc, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(stw, 10))
+		sb.WriteByte(',')
+		sb.WriteString(strconv.FormatInt(mw, 10))
+		sb.WriteByte(']')
+	}
+	if r.sched != nil && rd&rQ != 0 {
 		// G-B: scheduler latency of every goroutine of the process during this window (ns)
 		p50, p90, n := r.sched.delta()
 		sb.WriteString(`,"sched":[`)
@@ -800,7 +1135,7 @@ func (r *Recorder) flush(winStart time.Time, buckets []bucket) {
 	sb.WriteString(`],"ep":{`)
 	first := true
 	for i := range buckets {
-		if arr[i] == 0 && len(buckets[i].total) == 0 {
+		if arr[i] == 0 && len(buckets[i].total) == 0 && ncs[i] == 0 {
 			continue
 		}
 		if !first {
@@ -829,4 +1164,173 @@ func (r *Recorder) Stop() {
 	if r.outFile != nil {
 		r.outFile.Close()
 	}
+}
+
+// rtCounters reads three cumulative runtime/metrics values and reports their per-window deltas (Phase G):
+// GC CPU seconds (all GC work, background workers included), stop-the-world GC pause seconds (sum of the pause
+// histogram, bucket upper edges) and the total time goroutines spent blocked on sync.Mutex / RWMutex.
+type rtCounters struct {
+	s         []metrics.Sample
+	sg, sq    []metrics.Sample // K5: the G half (GC CPU, pauses) and the Q half (mutex wait), read separately
+	gc, mw    float64
+	pauseCnts []uint64
+	pauseSum  float64
+}
+
+func newRTCounters() *rtCounters {
+	c := &rtCounters{s: []metrics.Sample{{Name: "/cpu/classes/gc/total:cpu-seconds"}, {Name: "/sched/pauses/total/gc:seconds"}, {Name: "/sync/mutex/wait/total:seconds"}}}
+	metrics.Read(c.s)
+	ok := false
+	for _, v := range c.s {
+		if v.Value.Kind() != metrics.KindBad {
+			ok = true
+		}
+	}
+	if !ok {
+		return nil
+	}
+	c.sg, c.sq = c.s[:2], c.s[2:]
+	c.gc, c.pauseSum, c.mw = c.read(true, true)
+	return c
+}
+
+// read returns the cumulative values (seconds); a missing metric reads as 0. K5: g and q choose which half is read
+// (the other half returns the previous values, so its delta is 0).
+func (c *rtCounters) read(g, q bool) (gc, pause, mw float64) {
+	gc, pause, mw = c.gc, c.pauseSum, c.mw
+	switch {
+	case g && q:
+		metrics.Read(c.s)
+	case g:
+		metrics.Read(c.sg)
+	case q:
+		metrics.Read(c.sq)
+	default:
+		return
+	}
+	if g {
+		gc, pause = 0, 0
+	}
+	if g && c.s[0].Value.Kind() == metrics.KindFloat64 {
+		gc = c.s[0].Value.Float64()
+	}
+	if g && c.s[1].Value.Kind() == metrics.KindFloat64Histogram {
+		h := c.s[1].Value.Float64Histogram()
+		for i, n := range h.Counts {
+			if n == 0 {
+				continue
+			}
+			edge := h.Buckets[i+1]
+			if math.IsInf(edge, 1) {
+				edge = h.Buckets[i]
+			}
+			pause += float64(n) * edge
+		}
+	}
+	if q && c.s[2].Value.Kind() == metrics.KindFloat64 {
+		mw = c.s[2].Value.Float64()
+	}
+	return
+}
+
+// delta returns the ns of GC CPU, STW pause and mutex wait since the previous call.
+func (c *rtCounters) delta(g, q bool) (gcNs, stwNs, mwNs int64) {
+	gc, pause, mw := c.read(g, q)
+	gcNs, stwNs, mwNs = int64((gc-c.gc)*1e9), int64((pause-c.pauseSum)*1e9), int64((mw-c.mw)*1e9)
+	c.gc, c.pauseSum, c.mw = gc, pause, mw
+	if gcNs < 0 {
+		gcNs = 0
+	}
+	if stwNs < 0 {
+		stwNs = 0
+	}
+	if mwNs < 0 {
+		mwNs = 0
+	}
+	return
+}
+
+// K5: the switches.
+const (
+	iCount = 1 << iota // arrivals and completions per endpoint
+	iSlot              // the busy-handler integral
+	iTime              // timers, percentiles, the admission gate (implies iCount)
+)
+
+const (
+	rCPU = 1 << iota // getrusage
+	rMHz             // sysfs cpufreq
+	rQ               // runtime/metrics: scheduler latencies, mutex wait
+	rG               // runtime/metrics: GC CPU, stop-the-world pauses
+)
+
+func parseIntercept(v string) int32 {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "full" {
+		return iCount | iSlot | iTime
+	}
+	var m int32
+	for _, p := range strings.Split(v, ",") {
+		switch strings.TrimSpace(p) {
+		case "full":
+			m |= iCount | iSlot | iTime
+		case "count":
+			m |= iCount
+		case "slot":
+			m |= iSlot
+		case "time":
+			m |= iCount | iTime
+		}
+	}
+	return m
+}
+
+func parseReads(v string) int32 {
+	var m int32
+	for _, p := range strings.Split(strings.TrimSpace(v), ",") {
+		switch strings.TrimSpace(p) {
+		case "all":
+			m |= rCPU | rMHz | rQ | rG
+		case "cpu":
+			m |= rCPU
+		case "mhz":
+			m |= rMHz
+		case "q":
+			m |= rQ
+		case "g":
+			m |= rG
+		}
+	}
+	return m
+}
+
+// pollCtl applies the control file's "intercept=<list> reads=<list>" line when it changed, and logs the change.
+func (r *Recorder) pollCtl() {
+	b, err := os.ReadFile(r.ctlPath)
+	if err != nil {
+		return
+	}
+	line := strings.TrimSpace(string(b))
+	if line == r.ctlLast {
+		return
+	}
+	r.ctlLast = line
+	for _, f := range strings.Fields(line) {
+		if k, v, ok := strings.Cut(f, "="); ok {
+			switch k {
+			case "intercept":
+				atomic.StoreInt32(&r.mode, parseIntercept(v))
+			case "reads":
+				atomic.StoreInt32(&r.reads, parseReads(v))
+			case "sample":
+				if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+					atomic.StoreUint32(&r.sampleN, uint32(n))
+				}
+			}
+		}
+	}
+	r.out.WriteString(`{"event":"ctl","t":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"intercept":` +
+		strconv.Itoa(int(atomic.LoadInt32(&r.mode))) + `,"reads":` + strconv.Itoa(int(atomic.LoadInt32(&r.reads))) +
+		`,"line":"` + strings.ReplaceAll(line, `"`, `'`) + `"}` + "\n")
+	r.out.Flush()
 }

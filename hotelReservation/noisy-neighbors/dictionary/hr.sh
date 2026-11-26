@@ -37,7 +37,9 @@ JAEGER_SAMPLE_RATIO=${JAEGER_SAMPLE_RATIO:-0}
 OTHER_NODES=${OTHER_NODES:-node-1,node-2,node-3}
 DB_NODE=${DB_NODE:-node-3}
 SERVICES="frontend search geo rate profile recommendation user reservation"
-export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+NS=${NS:-default}          # Phase G (clnode170): the Gordion HR stack lives beside the motivation one, in its own namespace
+kubectl() { command kubectl -n "$NS" "$@"; }
+export PATH=${GOROOT_OVERRIDE:+$GOROOT_OVERRIDE/bin:}$PATH:/usr/local/go/bin:$HOME/go/bin
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
@@ -50,6 +52,26 @@ cmd_build() {
   (cd $HR && docker build -q -t $REGISTRY/hr-gordion:$tag . && docker push -q $REGISTRY/hr-gordion:$tag)
   (cd $HR && CGO_ENABLED=0 go build -mod=vendor -o $HR/hrgen ./cmd/hrgen && ls -la $HR/hrgen)
   curl -s http://$REGISTRY/v2/hr-gordion/tags/list; echo
+}
+
+# Phase G: create the stock HR stack in namespace $NS from the fork's manifests (hr-client excluded), strip the chart's
+# CPU quotas from the eight services (deploy_svc does it again per run) and wait for the pods
+cmd_install() {
+  command kubectl get ns $NS >/dev/null 2>&1 || command kubectl create ns $NS >/dev/null
+  # the fork's PVCs name static per-service classes whose PVs are already claimed by the default namespace: use the
+  # cluster's dynamic default class instead; the static PV manifests are skipped
+  for f in $(ls $HR/kubernetes/*/*.yaml | grep -v persistent-volume.yaml); do
+    sed 's/storageClassName: .*/storageClassName: nfs-client/' $f | kubectl apply -f - >/dev/null
+  done
+  for svc in $SERVICES; do
+    kubectl patch deployment $svc --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/resources","value":{}}]' >/dev/null || true
+  done
+  for i in $(seq 1 60); do
+    local notready; notready=$(kubectl get pods --no-headers 2>/dev/null | grep -v -c -E "Running|Completed" || true)
+    [ "$notready" = "0" ] && break
+    sleep 5
+  done
+  kubectl get pods -o wide | awk '{print $1, $3, $7}' >&2
 }
 
 # move stateful pods off the service node (their data is re-seeded by the services on restart)
@@ -83,6 +105,7 @@ print(n)")\"}"
   # strategic merge: env/volumes merge by name, command is replaced
   kubectl patch deployment $svc -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"gordion/run\":\"$run\"}},\"spec\":{
     \"nodeSelector\":{\"kubernetes.io/hostname\":\"$node\"},
+    \"tolerations\":[{\"key\":\"dedicated\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"}],
     \"volumes\":[{\"name\":\"gordion\",\"hostPath\":{\"path\":\"$hd\",\"type\":\"DirectoryOrCreate\"}}],
     \"containers\":[{\"name\":\"$(container $svc)\",\"image\":\"$REGISTRY/hr-gordion:$TAG\",\"imagePullPolicy\":\"Always\",\"command\":$cmd,
       \"env\":[{\"name\":\"GORDION_OUT\",\"value\":\"/data/$run-$svc.jsonl\"},{\"name\":\"GORDION_CLIENT_OUT\",\"value\":\"/data/$run-$svc-client.jsonl\"},
@@ -183,6 +206,7 @@ cmd_stock() {
 sub=${1:-}; shift || true
 case "$sub" in
   build)   cmd_build "$@";;
+  install) cmd_install;;
   place)   cmd_place;;
   deploy)  cmd_deploy "$@";;
   wlgen)   cmd_wlgen "$@";;
